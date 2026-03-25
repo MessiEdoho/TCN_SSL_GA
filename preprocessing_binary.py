@@ -14,9 +14,9 @@ from scipy.stats import median_abs_deviation        # robust scale estimator for
 # -- Section 3: Configuration -- edit these values before running ---------------
 
 # --- Paths (EDF files and annotation files are in SEPARATE folders) ---
-edf_dir        = Path(r'C:/data/edfs')           # folder containing all .edf files
-annotation_dir = Path(r'C:/data/annotations')    # folder containing all matching .xlsx files
-output_dir     = Path(r'C:/data/segments')       # root output folder; seizure/ and non_seizure/ created inside
+edf_dir        = Path(r'/home/people/22206468/scratch/EEG_TRAINING')           # folder containing all .edf files
+annotation_dir = Path(r'/home/people/22206468/scratch/seizure_times_updated')    # folder containing all matching .xlsx files
+output_dir     = Path(r'/home/people/22206468/scratch/TRAIN_DATA')       # root output folder; seizure/ and non_seizure/ created inside
 
 # --- Signal parameters ---
 fs      = 500    # sampling rate in Hz -- must match the EDF file header
