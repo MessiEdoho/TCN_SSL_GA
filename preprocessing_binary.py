@@ -340,7 +340,7 @@ log.info(f'Found {len(edf_files)} EDF file(s) in {edf_dir}')  # report the total
 for edf_path in edf_files:  # iterate over each mouse recording
 
     mouse_id  = edf_path.stem                             # extract mouse ID from filename (e.g. 'm1' from 'm1.edf')
-    xlsx_path = annotation_dir / f'{mouse_id}.xlsx'       # look up the annotation in the SEPARATE folder
+    xlsx_path = annotation_dir / f'{mouse_id}_xlsx.xlsx'       # look up the annotation in the SEPARATE folder
 
     if not xlsx_path.exists():                            # guard: skip if no matching annotation file
         log.warning(f'[SKIP] {mouse_id}: no annotation file found at {xlsx_path}')
