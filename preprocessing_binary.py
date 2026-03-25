@@ -11,7 +11,7 @@ from pathlib import Path                            # cross-platform path handli
 from scipy.signal import iirnotch, filtfilt         # notch filter design and zero-phase filtering
 from scipy.stats import median_abs_deviation        # robust scale estimator for MAD-based z-score
 
-# -- Section 3: Configuration — edit these values before running ---------------
+# -- Section 3: Configuration -- edit these values before running ---------------
 
 # --- Paths (EDF files and annotation files are in SEPARATE folders) ---
 edf_dir        = Path(r'C:/data/edfs')           # folder containing all .edf files
@@ -19,18 +19,18 @@ annotation_dir = Path(r'C:/data/annotations')    # folder containing all matchin
 output_dir     = Path(r'C:/data/segments')       # root output folder; seizure/ and non_seizure/ created inside
 
 # --- Signal parameters ---
-fs      = 500    # sampling rate in Hz — must match the EDF file header
+fs      = 500    # sampling rate in Hz -- must match the EDF file header
 win_len = 2500   # window length in samples: 5 s * 500 Hz = 2500 samples per segment
 step    = 1250   # step size in samples: 2.5 s * 500 Hz = 1250 samples (50% overlap)
 
-# --- Chunking — controls peak RAM usage ---
+# --- Chunking -- controls peak RAM usage ---
 segments_per_chunk = 40  # number of segments grouped into one RAM-loaded block (K)
 
 # --- Preprocessing ---
 notch_freq = 50.0  # powerline interference frequency to suppress (Hz)
 notch_Q    = 30     # Q-factor of the notch filter: higher = narrower, more targeted notch
 
-# --- Logging setup — writes to file AND console -------------------------------
+# --- Logging setup -- writes to file AND console -------------------------------
 output_dir.mkdir(parents=True, exist_ok=True)  # ensure output folder exists before creating log file
 
 log = logging.getLogger('eeg_pipeline')        # create a named logger for this pipeline
@@ -39,7 +39,7 @@ log.handlers.clear()                           # remove any handlers from previo
 
 file_handler = logging.FileHandler(            # handler that writes log messages to a file
     output_dir / 'pipeline.log',               # log file lives next to the output segments
-    mode='a',                                  # append mode — new runs add to the same log file
+    mode='a',                                  # append mode -- new runs add to the same log file
     encoding='utf-8'                           # ensure Unicode characters are written correctly
 )
 file_handler.setFormatter(logging.Formatter(   # format: timestamp | message
@@ -60,7 +60,7 @@ log.info(f'  Annotation dir: {annotation_dir}')  # log the annotation directory 
 log.info(f'  Output dir:     {output_dir}')    # log the output directory path
 log.info(f'  Log file:       {output_dir / "pipeline.log"}')  # log the log file path itself
 
-# -- load_annotations — parse Excel seizure times into seconds -----------------
+# -- load_annotations -- parse Excel seizure times into seconds -----------------
 
 def load_annotations(xlsx_path, recording_start_dt):
     """
@@ -110,7 +110,7 @@ def load_annotations(xlsx_path, recording_start_dt):
 
     return intervals  # return all seizure intervals as seconds relative to recording start
 
-# -- compute_segment_grid — build the full list of segment start indices -------
+# -- compute_segment_grid -- build the full list of segment start indices -------
 
 def compute_segment_grid(n_samples, win_len, step):
     """
@@ -146,7 +146,7 @@ def compute_segment_grid(n_samples, win_len, step):
     return starts  # return the complete grid of segment start indices
 
 
-# -- Preprocessing functions — notch filter, DC removal, robust z-score --------
+# -- Preprocessing functions -- notch filter, DC removal, robust z-score --------
 
 def apply_notch_filter(signal, fs, freq, Q):
     """
@@ -161,7 +161,7 @@ def apply_notch_filter(signal, fs, freq, Q):
     freq : float
         Centre frequency of the notch in Hz (e.g. 50.0).
     Q : float
-        Quality factor — higher values produce a narrower notch.
+        Quality factor -- higher values produce a narrower notch.
 
     Returns
     -------
@@ -219,7 +219,7 @@ def robust_zscore(signal):
     med = np.median(signal)                       # robust location estimate (centre of the distribution)
     mad = median_abs_deviation(signal, scale=1)   # MAD without the 1.4826 scaling factor
 
-    if mad == 0.0:               # constant signal — cannot normalise
+    if mad == 0.0:               # constant signal -- cannot normalise
         return signal            # return unchanged to avoid division by zero
 
     normed = (signal - med) / (1.4826 * mad)  # apply the robust z-score formula
@@ -283,9 +283,9 @@ def is_ictal(seg_start_sec, seg_end_sec, seizure_intervals):
     for sz_start, sz_end in seizure_intervals:  # check each annotated seizure
 
         if seg_start_sec < sz_end and seg_end_sec > sz_start:  # overlap condition
-            return True  # at least one seizure overlaps — label as ictal
+            return True  # at least one seizure overlaps -- label as ictal
 
-    return False  # no overlap found with any seizure — label as non-ictal
+    return False  # no overlap found with any seizure -- label as non-ictal
 
 
 def save_segment(segment, output_dir, mouse_id, label, index):
@@ -330,7 +330,7 @@ def save_segment(segment, output_dir, mouse_id, label, index):
     return filepath  # return the path for logging or verification
 
 
-# -- Main loop — iterate over all EDF files, chunk-process, label, save --------
+# -- Main loop -- iterate over all EDF files, chunk-process, label, save --------
 
 results = {}  # accumulate per-mouse segment counts: {mouse_id: {'ictal': int, 'nonictal': int}}
 
@@ -412,7 +412,7 @@ for edf_path in edf_files:  # iterate over each mouse recording
             if is_ictal(seg_start_sec, seg_end_sec, seizure_intervals):  # check seizure overlap
                 ictal_count += 1                                    # increment the 1-based ictal counter
                 save_segment(segment, output_dir, mouse_id, 'ictal', ictal_count)
-            else:                                                   # no overlap — non-ictal
+            else:                                                   # no overlap -- non-ictal
                 nonictal_count += 1                                 # increment the 1-based non-ictal counter
                 save_segment(segment, output_dir, mouse_id, 'nonictal', nonictal_count)
 
@@ -457,7 +457,7 @@ log.info(sep)  # log separator before totals row
 log.info(f'{"TOTAL":<12s} {total_ictal:>8d} {total_nonictal:>12d} '
          f'{total_ictal + total_nonictal:>8d}')  # log grand totals
 
-# -- Grouped bar chart (saved to file — no display needed on cluster) ----------
+# -- Grouped bar chart (saved to file -- no display needed on cluster) ----------
 mice    = list(results.keys())                     # list of mouse IDs in processing order
 ic_vals = [results[m]['ictal'] for m in mice]      # ictal counts per mouse
 ni_vals = [results[m]['nonictal'] for m in mice]   # non-ictal counts per mouse
