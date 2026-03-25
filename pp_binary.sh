@@ -1,0 +1,1 @@
+srun --time=120:00:00 --partition=cpu -c8 job-name=preprocessing_binary --pty bash
