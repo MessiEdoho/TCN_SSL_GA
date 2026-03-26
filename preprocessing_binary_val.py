@@ -14,9 +14,9 @@ from scipy.stats import median_abs_deviation        # robust scale estimator for
 # -- Section 3: Configuration -- edit these values before running ---------------
 
 # --- Paths (EDF files and annotation files are in SEPARATE folders) ---
-edf_dir        = Path(r'/home/people/22206468/scratch/EEG_TRAINING')           # folder containing all .edf files
+edf_dir        = Path(r'/home/people/22206468/scratch/EEG_VAL')           # folder containing all .edf files
 annotation_dir = Path(r'/home/people/22206468/scratch/seizure_times_updated')    # folder containing all matching .xlsx files
-output_dir     = Path(r'/home/people/22206468/scratch/TRAIN_DATA')       # root output folder; seizure/ and non_seizure/ created inside
+output_dir     = Path(r'/home/people/22206468/scratch/VAL_DATA')       # root output folder; seizure/ and non_seizure/ created inside
 
 # --- Signal parameters ---
 fs      = 500    # sampling rate in Hz -- must match the EDF file header
@@ -33,12 +33,12 @@ notch_Q    = 30     # Q-factor of the notch filter: higher = narrower, more targ
 # --- Logging setup -- writes to file AND console -------------------------------
 output_dir.mkdir(parents=True, exist_ok=True)  # ensure output folder exists before creating log file
 
-log = logging.getLogger('eeg_pipeline')        # create a named logger for this pipeline
+log = logging.getLogger('eeg_pipeline_val')        # create a named logger for this pipeline
 log.setLevel(logging.INFO)                     # set minimum log level to INFO
 log.handlers.clear()                           # remove any handlers from previous runs (re-run safe)
 
 file_handler = logging.FileHandler(            # handler that writes log messages to a file
-    output_dir / 'pipeline.log',               # log file lives next to the output segments
+    output_dir / 'val_pipeline.log',               # log file lives next to the output segments
     mode='a',                                  # append mode -- new runs add to the same log file
     encoding='utf-8'                           # ensure Unicode characters are written correctly
 )
@@ -58,7 +58,7 @@ log.info('Pipeline configuration loaded')      # confirm logging is working
 log.info(f'  EDF dir:        {edf_dir}')       # log the EDF directory path
 log.info(f'  Annotation dir: {annotation_dir}')  # log the annotation directory path
 log.info(f'  Output dir:     {output_dir}')    # log the output directory path
-log.info(f'  Log file:       {output_dir / "pipeline.log"}')  # log the log file path itself
+log.info(f'  Log file:       {output_dir / "val_pipeline.log"}')  # log the log file path itself
 
 # -- load_annotations -- parse Excel seizure times into seconds -----------------
 
