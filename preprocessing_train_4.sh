@@ -1,5 +1,5 @@
 #!/bin/bash -l
-#SBATCH --job-name=batch_execution_preprocessing_train2
+#SBATCH --job-name=batch_execution_preprocessing_train4
 # speficity number of nodes 
 #SBATCH -N 1
 
@@ -26,4 +26,4 @@ conda activate uniqureSSLGA
 cd ~/TCN_SSL_GA
 
 # Run the Python script
-python preprocessing_binary_train_2.py
+python preprocessing_binary_train_4.py
