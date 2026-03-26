@@ -26,4 +26,4 @@ conda activate uniqureSSLGA
 cd ~/TCN_SSL_GA
 
 # Run the Python script
-python preprocessing_binary.py
+python preprocessing_binary_val.py
