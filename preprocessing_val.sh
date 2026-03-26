@@ -1,5 +1,5 @@
 #!/bin/bash -l
-#SBATCH --job-name=batch_execution_preprocessing
+#SBATCH --job-name=batch_execution_preprocessing_val
 # speficity number of nodes 
 #SBATCH -N 1
 
