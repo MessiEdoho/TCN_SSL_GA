@@ -1,5 +1,5 @@
 #!/bin/bash -l
-#SBATCH --job-name=batch_execution_preprocessing_train3
+#SBATCH --job-name=batch_execution_preprocessing_train_3
 # speficity number of nodes 
 #SBATCH -N 1
 
