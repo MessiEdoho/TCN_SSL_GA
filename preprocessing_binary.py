@@ -353,6 +353,18 @@ for edf_path in edf_files:  # iterate over each mouse recording
         verbose=False            # suppress MNE's internal log messages
     )
 
+    # -- Discard non-EEG channels (e.g. Activity, accelerometry, respiration, temperature) --
+    # This eliminates mixed-sampling-frequency warnings and ensures only the EEG channel remains.
+    raw.pick('EEG')  # keep only channels with 'EEG' in their type (case-insensitive match)
+
+    # -- Guard: ensure at least one EEG channel survived the pick ----------
+    if len(raw.ch_names) == 0:
+        raise ValueError(
+            f"No EEG channels identified in {edf_path} after pick('eeg'). "
+            f"Consider using raw.pick([<explicit_channel_name>]) as a fallback."
+        )
+    log.info(f"[{mouse_id}] EEG channel retained: {raw.ch_names} @ {raw.info['sfreq']} Hz")
+
     n_samples = int(raw.n_times)                # total samples in the recording (from header)
     fs_file   = raw.info['sfreq']               # sampling rate reported in the EDF header
     meas_date = raw.info['meas_date']           # recording start datetime (may have timezone)
