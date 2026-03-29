@@ -1292,3 +1292,592 @@ def run_finetuning(model, train_loader, val_loader, lr, weight_decay,
 #   Separate optimiser after unfreeze : ensures correct momentum statistics
 #     for the newly trainable encoder parameters.
 # -----------------------------------------------------------------------------
+
+
+# ═══════════════════════════════════════════════════
+# POST-PROCESSING AND THRESHOLD OPTIMISATION
+# Called by all four model training notebooks and by
+# final_evaluation.ipynb
+# ═══════════════════════════════════════════════════
+
+# ── HOW TO REPORT THESE METHODS IN YOUR PAPER ──────
+#
+# Overview
+# ────────
+# The post-processing pipeline converts raw segment-level
+# binary predictions from the TCN (or TCN-Attention / SSL)
+# classifier into clinical event-level alarms before
+# computing the false alarm rate per hour (FAR/hr).
+# Three sequential stages are applied:
+#   Stage 1 — Probability smoothing
+#   Stage 2 — Refractory period merging
+#   Stage 3 — Minimum duration filtering
+# Threshold optimisation selects the classification
+# threshold on the validation set before any test set
+# evaluation.
+#
+# Methods section template (adapt and cite as needed)
+# ────────────────────────────────────────────────────
+# "Raw segment-level sigmoid probabilities were
+# post-processed prior to computing false alarm rate.
+# A [smoothing_window]-segment moving average was applied
+# to the predicted probabilities to suppress isolated
+# single-segment spikes caused by transient artefacts.
+# Consecutive positive predictions separated by fewer
+# than [refractory_period_sec] seconds were merged into
+# a single event to prevent a single seizure from being
+# counted as multiple alarms. Events shorter than
+# [min_event_duration_sec] seconds were discarded, as
+# genuine rodent seizures typically last at least 10
+# seconds [CITE]. The classification threshold was
+# selected by maximising the Youden J statistic
+# (J = sensitivity + specificity - 1) on the validation
+# set independently for each model. Event-level false
+# alarm rate per hour (FAR/hr) was computed as the
+# number of false alarm events divided by the total
+# non-ictal recording duration in hours."
+#
+# Parameters to report in paper
+# ────────────────────────────────────────────────────
+# | Parameter                  | Recommended value     |
+# |----------------------------|-----------------------|
+# | smoothing_window           | 3 segments            |
+# | refractory_period_sec      | 30 seconds            |
+# | min_event_duration_sec     | 10 seconds            |
+# | step_sec                   | 2.5 s (= seg - overlap)|
+# | threshold objective        | Youden J statistic    |
+# | threshold search range     | 0.1 to 0.9, step 0.01 |
+# | FAR/hr denominator         | non-ictal hours only  |
+#
+# Report all six parameters in Table 1 or the methods
+# section. Do not report only the final FAR/hr value
+# without specifying which post-processing parameters
+# produced it, as results are not reproducible otherwise.
+#
+# Results table structure (three rows per model)
+# ────────────────────────────────────────────────────
+# Row 1: threshold=0.5,       post-processing=No
+#        Baseline raw classifier output at standard
+#        threshold. Allows comparison with prior work.
+#        FAR/hr here is segment-level only.
+#
+# Row 2: threshold=0.5,       post-processing=Yes
+#        Isolates the contribution of post-processing
+#        alone. Difference in FAR/hr between Row 1 and
+#        Row 2 quantifies how much of the segment-level
+#        alarm burden was classifier noise.
+#
+# Row 3: threshold=optimal,   post-processing=Yes
+#        Best clinical operating point. Threshold selected
+#        on validation set via Youden J. Apply to test set
+#        without further adjustment.
+#
+# AUROC is threshold-invariant — report it once per model
+# with a footnote: "AUROC is identical across all rows
+# for a given model as it is computed from the full
+# probability distribution."
+#
+# Important warnings
+# ────────────────────────────────────────────────────
+# WARNING 1 — Threshold must be selected on validation
+#   set only. Never select threshold by evaluating on
+#   the test set. Store the optimal threshold in
+#   outputs/optimal_threshold_<model>.json and load it
+#   in final_evaluation.ipynb without re-optimising.
+#
+# WARNING 2 — Post-processing parameters must be
+#   identical across all four models. Do not tune
+#   post-processing parameters per model. Fix them once
+#   (smoothing_window=3, refractory_period_sec=30,
+#   min_event_duration_sec=10) and apply to all models.
+#   Only the threshold may differ per model.
+#
+# WARNING 3 — Smoothing introduces boundary uncertainty.
+#   A window of W segments shifts event boundaries by
+#   up to floor(W/2) x step_sec seconds. For W=3 and
+#   step_sec=2.5, this is 2.5 seconds maximum. Report
+#   this limitation in the discussion section.
+#
+# WARNING 4 — Segment-level FAR/hr inflates alarm count.
+#   With 50% overlap, a single artefact can generate
+#   2-3 consecutive FP segments from one noise event.
+#   Always report event-level FAR/hr as the primary
+#   clinical metric and segment-level FAR/hr only as
+#   a secondary reference for comparison with prior work.
+#
+# ── END OF REPORTING GUIDANCE ────────────────────────
+
+
+def segment_predictions_to_events(
+        y_pred,
+        y_prob,
+        segment_len_sec,
+        step_sec,
+        min_event_duration_sec=10.0,
+        refractory_period_sec=30.0,
+        smoothing_window=3,
+        threshold=0.5
+):
+    """Convert raw segment-level predictions into post-processed clinical event-level alarms.
+
+    Clinical motivation
+    -------------------
+    Raw segment-level binary predictions are not clinically meaningful because
+    overlapping segments (50 % overlap) cause a single noise transient to trigger
+    multiple consecutive false-positive segments. Post-processing collapses these
+    into discrete events, merges fragmented detections from a single seizure, and
+    discards implausibly short events, producing an alarm stream that is
+    interpretable by clinicians and suitable for computing event-level FAR/hr.
+
+    Parameters
+    ----------
+    y_pred : array-like, shape (n_segments,)
+        Binary segment-level predictions (0 or 1). Used only as a reference;
+        smoothing is applied to y_prob and re-thresholded.
+    y_prob : array-like, shape (n_segments,)
+        Sigmoid probabilities for each segment (float in [0, 1]).
+    segment_len_sec : float
+        Duration of each segment in seconds (e.g. 5.0).
+    step_sec : float
+        Step between consecutive segment starts in seconds (e.g. 2.5).
+    min_event_duration_sec : float, default 10.0
+        Minimum event duration in seconds; shorter events are discarded.
+    refractory_period_sec : float, default 30.0
+        Maximum gap in seconds between consecutive positive runs that
+        should be merged into a single event.
+    smoothing_window : int, default 3
+        Length of the uniform moving-average kernel applied to y_prob.
+    threshold : float, default 0.5
+        Classification threshold applied after probability smoothing.
+
+    Returns
+    -------
+    result : dict
+        Keys: 'smoothed_probs', 'smoothed_preds', 'events', 'n_events',
+        'total_duration_sec', 'n_segments', 'parameters'.
+        See source for full schema documentation.
+
+    Example
+    -------
+    >>> from tcn_utils import segment_predictions_to_events
+    >>> post = segment_predictions_to_events(
+    ...     y_pred=val_preds, y_prob=val_probs,
+    ...     segment_len_sec=5.0, step_sec=2.5,
+    ...     threshold=0.5
+    ... )
+    >>> print(f"Detected {post['n_events']} events")
+    """
+    import numpy as np
+
+    y_prob = np.asarray(y_prob, dtype=np.float64)
+    n_segments = len(y_prob)
+
+    # --- Edge case: empty input produces sensible zero-valued defaults ---
+    if n_segments == 0:
+        return {
+            "smoothed_probs": np.array([], dtype=np.float64),
+            "smoothed_preds": np.array([], dtype=np.int64),
+            "events": [],
+            "n_events": 0,
+            "total_duration_sec": 0.0,
+            "n_segments": 0,
+            "parameters": {
+                "smoothing_window": int(smoothing_window),
+                "refractory_period_sec": round(float(refractory_period_sec), 4),
+                "min_event_duration_sec": round(float(min_event_duration_sec), 4),
+                "threshold": round(float(threshold), 6),
+                "step_sec": round(float(step_sec), 4),
+                "segment_len_sec": round(float(segment_len_sec), 4),
+            }
+        }
+
+    # ── Stage 1: Probability smoothing ────────────────────────────────────
+    # A uniform moving average suppresses isolated single-segment spikes
+    # caused by transient artefacts before binarisation.
+    kernel = np.ones(smoothing_window) / smoothing_window
+    # mode="same" preserves the original array length so that the 1:1
+    # mapping between segments and probabilities is maintained.
+    smoothed_probs = np.convolve(y_prob, kernel, mode="same")
+    # Threshold applied after smoothing so isolated artefact spikes are
+    # suppressed before binarisation, reducing spurious positive segments.
+    smoothed_preds = (smoothed_probs >= threshold).astype(np.int64)
+
+    # ── Stage 2: Map segments to time coordinates ─────────────────────────
+    # segment_starts uses step_sec (not segment_len_sec) because segments
+    # overlap — each new segment begins step_sec after the previous one,
+    # not segment_len_sec after it.
+    segment_starts = np.arange(n_segments) * step_sec
+    segment_ends = segment_starts + segment_len_sec
+
+    # ── Stage 3: Identify consecutive positive runs ───────────────────────
+    raw_events = []
+    in_event = False
+    event_start_sec = 0.0
+    event_seg_indices = []
+
+    for i in range(n_segments):
+        if smoothed_preds[i] == 1 and not in_event:
+            # Transition 0→1: a new positive run begins
+            in_event = True
+            event_start_sec = segment_starts[i]
+            event_seg_indices = [i]
+        elif smoothed_preds[i] == 1 and in_event:
+            event_seg_indices.append(i)
+        elif smoothed_preds[i] == 0 and in_event:
+            # Transition 1→0: close the current positive run
+            in_event = False
+            raw_events.append({
+                "start_sec": event_start_sec,
+                "end_sec": segment_ends[event_seg_indices[-1]],
+                "seg_indices": list(event_seg_indices),
+            })
+
+    # If the recording ends while still inside a positive run, close it
+    # so the final event is not silently dropped.
+    if in_event:
+        raw_events.append({
+            "start_sec": event_start_sec,
+            "end_sec": segment_ends[event_seg_indices[-1]],
+            "seg_indices": list(event_seg_indices),
+        })
+
+    # ── Stage 4: Refractory period merging ────────────────────────────────
+    # Merging prevents a single seizure from being counted as multiple
+    # alarms when the probability briefly dips below threshold mid-seizure.
+    merged_events = []
+    for evt in raw_events:
+        if (merged_events and
+                (evt["start_sec"] - merged_events[-1]["end_sec"]) < refractory_period_sec):
+            # Gap is shorter than the refractory period — extend the
+            # previous event rather than starting a new one.
+            merged_events[-1]["end_sec"] = evt["end_sec"]
+            merged_events[-1]["seg_indices"].extend(evt["seg_indices"])
+        else:
+            merged_events.append({
+                "start_sec": evt["start_sec"],
+                "end_sec": evt["end_sec"],
+                "seg_indices": list(evt["seg_indices"]),
+            })
+
+    # ── Stage 5: Minimum duration filter ──────────────────────────────────
+    final_events = []
+    for evt in merged_events:
+        duration = evt["end_sec"] - evt["start_sec"]
+        if duration < min_event_duration_sec:
+            continue
+
+        # valid_idx clipping guards against index-out-of-bounds from
+        # boundary segments whose indices may exceed array length after
+        # merging across chunk edges.
+        valid_idx = [idx for idx in evt["seg_indices"] if 0 <= idx < n_segments]
+
+        if len(valid_idx) > 0:
+            mean_prob = round(float(np.mean(smoothed_probs[valid_idx])), 6)
+            max_prob = round(float(np.max(smoothed_probs[valid_idx])), 6)
+        else:
+            mean_prob = 0.0
+            max_prob = 0.0
+
+        final_events.append({
+            "start_sec": round(float(evt["start_sec"]), 4),
+            "end_sec": round(float(evt["end_sec"]), 4),
+            "duration_sec": round(float(duration), 4),
+            "mean_prob": mean_prob,
+            "max_prob": max_prob,
+        })
+
+    total_duration_sec = round(float(segment_ends[-1]), 4) if n_segments > 0 else 0.0
+
+    return {
+        "smoothed_probs": smoothed_probs,
+        "smoothed_preds": smoothed_preds,
+        "events": final_events,
+        "n_events": int(len(final_events)),
+        "total_duration_sec": total_duration_sec,
+        "n_segments": int(n_segments),
+        "parameters": {
+            "smoothing_window": int(smoothing_window),
+            "refractory_period_sec": round(float(refractory_period_sec), 4),
+            "min_event_duration_sec": round(float(min_event_duration_sec), 4),
+            "threshold": round(float(threshold), 6),
+            "step_sec": round(float(step_sec), 4),
+            "segment_len_sec": round(float(segment_len_sec), 4),
+        }
+    }
+
+
+# ── REPORTING NOTE: segment_predictions_to_events ───
+# Stage 1 smoothing_window: report as "a W-segment
+#   moving average was applied to predicted probabilities"
+# Stage 4 refractory_period_sec: report as "events
+#   separated by fewer than R seconds were merged"
+# Stage 5 min_event_duration_sec: report as "events
+#   shorter than D seconds were discarded"
+# Boundary uncertainty from smoothing: ±floor(W/2)×step_sec
+#   seconds. For W=3, step=2.5s: ±2.5 seconds maximum.
+#   State this limitation in the discussion section.
+# ────────────────────────────────────────────────────
+
+
+def compute_event_level_far(
+        y_true_segments,
+        post_processed,
+        step_sec,
+        segment_len_sec
+):
+    """Compute event-level false alarm rate per hour (FAR/hr) from post-processed events.
+
+    A false alarm event is an event that has no overlap with any truly ictal
+    segment. An event overlaps a segment when the segment starts before the
+    event ends AND the segment ends after the event starts — any temporal
+    intersection counts as overlap.
+
+    Parameters
+    ----------
+    y_true_segments : array-like, shape (n_segments,)
+        Ground-truth binary labels per segment (0 = non-ictal, 1 = ictal).
+    post_processed : dict
+        Output of segment_predictions_to_events(). Must contain keys
+        'events' and 'n_segments'.
+    step_sec : float
+        Step between consecutive segment starts in seconds.
+    segment_len_sec : float
+        Duration of each segment in seconds.
+
+    Returns
+    -------
+    result : dict
+        Keys: 'n_true_alarms', 'n_false_alarms', 'n_total_events',
+        'total_non_ictal_hr', 'far_per_hour', 'event_details'.
+
+    Example
+    -------
+    >>> from tcn_utils import segment_predictions_to_events, compute_event_level_far
+    >>> post = segment_predictions_to_events(preds, probs, 5.0, 2.5)
+    >>> far = compute_event_level_far(y_true, post, step_sec=2.5, segment_len_sec=5.0)
+    >>> print(f"FAR/hr = {far['far_per_hour']}")
+    """
+    import numpy as np
+
+    events = post_processed["events"]
+    n_segments = post_processed["n_segments"]
+    y_true_segments = np.asarray(y_true_segments, dtype=np.int64)
+
+    # --- Edge case: no events means zero alarms of either kind ---
+    if len(events) == 0 or n_segments == 0:
+        # Only non-ictal segments contribute to the denominator because
+        # FAR/hr measures alarms during normal brain activity, not during
+        # seizures where detections are expected.
+        n_non_ictal_segs = int(np.sum(y_true_segments == 0)) if len(y_true_segments) > 0 else 0
+        total_non_ictal_hr = round(float(n_non_ictal_segs * segment_len_sec) / 3600.0, 4) if n_non_ictal_segs > 0 else 0.0
+        return {
+            "n_true_alarms": 0,
+            "n_false_alarms": 0,
+            "n_total_events": 0,
+            "total_non_ictal_hr": total_non_ictal_hr,
+            "far_per_hour": 0.0,
+            "event_details": [],
+        }
+
+    # Step 1 — Segment time coordinates
+    segment_starts = np.arange(n_segments) * step_sec
+
+    # Step 2 — Classify each event as true alarm or false alarm
+    n_true_alarms = 0
+    n_false_alarms = 0
+    event_details = []
+
+    for evt in events:
+        # A segment overlaps an event if the segment starts before the event
+        # ends AND the segment ends after the event starts — this is the
+        # standard interval overlap test.
+        overlapping = np.where(
+            (segment_starts < evt["end_sec"]) &
+            (segment_starts + segment_len_sec > evt["start_sec"])
+        )[0]
+
+        is_true_alarm = False
+        if len(overlapping) > 0:
+            # True alarm if ANY overlapping segment is labelled ictal
+            is_true_alarm = bool(np.any(y_true_segments[overlapping] == 1))
+
+        if is_true_alarm:
+            n_true_alarms += 1
+        else:
+            n_false_alarms += 1
+
+        event_details.append({
+            "start_sec": round(float(evt["start_sec"]), 4),
+            "end_sec": round(float(evt["end_sec"]), 4),
+            "duration_sec": round(float(evt.get("duration_sec", evt["end_sec"] - evt["start_sec"])), 4),
+            "is_true_alarm": is_true_alarm,
+        })
+
+    # Step 3 — Compute non-ictal recording hours
+    # Only non-ictal segments contribute to the denominator because FAR/hr
+    # measures alarms during normal brain activity, not total recording time.
+    n_non_ictal_segs = int(np.sum(y_true_segments == 0))
+    total_non_ictal_hr = round(
+        float(n_non_ictal_segs * segment_len_sec) / 3600.0, 4
+    )
+
+    # Step 4 — Compute FAR/hr with zero-division guard
+    far_per_hour = round(
+        float(n_false_alarms / total_non_ictal_hr) if total_non_ictal_hr > 0 else 0.0,
+        4
+    )
+
+    return {
+        "n_true_alarms": int(n_true_alarms),
+        "n_false_alarms": int(n_false_alarms),
+        "n_total_events": int(n_true_alarms + n_false_alarms),
+        "total_non_ictal_hr": total_non_ictal_hr,
+        "far_per_hour": far_per_hour,
+        "event_details": event_details,
+    }
+
+
+# ── REPORTING NOTE: compute_event_level_far ──────────
+# FAR/hr denominator: non-ictal segments only (not total
+#   recording). State explicitly in methods: "FAR/hr was
+#   computed as the number of false alarm events divided
+#   by the total non-ictal recording duration in hours."
+# Event overlap rule: an event is a true alarm if ANY
+#   overlapping segment is labelled ictal. State this:
+#   "An event was classified as a true alarm if it
+#   overlapped with at least one truly ictal segment."
+# Distinguish from segment-level FAR/hr in results table:
+#   FAR/hr (seg) = raw FP segments / non-ictal hours
+#   FAR/hr (event) = false alarm events / non-ictal hours
+#   Both should be reported; event-level is the primary
+#   clinical metric.
+# ────────────────────────────────────────────────────
+
+
+def find_optimal_threshold(
+        y_true,
+        y_prob,
+        objective="youden",
+        thresholds=None
+):
+    """Select the optimal classification threshold on the validation set.
+
+    The Youden J statistic (J = sensitivity + specificity - 1) is the
+    recommended objective because it treats sensitivity and specificity
+    symmetrically, penalising missed seizures and false alarms equally.
+    F1, by contrast, weights false negatives more heavily than false
+    positives via the precision term, which may not reflect clinical
+    priorities where both under- and over-detection carry significant cost.
+
+    IMPORTANT: This function must only be called on the validation set —
+    never on the test set. The returned threshold should be saved to
+    outputs/optimal_threshold_<model>.json and loaded without modification
+    for test-set evaluation.
+
+    Parameters
+    ----------
+    y_true : array-like, shape (n_samples,)
+        Ground-truth binary labels (0 or 1).
+    y_prob : array-like, shape (n_samples,)
+        Predicted sigmoid probabilities (float in [0, 1]).
+    objective : str, default 'youden'
+        Objective function to maximise: 'youden' or 'f1'.
+    thresholds : array-like or None, default None
+        Threshold values to evaluate. If None, uses
+        np.linspace(0.1, 0.9, 81) (step = 0.01).
+
+    Returns
+    -------
+    result : dict
+        Keys: 'optimal_threshold', 'optimal_score', 'objective',
+        'sensitivity_at_opt', 'specificity_at_opt', 'youden_j_at_opt',
+        'threshold_curve'.
+
+    Example
+    -------
+    >>> from tcn_utils import find_optimal_threshold
+    >>> opt = find_optimal_threshold(val_true, val_probs, objective='youden')
+    >>> print(f"Optimal threshold: {opt['optimal_threshold']}")
+    >>> print(f"Youden J: {opt['youden_j_at_opt']}")
+    """
+    import numpy as np
+    from sklearn.metrics import confusion_matrix
+
+    y_true = np.asarray(y_true, dtype=np.int64)
+    y_prob = np.asarray(y_prob, dtype=np.float64)
+
+    # Step 1 — Default threshold range: 0.1–0.9 excludes extremes because
+    # thresholds < 0.1 or > 0.9 produce degenerate all-positive or
+    # all-negative classifiers that are not clinically useful.
+    if thresholds is None:
+        thresholds = np.linspace(0.1, 0.9, 81)
+
+    # Step 2 — Evaluate each threshold
+    scores = {}
+    for t in thresholds:
+        preds = (y_prob >= t).astype(np.int64)
+        cm = confusion_matrix(y_true, preds, labels=[0, 1])
+        tn, fp, fn, tp = cm.ravel()
+
+        sensitivity = (tp / (tp + fn)) if (tp + fn) > 0 else 0.0
+        specificity = (tn / (tn + fp)) if (tn + fp) > 0 else 0.0
+
+        if objective == "youden":
+            score = sensitivity + specificity - 1.0
+        elif objective == "f1":
+            from sklearn.metrics import f1_score as _f1_score
+            score = _f1_score(y_true, preds, average="macro", zero_division=0)
+        else:
+            raise ValueError(
+                f"Unknown objective: {objective}. Use 'youden' or 'f1'."
+            )
+
+        scores[round(float(t), 4)] = round(float(score), 6)
+
+    # Step 3 — Select optimal threshold
+    optimal_threshold = max(scores, key=scores.get)
+    optimal_score = scores[optimal_threshold]
+
+    # Step 4 — Recompute metrics at optimal threshold for logging
+    opt_preds = (y_prob >= optimal_threshold).astype(np.int64)
+    cm_opt = confusion_matrix(y_true, opt_preds, labels=[0, 1])
+    tn_opt, fp_opt, fn_opt, tp_opt = cm_opt.ravel()
+
+    sensitivity_at_opt = round(
+        float(tp_opt / (tp_opt + fn_opt)) if (tp_opt + fn_opt) > 0 else 0.0, 6
+    )
+    specificity_at_opt = round(
+        float(tn_opt / (tn_opt + fp_opt)) if (tn_opt + fp_opt) > 0 else 0.0, 6
+    )
+    youden_j_at_opt = round(float(sensitivity_at_opt + specificity_at_opt - 1.0), 6)
+
+    return {
+        "optimal_threshold": round(float(optimal_threshold), 6),
+        "optimal_score": round(float(optimal_score), 6),
+        "objective": str(objective),
+        "sensitivity_at_opt": sensitivity_at_opt,
+        "specificity_at_opt": specificity_at_opt,
+        "youden_j_at_opt": youden_j_at_opt,
+        "threshold_curve": scores,
+    }
+
+
+# ── REPORTING NOTE: find_optimal_threshold ───────────
+# Objective function: Youden J statistic is recommended.
+#   Report as: "The classification threshold was selected
+#   by maximising the Youden J statistic (J = sensitivity
+#   + specificity - 1) on the validation set."
+# Threshold search range: report as "Thresholds from 0.1
+#   to 0.9 in steps of 0.01 were evaluated."
+# Validation-only rule: report as "Threshold selection
+#   was performed exclusively on the validation set and
+#   applied without modification to the test set."
+# Per-model thresholds: report as "An independent
+#   threshold was selected for each model architecture."
+# Save optimal threshold to JSON after calling:
+#   outputs/optimal_threshold_<model_name>.json
+#   This file is loaded by final_evaluation.ipynb.
+#   Include threshold value in Table 1 of the paper.
+# ────────────────────────────────────────────────────
+
+# ═══════════════════════════════════════════════════
