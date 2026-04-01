@@ -1,10 +1,11 @@
 #!/bin/bash -l
-#SBATCH --job-name=batch_execution_preprocessing_train_3
+#SBATCH --job-name=delete_m291
+#SBATCH --output=delete_m291_%j.log
 # speficity number of nodes 
 #SBATCH -N 1
 
 # specify number of tasks/cores per node required
-#SBATCH --ntasks-per-node 3
+#SBATCH --ntasks-per-node 5
 
 # specify the walltime e.g 10 days 
 #SBATCH -t 10-00:00:00
@@ -26,4 +27,11 @@ conda activate uniqureSSLGA
 cd ~/TCN_SSL_GA
 
 # Run the Python script
-python preprocessing_binary_train_3.py
+
+# --- dry run first (no deletion) ---
+python delete_files_by_prefix.py /scratch/22206468/TRAIN_DATA_5/seizure /scratch/22206468/TRAIN_DATA_5/non_seizure --prefix m291
+
+# --- once you have checked the log and are happy, comment out the line above
+# --- and uncomment the line below, then resubmit ---
+# python delete_files_by_prefix.py /scratch/22206468/TRAIN_DATA_5/seizure /scratch/22206468/TRAIN_DATA_5/non_seizure --prefix m291 --confirm
+
