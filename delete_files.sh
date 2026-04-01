@@ -29,9 +29,9 @@ cd ~/TCN_SSL_GA
 # Run the Python script
 
 # --- dry run first (no deletion) ---
-python delete_files_by_prefix.py /scratch/22206468/TRAIN_DATA_5/seizure /scratch/22206468/TRAIN_DATA_5/non_seizure --prefix m291
+#python delete_files_by_prefix.py /scratch/22206468/TRAIN_DATA_5/seizure /scratch/22206468/TRAIN_DATA_5/non_seizure --prefix m291
 
 # --- once you have checked the log and are happy, comment out the line above
 # --- and uncomment the line below, then resubmit ---
-# python delete_files_by_prefix.py /scratch/22206468/TRAIN_DATA_5/seizure /scratch/22206468/TRAIN_DATA_5/non_seizure --prefix m291 --confirm
+python delete_files_by_prefix.py /scratch/22206468/TRAIN_DATA_5/seizure /scratch/22206468/TRAIN_DATA_5/non_seizure --prefix m291 --confirm
 
