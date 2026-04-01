@@ -390,10 +390,16 @@ def make_ssl_loader(file_paths, batch_size, device, segment_len=2500):
 # 8. CausalConvBlock
 # ---------------------------------------------------------------------------
 class CausalConvBlock(nn.Module):
-    """Single causal convolutional block with residual connection.
+    """Two-convolution causal residual block following Bai et al. (2018).
 
-    Architecture: Conv1d -> LayerNorm -> GELU -> Dropout1d -> Residual add.
-    Causal padding ensures no information leaks from future time steps.
+    Architecture per block (both convolutions share the same dilation):
+        Conv1d(in_ch -> out_ch) -> LayerNorm -> GELU -> Dropout1d ->
+        Conv1d(out_ch -> out_ch) -> LayerNorm -> GELU -> Dropout1d ->
+                                                          + Residual
+
+    The two-convolution design provides two non-linear transformations
+    per dilation level before advancing to the next scale. Causal
+    padding ensures no information leaks from future time steps.
 
     Parameters
     ----------
@@ -404,7 +410,7 @@ class CausalConvBlock(nn.Module):
     kernel_size : int
         Convolution kernel size (must be odd).
     dilation : int
-        Dilation factor for this layer.
+        Dilation factor for this block (same for both convolutions).
     dropout : float
         Spatial dropout rate (drops entire channels).
 
@@ -417,40 +423,67 @@ class CausalConvBlock(nn.Module):
     def __init__(self, in_ch, out_ch, kernel_size, dilation, dropout):
         super().__init__()
         self.pad = (kernel_size - 1) * dilation    # total causal padding (left side only)
-        self.conv = nn.Conv1d(in_ch, out_ch, kernel_size,
-                              dilation=dilation, padding=self.pad)
-        self.norm = nn.LayerNorm(out_ch)           # normalise across channel dim per time step
-        self.act = nn.GELU()                       # smooth activation for bio-signal features
-        self.drop = nn.Dropout1d(dropout)          # spatial dropout: drops entire channels
+
+        # -- Sub-layer 1: expands channels from in_ch to out_ch ----------------
+        self.conv1 = nn.Conv1d(in_ch, out_ch, kernel_size,
+                               dilation=dilation, padding=self.pad)
+        self.norm1 = nn.LayerNorm(out_ch)          # normalise across channel dim per time step
+        self.act1 = nn.GELU()                      # smooth activation for bio-signal features
+        self.drop1 = nn.Dropout1d(dropout)         # spatial dropout: drops entire channels
+
+        # -- Sub-layer 2: operates at full width (out_ch -> out_ch) ------------
+        self.conv2 = nn.Conv1d(out_ch, out_ch, kernel_size,
+                               dilation=dilation, padding=self.pad)
+        self.norm2 = nn.LayerNorm(out_ch)          # second normalisation layer
+        self.act2 = nn.GELU()                      # second activation
+        self.drop2 = nn.Dropout1d(dropout)         # second spatial dropout
+
         # 1x1 conv for residual projection when channel counts differ
         self.residual = nn.Conv1d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
 
     def forward(self, x):
         """Forward pass. x shape: (batch, channels, time)."""
+        seq_len = x.size(2)
         res = self.residual(x)                     # project input for skip connection
-        out = self.conv(x)                         # dilated conv with causal padding
-        out = out[:, :, :x.size(2)]                # trim right side to enforce causality (no future leak)
+
+        # -- Sub-layer 1 -------------------------------------------------------
+        out = self.conv1(x)                        # dilated conv with causal padding
+        out = out[:, :, :seq_len]                  # trim right side to enforce causality
         out = out.transpose(1, 2)                  # (B, T, C) -- LayerNorm expects channels last
-        out = self.norm(out)                       # normalise across channel dimension
+        out = self.norm1(out)                      # normalise across channel dimension
         out = out.transpose(1, 2)                  # (B, C, T) -- back to conv format
-        out = self.act(out)                        # GELU activation
-        out = self.drop(out)                       # spatial dropout
+        out = self.act1(out)                       # GELU activation
+        out = self.drop1(out)                      # spatial dropout
+
+        # -- Sub-layer 2 -------------------------------------------------------
+        out = self.conv2(out)                      # second dilated conv at same dilation
+        out = out[:, :, :seq_len]                  # trim right side to enforce causality
+        out = out.transpose(1, 2)                  # (B, T, C)
+        out = self.norm2(out)                      # normalise across channel dimension
+        out = out.transpose(1, 2)                  # (B, C, T)
+        out = self.act2(out)                       # GELU activation
+        out = self.drop2(out)                      # spatial dropout
+
         return out + res                           # residual connection
 
 
 # -- RESEARCH REPORTING NOTE: CausalConvBlock ----------------------------------
 # Methods description:
-#   Each dilated causal convolutional block comprised a 1-D causal convolution
-#   with exponential dilation, layer normalisation, GELU activation, spatial
-#   dropout, and a residual skip connection with 1x1 projection when input
-#   and output channel counts differed.
+#   Each residual block contained two dilated causal 1-D convolutions at
+#   the same dilation factor (Bai et al., 2018), each followed by layer
+#   normalisation across the channel dimension, GELU activation, and
+#   spatial dropout (Dropout1d). A 1x1 pointwise convolution projected
+#   the block input to match the output channel count when necessary,
+#   forming the residual skip connection.
 #
 # Parameters to report in paper:
-#   kernel_size : determines temporal resolution per layer
-#   dilation : determines receptive field contribution per layer
+#   kernel_size : determines temporal resolution per sub-layer
+#   dilation : determines receptive field contribution per block
 #   dropout : regularisation strength (affects generalisation)
 #
 # Design choices to justify:
+#   Two convolutions per block (Bai et al., 2018) : provides two non-linear
+#     transformations per dilation level before advancing to the next scale.
 #   LayerNorm instead of BatchNorm : EEG amplitude varies across subjects;
 #     BatchNorm statistics are unreliable at small batch sizes (16--64).
 #   Dropout1d instead of Dropout : structured EEG feature maps benefit from
@@ -466,13 +499,18 @@ class CausalConvBlock(nn.Module):
 class TCN(nn.Module):
     """Temporal Convolutional Network for binary EEG classification.
 
-    Stacks L CausalConvBlocks with exponential dilation d_l = 2^l,
-    followed by global average pooling and a linear classification head.
+    Stacks L CausalConvBlocks (each containing two dilated causal
+    convolutions, following Bai et al. 2018) with exponential dilation
+    d_l = 2^l, followed by global average pooling and a linear
+    classification head.
+
+    Receptive field: RF = 2 * (2^L - 1) * (k - 1) + 1 samples.
+    The factor of 2 accounts for the two convolutions per block.
 
     Parameters
     ----------
     num_layers : int
-        Number of stacked causal conv blocks (L).
+        Number of stacked residual blocks (L).
     num_filters : int
         Output channels per convolutional layer.
     kernel_size : int
@@ -497,7 +535,9 @@ class TCN(nn.Module):
             layers.append(CausalConvBlock(in_ch, num_filters, kernel_size, dilation, dropout))
         self.network = nn.Sequential(*layers)       # sequential stack of all blocks
         self.head = nn.Linear(num_filters, 1)       # classification head: 1 logit for binary
-        self.rf = (2 ** num_layers) * (kernel_size - 1)  # receptive field in samples
+        # RF = 2 * (2^L - 1) * (k - 1) + 1: two convolutions per block
+        # each contribute (k-1)*d to the receptive field at dilation d
+        self.rf = 2 * (2 ** num_layers - 1) * (kernel_size - 1) + 1
         self.num_filters = num_filters              # store for external access
 
     def forward(self, x):
@@ -509,19 +549,23 @@ class TCN(nn.Module):
 
 # -- RESEARCH REPORTING NOTE: TCN ----------------------------------------------
 # Methods description:
-#   The TCN comprised L stacked dilated causal convolutional blocks with
-#   exponential dilation schedule d_l = 2^l, yielding a receptive field of
-#   2^L * (k-1) samples. Global average pooling collapsed the temporal
-#   dimension before a single linear head produced binary classification logits.
+#   The TCN comprised L stacked residual blocks with exponential dilation
+#   schedule d_l = 2^l. Each block contained two dilated causal 1-D
+#   convolutions at the same dilation factor (Bai et al., 2018), yielding
+#   a receptive field of 2*(2^L - 1)*(k - 1) + 1 samples. Global average
+#   pooling collapsed the temporal dimension before a single linear head
+#   produced binary classification logits.
 #
 # Parameters to report in paper:
 #   num_layers (L) : determines depth and RF -- compute and report RF in seconds
 #   kernel_size (k) : determines local temporal resolution
 #   num_filters : model capacity (width)
 #   total trainable parameters : standard for reproducibility
-#   receptive field : 2^L * (k-1) samples and RF / fs seconds
+#   receptive field : 2*(2^L - 1)*(k - 1) + 1 samples and RF / fs seconds
 #
 # Design choices to justify:
+#   Two convolutions per block (Bai et al., 2018) : doubles non-linear
+#     transformations per dilation level for richer feature extraction.
 #   Global average pooling : makes model length-agnostic after causal trimming;
 #     acts as a spatial regulariser reducing overfitting risk.
 #   Single linear head : sufficient for binary classification; avoids
@@ -535,14 +579,18 @@ class TCN(nn.Module):
 class TCNWithAttention(nn.Module):
     """TCN backbone followed by multi-head self-attention.
 
-    The TCN extracts temporal features; self-attention captures global
-    dependencies across the full sequence. Optionally returns the embedding
-    (before the classification head) for use as an encoder in SSL pipelines.
+    The TCN extracts temporal features using two-convolution residual
+    blocks (Bai et al., 2018); self-attention captures global
+    dependencies across the full sequence. Optionally returns the
+    embedding (before the classification head) for use as an encoder
+    in SSL pipelines.
+
+    Receptive field: RF = 2 * (2^L - 1) * (k - 1) + 1 samples.
 
     Parameters
     ----------
     num_layers : int
-        Number of TCN blocks.
+        Number of TCN residual blocks (each with two convolutions).
     num_filters : int
         Channels per TCN layer and attention embedding dimension.
     kernel_size : int
@@ -579,7 +627,8 @@ class TCNWithAttention(nn.Module):
         self.attn_norm = nn.LayerNorm(num_filters)  # post-attention normalisation
         self.return_embedding = return_embedding
         self.head = nn.Linear(num_filters, 1)       # classification head
-        self.rf = (2 ** num_layers) * (kernel_size - 1)
+        # RF = 2 * (2^L - 1) * (k - 1) + 1: two convolutions per block
+        self.rf = 2 * (2 ** num_layers - 1) * (kernel_size - 1) + 1
         self.num_filters = num_filters
 
     def forward(self, x):

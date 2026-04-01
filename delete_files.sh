@@ -1,10 +1,10 @@
 #!/bin/bash -l
-#SBATCH --job-name=batch_execution_preprocessing_train2
+#SBATCH --job-name=batch_execution_preprocessing_train_3
 # speficity number of nodes 
 #SBATCH -N 1
 
 # specify number of tasks/cores per node required
-#SBATCH --ntasks-per-node 8
+#SBATCH --ntasks-per-node 3
 
 # specify the walltime e.g 10 days 
 #SBATCH -t 10-00:00:00
@@ -26,4 +26,4 @@ conda activate uniqureSSLGA
 cd ~/TCN_SSL_GA
 
 # Run the Python script
-python preprocessing_binary_train_2.py
+python preprocessing_binary_train_3.py
