@@ -5,7 +5,7 @@ This module centralises all architecture definitions, dataset classes,
 training loops, and evaluation functions used across the pipeline notebooks:
   - tcn_HPT_binary.ipynb (hyperparameter tuning)
   - TCN training and evaluation notebooks
-  - TCN-Attention and SSL pipeline notebooks
+  - TCN-TemporalAttention and SSL pipeline notebooks
 
 All components are parameterised -- no global variable references.
 Every class and function includes a RESEARCH REPORTING NOTE block
@@ -574,16 +574,102 @@ class TCN(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# 10. TCNWithAttention
+# 10. TemporalAttention
+# ---------------------------------------------------------------------------
+class TemporalAttention(nn.Module):
+    """Additive temporal attention: learns a scalar importance weight per time step.
+
+    A single linear projection maps each feature vector to a scalar score.
+    Scores are normalised with softmax over the temporal axis, producing a
+    probability distribution (saliency map) across time steps. The output is
+    the convex combination (weighted sum) of all input feature vectors.
+
+    Complexity: O(T * D) -- linear in sequence length, versus O(T^2 * D * H)
+    for multi-head self-attention. Equivalent to Bahdanau-style additive
+    attention with a single global query vector.
+
+    Parameters
+    ----------
+    embed_dim : int
+        Dimensionality of the input feature vectors (= num_filters from TCN).
+
+    Example
+    -------
+    >>> attn = TemporalAttention(64)
+    >>> context, weights = attn(torch.randn(8, 2500, 64))
+    >>> context.shape  # (8, 64)
+    >>> weights.shape  # (8, 2500)
+    """
+
+    def __init__(self, embed_dim):
+        super().__init__()
+        # Single linear layer maps each feature vector to a scalar logit
+        self.score = nn.Linear(embed_dim, 1, bias=True)
+
+    def forward(self, x):
+        """Compute attended context vector and attention weights.
+
+        Parameters
+        ----------
+        x : torch.Tensor, shape (batch, time, embed_dim)
+            TCN output in channels-last layout.
+
+        Returns
+        -------
+        context : torch.Tensor, shape (batch, embed_dim)
+            Attention-weighted sum over the temporal axis.
+        weights : torch.Tensor, shape (batch, time)
+            Softmax attention weights -- interpretable as temporal saliency.
+        """
+        logits = self.score(x).squeeze(-1)          # (batch, time) scalar score per step
+        weights = torch.softmax(logits, dim=-1)     # (batch, time) normalised over T
+        # Weighted sum: (batch, 1, time) x (batch, time, embed_dim) -> (batch, embed_dim)
+        context = torch.bmm(weights.unsqueeze(1), x).squeeze(1)
+        return context, weights
+
+
+# -- RESEARCH REPORTING NOTE: TemporalAttention --------------------------------
+# Methods description:
+#   A lightweight additive temporal attention module was inserted between the
+#   TCN stack and the classification head. A single linear layer projected each
+#   time-step feature vector to a scalar logit; softmax over the time axis
+#   produced a probability distribution over time steps. The attended context
+#   vector was the convex combination of feature vectors weighted by this
+#   distribution, providing an interpretable temporal saliency map.
+#
+# Parameters to report in paper:
+#   embed_dim : equals num_filters (the TCN channel width)
+#   Learnable parameters in attention: embed_dim + 1 (score layer weight + bias)
+#
+# Design choices to justify:
+#   O(T * D) complexity : linear in sequence length vs O(T^2 * D * H) for MHA;
+#     critical for 2,500-sample EEG segments at 500 Hz.
+#   Single query vector : sufficient for seizure detection -- discriminative
+#     information is a localised ictal discharge, not a pairwise positional
+#     relationship between feature dimensions.
+#   Softmax over T : produces a proper probability distribution, enabling
+#     weights to be visualised directly as a temporal saliency map.
+#   No residual connection needed : temporal attention replaces global average
+#     pooling entirely; the weighted sum already preserves all TCN features.
+# -----------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# 11. TCNWithAttention
 # ---------------------------------------------------------------------------
 class TCNWithAttention(nn.Module):
-    """TCN backbone followed by multi-head self-attention.
+    """TCN backbone followed by temporal attention pooling.
 
     The TCN extracts temporal features using two-convolution residual
-    blocks (Bai et al., 2018); self-attention captures global
-    dependencies across the full sequence. Optionally returns the
-    embedding (before the classification head) for use as an encoder
-    in SSL pipelines.
+    blocks (Bai et al., 2018); temporal attention (TemporalAttention) learns
+    a scalar importance weight per time step and collapses the sequence to a
+    fixed-length embedding via a weighted sum. The attention weights form an
+    interpretable saliency map over the segment window, indicating which time
+    steps were most informative for classification.
+
+    Replaces multi-head self-attention (Q=K=V, O(T^2*D*H)) with additive
+    temporal attention (O(T*D)), removing the n_heads hyperparameter and
+    global average pooling in favour of a single attention pooling step.
 
     Receptive field: RF = 2 * (2^L - 1) * (k - 1) + 1 samples.
 
@@ -597,10 +683,8 @@ class TCNWithAttention(nn.Module):
         TCN kernel size (odd).
     dropout : float
         Spatial dropout rate for TCN blocks.
-    n_heads : int, default 4
-        Number of attention heads.
     return_embedding : bool, default False
-        If True, return the pooled embedding instead of classification logits.
+        If True, return the attended embedding instead of classification logits.
     fs : int, default 500
         Sampling rate for RF logging.
 
@@ -611,7 +695,7 @@ class TCNWithAttention(nn.Module):
     """
 
     def __init__(self, num_layers, num_filters, kernel_size, dropout,
-                 n_heads=4, return_embedding=False, fs=500):
+                 return_embedding=False, fs=500):
         super().__init__()
         layers = []
         for i in range(num_layers):
@@ -620,10 +704,9 @@ class TCNWithAttention(nn.Module):
             layers.append(CausalConvBlock(in_ch, num_filters, kernel_size, dilation, dropout))
         self.tcn = nn.Sequential(*layers)
 
-        # Multi-head self-attention: Q = K = V = TCN output
-        self.attn = nn.MultiheadAttention(
-            embed_dim=num_filters, num_heads=n_heads, batch_first=True
-        )
+        # Temporal attention: scalar weight per time step (replaces nn.MultiheadAttention)
+        # n_heads parameter removed -- TemporalAttention has no head count
+        self.attn = TemporalAttention(embed_dim=num_filters)
         self.attn_norm = nn.LayerNorm(num_filters)  # post-attention normalisation
         self.return_embedding = return_embedding
         self.head = nn.Linear(num_filters, 1)       # classification head
@@ -636,11 +719,10 @@ class TCNWithAttention(nn.Module):
         out = self.tcn(x)                           # (batch, num_filters, time)
         out = out.transpose(1, 2)                   # (batch, time, num_filters) for attention
 
-        # Self-attention with residual connection and layer norm
-        attn_out, _ = self.attn(out, out, out)      # Q = K = V = TCN output
-        out = self.attn_norm(out + attn_out)         # residual + LayerNorm
-
-        out = out.mean(dim=1)                       # global average pooling over time
+        # Temporal attention pooling: replaces self-attention + global average pooling
+        # context is the attention-weighted sum; _ are the saliency weights (batch, time)
+        context, _ = self.attn(out)                 # context: (batch, num_filters)
+        out = self.attn_norm(context)               # LayerNorm on attended context vector
 
         if self.return_embedding:
             return out                              # (batch, num_filters) embedding
@@ -649,22 +731,28 @@ class TCNWithAttention(nn.Module):
 
 # -- RESEARCH REPORTING NOTE: TCNWithAttention ---------------------------------
 # Methods description:
-#   A multi-head self-attention layer was appended after the TCN stack. The
-#   TCN output served as query, key, and value (self-attention). A residual
-#   connection and layer normalisation followed the attention output. Global
-#   average pooling produced a fixed-length embedding vector.
+#   An additive temporal attention layer (TemporalAttention) was appended after
+#   the TCN stack, replacing both multi-head self-attention and global average
+#   pooling. A single linear projection scored each time step; softmax over the
+#   temporal axis produced importance weights. The attended context vector
+#   (weighted sum of TCN features) was layer-normalised before the
+#   classification head.
 #
 # Parameters to report in paper:
-#   n_heads : number of attention heads
-#   num_filters : embedding dimension (= TCN channel width)
+#   num_filters : embedding dimension (= TCN channel width = attention embed_dim)
 #   All TCN parameters (num_layers, kernel_size, dropout)
 #   total trainable parameters
+#   attention parameters: num_filters + 1 (score layer weight + bias)
+#   Note: n_heads removed -- temporal attention has no head count hyperparameter
 #
 # Design choices to justify:
-#   Self-attention after TCN : captures long-range temporal dependencies
-#     beyond the TCN receptive field without increasing dilation depth.
-#   Residual + LayerNorm after attention : standard transformer practice;
-#     stabilises training and preserves TCN features.
+#   Temporal attention replacing MHA : O(T*D) vs O(T^2*D*H); removes n_heads
+#     as a hyperparameter; critical for 2,500-sample segments at 500 Hz.
+#   Attention replaces global average pooling : the weighted sum is a strict
+#     generalisation of uniform pooling -- it can learn to replicate GAP or
+#     focus on seizure onset regions.
+#   LayerNorm after attention : stabilises the context vector before the
+#     linear classification head.
 #   return_embedding mode : enables reuse as encoder in SSL pipelines.
 # -----------------------------------------------------------------------------
 
@@ -675,9 +763,9 @@ class TCNWithAttention(nn.Module):
 class SSLModel(nn.Module):
     """Self-supervised learning model with encoder and projection head.
 
-    The encoder is a TCNWithAttention in embedding mode. The projector
-    maps embeddings to a lower-dimensional space for contrastive loss.
-    Outputs are L2-normalised to the unit hypersphere.
+    The encoder is a TCNWithAttention (with temporal attention) in embedding
+    mode. The projector maps embeddings to a lower-dimensional space for
+    contrastive loss. Outputs are L2-normalised to the unit hypersphere.
 
     Parameters
     ----------
@@ -691,8 +779,8 @@ class SSLModel(nn.Module):
         Spatial dropout rate.
     projection_dim : int, default 128
         Output dimension of the projection head.
-    n_heads : int, default 4
-        Number of attention heads in the encoder.
+    Note: n_heads removed -- TCNWithAttention now uses TemporalAttention
+        which has no head count hyperparameter.
 
     Example
     -------
@@ -701,11 +789,12 @@ class SSLModel(nn.Module):
     """
 
     def __init__(self, num_layers, num_filters, kernel_size, dropout,
-                 projection_dim=128, n_heads=4):
+                 projection_dim=128):
         super().__init__()
+        # n_heads removed: TCNWithAttention uses TemporalAttention (no head count)
         self.encoder = TCNWithAttention(
             num_layers, num_filters, kernel_size, dropout,
-            n_heads=n_heads, return_embedding=True
+            return_embedding=True
         )
         self.projector = nn.Sequential(
             nn.Linear(num_filters, num_filters),    # first linear layer
@@ -722,19 +811,25 @@ class SSLModel(nn.Module):
 
 # -- RESEARCH REPORTING NOTE: SSLModel -----------------------------------------
 # Methods description:
-#   The self-supervised model comprised a TCN-Attention encoder followed by
-#   a two-layer projection head (Linear-GELU-Linear) mapping to a
+#   The self-supervised model comprised a TCN-TemporalAttention encoder followed
+#   by a two-layer projection head (Linear-GELU-Linear) mapping to a
 #   projection_dim-dimensional space. Outputs were L2-normalised to the
-#   unit hypersphere for NT-Xent contrastive loss computation.
+#   unit hypersphere for NT-Xent contrastive loss computation. The encoder
+#   uses additive temporal attention (TemporalAttention) in place of the
+#   previous multi-head self-attention layer; n_heads is no longer a parameter.
 #
 # Parameters to report in paper:
 #   projection_dim : output dimension of the projection head
-#   All encoder parameters (num_layers, num_filters, kernel_size, dropout, n_heads)
+#   All encoder parameters (num_layers, num_filters, kernel_size, dropout)
+#   Note: n_heads removed -- temporal attention has no head count hyperparameter
 #
 # Design choices to justify:
 #   Two-layer projector with GELU : standard SimCLR-style projection head;
 #     non-linear projector empirically outperforms linear for contrastive learning.
 #   L2 normalisation : required for cosine-similarity-based NT-Xent loss.
+#   Temporal attention in encoder : attention weights produced during SSL
+#     pre-training are available for post-hoc visualisation and auxiliary
+#     regularisation without additional architectural cost.
 # -----------------------------------------------------------------------------
 
 
@@ -802,7 +897,7 @@ def nt_xent_loss(z1, z2, temperature=0.5):
 # 13. FineTunedModel
 # ---------------------------------------------------------------------------
 class FineTunedModel(nn.Module):
-    """Fine-tuned model: pre-trained TCN-Attention encoder + linear classifier.
+    """Fine-tuned model: pre-trained TCN-TemporalAttention encoder + linear classifier.
 
     The encoder can be frozen during initial fine-tuning epochs, then unfrozen
     for end-to-end training with a lower learning rate.
@@ -810,7 +905,7 @@ class FineTunedModel(nn.Module):
     Parameters
     ----------
     encoder : TCNWithAttention
-        Pre-trained encoder in return_embedding=True mode.
+        Pre-trained encoder (with temporal attention) in return_embedding=True mode.
     num_filters : int
         Encoder embedding dimension (must match encoder output).
     freeze_encoder : bool, default True
@@ -825,7 +920,7 @@ class FineTunedModel(nn.Module):
 
     def __init__(self, encoder, num_filters, freeze_encoder=True):
         super().__init__()
-        self.encoder = encoder                     # pre-trained TCN-Attention encoder
+        self.encoder = encoder                     # pre-trained TCN-TemporalAttention encoder
         self.classifier = nn.Linear(num_filters, 1)  # binary classification head
 
         if freeze_encoder:
@@ -841,10 +936,11 @@ class FineTunedModel(nn.Module):
 # -- RESEARCH REPORTING NOTE: FineTunedModel -----------------------------------
 # Methods description:
 #   For fine-tuning, a linear classification head was appended to the
-#   pre-trained TCN-Attention encoder. During the initial phase, the encoder
-#   was frozen and only the classification head was trained. In the second
-#   phase, the encoder was unfrozen and trained end-to-end with a reduced
-#   learning rate.
+#   pre-trained TCN-TemporalAttention encoder. During the initial phase, the
+#   encoder was frozen and only the classification head was trained. In the
+#   second phase, the encoder was unfrozen and trained end-to-end with a
+#   reduced learning rate. The temporal attention weights of the encoder can
+#   be extracted post-hoc for seizure onset localisation analysis.
 #
 # Parameters to report in paper:
 #   freeze_epochs : number of epochs with frozen encoder
@@ -857,6 +953,8 @@ class FineTunedModel(nn.Module):
 #     encoder weights.
 #   Lower encoder LR : standard transfer learning practice to preserve
 #     pre-trained features while allowing task-specific adaptation.
+#   Temporal attention weights : post-hoc temporal saliency maps available
+#     from the encoder at inference time with no additional architectural cost.
 # -----------------------------------------------------------------------------
 
 
