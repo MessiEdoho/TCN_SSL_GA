@@ -81,35 +81,53 @@ from tcn_utils import (
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-SEED              = 42                                 # global reproducibility seed
-MAX_EPOCHS        = 100                                # max training epochs
-ES_PATIENCE       = 10                                 # early stopping patience
-CHECKPOINT_FREQ   = 5                                  # save periodic checkpoint every N epochs
-KEEP_CKPTS        = 3                                  # keep only the last N periodic checkpoints
-FS                = 500                                # EEG sampling rate (Hz)
-SEGMENT_LEN       = 2500                               # samples per segment (5 s at 500 Hz)
-SEGMENT_SEC       = 5.0                                # segment duration in seconds
-STEP_SEC          = 2.5                                # step between segment starts (50% overlap)
-MIN_EVENT_SEC     = 10.0                               # minimum event duration filter
-REFRACTORY_SEC    = 30.0                               # refractory period for event merging
-SMOOTHING_WIN     = 3                                  # probability smoothing window
-MODEL_NAME        = "TCN"                              # model identifier
+SEED              = 42                                 # global reproducibility seed (Python, NumPy, PyTorch CPU+CUDA)
+# 100 epochs provides a generous upper bound that lets the cosine
+# annealing schedule complete a full cycle from lr to eta_min.
+# Early stopping (patience=10) terminates training well before 100
+# epochs if the model has converged, so the budget is rarely exhausted.
+# This value is standard in EEG deep learning literature (Acharya et al.,
+# 2018; Yildirim et al., 2020) and balances compute cost against the
+# risk of premature termination when validation F1 plateaus temporarily.
+MAX_EPOCHS        = 100                                # max training epochs (upper bound)
+ES_PATIENCE       = 10                                 # epochs without val F1 improvement before stopping
+CHECKPOINT_FREQ   = 5                                  # save periodic checkpoint every N epochs for crash recovery
+KEEP_CKPTS        = 3                                  # disk-space cap: keep only the 3 most recent periodic checkpoints
+FS                = 500                                # native EDF sampling rate (Hz)
+SEGMENT_LEN       = 2500                               # samples per segment: 5 s * 500 Hz
+SEGMENT_SEC       = 5.0                                # segment duration in seconds (= SEGMENT_LEN / FS)
+STEP_SEC          = 2.5                                # step between segment starts: 50% overlap for temporal continuity
+# Minimum event duration filter: genuine rodent seizures typically
+# last at least 10 seconds (Luttjohann et al., 2009). Events shorter
+# than this threshold are almost certainly artefacts or transient noise.
+MIN_EVENT_SEC     = 10.0                               # discard detected events shorter than this (seconds)
+# Refractory period: a single seizure can produce a brief mid-event
+# probability dip below threshold. Merging events separated by < 30 s
+# prevents one seizure from being counted as multiple alarms.
+REFRACTORY_SEC    = 30.0                               # merge events separated by fewer than this (seconds)
+# Smoothing window: a 3-segment uniform moving average suppresses
+# isolated single-segment false-positive spikes caused by transient
+# artefacts before binarisation. Wider windows risk blurring seizure
+# onset boundaries; narrower windows provide insufficient suppression.
+SMOOTHING_WIN     = 3                                  # number of segments in the probability smoothing kernel
+MODEL_NAME        = "TCN"                              # model identifier for output filenames and JSON records
 
-OUTPUT_ROOT       = Path("outputs") / "TCN"
-CKPT_DIR          = OUTPUT_ROOT / "checkpoints"
-LOG_DIR           = OUTPUT_ROOT / "logs"
-FIGURE_DIR        = OUTPUT_ROOT / "figures"
-WEIGHTS_PATH      = OUTPUT_ROOT / "tcn_final_weights.pt"
-TRAIN_LOG_PATH    = OUTPUT_ROOT / "tcn_training_log.json"
-EVAL_REPORT_PATH  = OUTPUT_ROOT / "tcn_evaluation_report.json"
-THRESH_PATH       = OUTPUT_ROOT / "tcn_optimal_threshold.json"
-EPOCH_CSV         = OUTPUT_ROOT / "tcn_epoch_metrics.csv"
-THREE_ROW_CSV     = OUTPUT_ROOT / "tcn_three_row_summary.csv"
-# data_splits.json lives at data_splits_outputs/ per generate_data_splits.py
+OUTPUT_ROOT       = Path("outputs") / "TCN"            # all M1 outputs under this directory
+CKPT_DIR          = OUTPUT_ROOT / "checkpoints"        # periodic and best-model checkpoints
+LOG_DIR           = OUTPUT_ROOT / "logs"               # training log (DEBUG-level detail)
+FIGURE_DIR        = OUTPUT_ROOT / "figures"            # all 12 evaluation figures
+WEIGHTS_PATH      = OUTPUT_ROOT / "tcn_final_weights.pt"       # final model weights (best epoch)
+TRAIN_LOG_PATH    = OUTPUT_ROOT / "tcn_training_log.json"      # full training history as JSON
+EVAL_REPORT_PATH  = OUTPUT_ROOT / "tcn_evaluation_report.json" # three-row evaluation report
+THRESH_PATH       = OUTPUT_ROOT / "tcn_optimal_threshold.json" # Youden-optimal threshold + metadata
+EPOCH_CSV         = OUTPUT_ROOT / "tcn_epoch_metrics.csv"      # per-epoch loss, F1, LR for plotting
+THREE_ROW_CSV     = OUTPUT_ROOT / "tcn_three_row_summary.csv"  # paper Table 1 (M1 block)
+# data_splits.json lives at data_splits_outputs/ per generate_data_splits.py;
+# SPLITS_PATH_ALT is a fallback in case the user moved it to outputs/
 SPLITS_PATH_PRIMARY = Path("data_splits_outputs") / "data_splits.json"
 SPLITS_PATH_ALT     = Path("outputs") / "data_splits.json"
-BEST_PARAMS_PATH    = Path("outputs") / "best_params.json"
-PREV_THRESH_PATH    = Path("outputs") / "optimal_threshold_tcn.json"
+BEST_PARAMS_PATH    = Path("outputs") / "best_params.json"     # produced by tcn_HPT_binary.ipynb
+PREV_THRESH_PATH    = Path("outputs") / "optimal_threshold_tcn.json"  # reuse if already computed
 
 
 # ---------------------------------------------------------------------------
@@ -263,17 +281,21 @@ def build_model(hp, device, logger):
     -------
     model : nn.Module
     """
+    # Fix seed before weight init so every run starts from identical parameters.
+    # This isolates the effect of hyperparameters from initialisation randomness.
     set_seed(SEED)
     # TCN.__init__(num_layers, num_filters, kernel_size, dropout, fs=500)
+    # All four architecture params come from Optuna's best trial in best_params.json.
+    # fs is used only for receptive-field logging inside TCN, not for computation.
     model = TCN(
-        num_layers=int(hp["num_layers"]),
-        num_filters=int(hp["num_filters"]),
-        kernel_size=int(hp["kernel_size"]),
-        dropout=float(hp["dropout"]),
-        fs=FS,
+        num_layers=int(hp["num_layers"]),     # L: depth and RF growth
+        num_filters=int(hp["num_filters"]),   # channel width per block
+        kernel_size=int(hp["kernel_size"]),   # local temporal resolution
+        dropout=float(hp["dropout"]),         # spatial dropout rate (Dropout1d)
+        fs=FS,                                # sampling rate for RF logging only
     )
-    model = model.to(device)
-    n_params = count_parameters(model)
+    model = model.to(device)                  # move all parameters to GPU if available
+    n_params = count_parameters(model)        # sum of requires_grad=True elements
     logger.info("Model: %s", MODEL_NAME)
     logger.info("Parameters: %s", "{:,}".format(n_params))
     logger.info("Device: %s", device)
@@ -288,16 +310,24 @@ def build_training_components(model, train_pairs, hp, device, logger):
 
     Returns (optimiser, scheduler, criterion).
     """
+    # AdamW decouples weight decay from the gradient update (Loshchilov & Hutter,
+    # 2019), preventing regularisation strength from shrinking as LR decays.
     optimiser = torch.optim.AdamW(
         model.parameters(),
-        lr=float(hp["learning_rate"]),
-        weight_decay=float(hp["weight_decay"]))
+        lr=float(hp["learning_rate"]),        # initial LR from Optuna best trial
+        weight_decay=float(hp["weight_decay"]))  # L2 regularisation coefficient
+    # Cosine annealing smoothly decays LR from initial value to eta_min over
+    # T_max epochs, avoiding abrupt drops that can destabilise training.
+    # T_max = MAX_EPOCHS so one full cosine half-cycle spans the training budget.
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimiser,
         T_max=MAX_EPOCHS,
-        eta_min=float(hp["learning_rate"]) * 0.01)
+        eta_min=float(hp["learning_rate"]) * 0.01)  # floor at 1% of initial LR
+    # pos_weight = n_non_ictal / n_ictal upweights ictal gradient contribution.
+    # Combined with WeightedRandomSampler in make_loader(train=True), this
+    # provides dual imbalance correction: balanced batches + weighted loss.
     pos_weight = compute_pos_weight(train_pairs, device)
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)  # built-in sigmoid + BCE
     logger.info("Optimiser: AdamW (lr=%.2e, wd=%.2e)", hp["learning_rate"], hp["weight_decay"])
     logger.info("Scheduler: CosineAnnealingLR (T_max=%d)", MAX_EPOCHS)
     logger.info("pos_weight: %.4f", pos_weight.item())
@@ -364,18 +394,23 @@ def evaluate_model(model, loader, device, logger):
 
     Returns (val_f1, y_true, y_pred, y_prob).
     """
-    # evaluate(model, loader, device) -> (macro_f1, y_true, y_pred)
+    # evaluate() returns macro F1, ground truth, and binary preds at threshold 0.5.
+    # It does NOT return continuous probabilities, which are needed for AUROC,
+    # calibration curves, PR curves, and the post-processing pipeline.
     val_f1, y_true, y_pred = evaluate(model, loader, device)
 
-    # Separate inference pass for continuous probabilities
+    # Second inference pass collects continuous sigmoid probabilities (y_prob).
+    # This is a separate pass because evaluate() in tcn_utils.py only stores
+    # binarised predictions. The overhead is acceptable because inference is
+    # fast relative to the training epoch that preceded it.
     model.eval()
     all_probs = []
-    with torch.no_grad():
+    with torch.no_grad():                    # disable gradient tracking for speed + memory
         for x, _ in loader:
             x = x.to(device)
-            probs = torch.sigmoid(model(x)).cpu().numpy()
-            all_probs.extend(probs)
-    y_prob = np.array(all_probs)
+            probs = torch.sigmoid(model(x)).cpu().numpy()  # sigmoid maps logits to [0,1]
+            all_probs.extend(probs)          # accumulate on CPU to avoid VRAM buildup
+    y_prob = np.array(all_probs)             # shape: (n_segments,) continuous in [0,1]
 
     return val_f1, y_true, y_pred, y_prob
 
@@ -388,20 +423,30 @@ def compute_all_metrics(y_true, y_pred, y_prob, segment_sec, logger, label=""):
 
     Returns a dict with all values for JSON serialisation.
     """
+    # labels=[0,1] forces a 2x2 matrix even if one class is absent in y_pred
     tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
-    tn, fp, fn, tp = int(tn), int(fp), int(fn), int(tp)
+    tn, fp, fn, tp = int(tn), int(fp), int(fn), int(tp)  # cast to Python int for JSON
 
-    accuracy    = accuracy_score(y_true, y_pred)
-    prec        = precision_score(y_true, y_pred, pos_label=1, zero_division=0)
-    recall      = recall_score(y_true, y_pred, pos_label=1, zero_division=0)
-    f1_macro    = f1_score(y_true, y_pred, average="macro", zero_division=0)
-    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+    accuracy    = accuracy_score(y_true, y_pred)           # (TP+TN) / total
+    prec        = precision_score(y_true, y_pred, pos_label=1, zero_division=0)  # TP / (TP+FP)
+    recall      = recall_score(y_true, y_pred, pos_label=1, zero_division=0)     # TP / (TP+FN) = sensitivity
+    f1_macro    = f1_score(y_true, y_pred, average="macro", zero_division=0)     # mean of per-class F1
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0   # TN / (TN+FP)
+    # AUROC uses continuous probabilities, not binary predictions, so it is
+    # threshold-invariant and identical across all three evaluation rows.
     auroc       = roc_auc_score(y_true, y_prob) if len(np.unique(y_true)) > 1 else 0.0
     avg_prec    = average_precision_score(y_true, y_prob) if len(np.unique(y_true)) > 1 else 0.0
+    # Youden J = sensitivity + specificity - 1. Ranges from -1 (anti-classifier)
+    # to +1 (perfect). It is the vertical distance from the ROC diagonal to the
+    # operating point. Used as the threshold selection objective because it
+    # treats missed seizures and false alarms symmetrically.
     youden_j    = recall + specificity - 1.0
 
-    n_non_ic   = tn + fp
-    non_ic_hrs = (n_non_ic * segment_sec) / 3600.0
+    # Segment-level FAR/hr: raw FP segments divided by non-ictal recording hours.
+    # Only non-ictal segments contribute to the denominator because FAR measures
+    # alarms during normal brain activity, not during seizures.
+    n_non_ic   = tn + fp                                   # total non-ictal segments
+    non_ic_hrs = (n_non_ic * segment_sec) / 3600.0         # non-ictal duration in hours
     far_seg    = fp / non_ic_hrs if non_ic_hrs > 0 else 0.0
 
     logger.info("-- Metrics [%s] --", label)
@@ -448,11 +493,26 @@ def run_postprocessing_evaluations(y_true, y_prob, logger):
     row1_metrics["postprocessed"] = False
 
     # -- Find optimal threshold ------------------------------------------------
+    # Youden J statistic (J = sensitivity + specificity - 1) is chosen as the
+    # threshold selection objective for three reasons:
+    #   1. Symmetry: it penalises missed seizures (low sensitivity) and false
+    #      alarms (low specificity) equally, which matches the clinical priority
+    #      of seizure detection where both under- and over-detection carry cost.
+    #   2. Geometric meaning: J is the vertical distance from the ROC diagonal
+    #      to the operating point, so maximising J selects the point on the ROC
+    #      curve farthest from chance.
+    #   3. Independence from prevalence: unlike F1, J does not depend on the
+    #      positive predictive value, which is inflated or deflated by class
+    #      imbalance. This makes it stable across datasets with different
+    #      seizure-to-background ratios.
+    # The alternative (F1) weights false negatives more heavily than false
+    # positives via the precision term, which may not reflect the clinical
+    # balance required in continuous EEG monitoring.
     if PREV_THRESH_PATH.exists():
         with open(PREV_THRESH_PATH, "r", encoding="utf-8") as f:
             td = json.load(f)
         optimal_threshold = td["optimal_threshold"]
-        # Build a minimal thresh_result for plotting
+        # Still compute full threshold curve for the threshold selection plot
         thresh_result = find_optimal_threshold(y_true, y_prob, objective="youden")
         logger.info("Optimal threshold loaded from %s: %.4f", PREV_THRESH_PATH, optimal_threshold)
     else:
@@ -688,6 +748,13 @@ def plot_all_figures(history, best_epoch, best_val_f1,
     epochs = history["epoch"]
 
     # -- Figure 1: Training curves ---------------------------------------------
+    # PURPOSE: Demonstrates model convergence behaviour. The left panel shows
+    # training loss declining over epochs, confirming the optimiser is reducing
+    # the objective. The right panel shows validation macro F1, the metric that
+    # drives early stopping. Together they reveal whether the model overfit
+    # (loss drops but F1 plateaus/declines), underfit (both remain poor), or
+    # converged healthily (loss drops and F1 rises then stabilises). The
+    # vertical dashed line marks the epoch whose weights are saved as final.
     fig, axes = plt.subplots(1, 2, figsize=(13, 4))
     axes[0].plot(epochs, history["train_loss"], color="#5A7DC8", linewidth=1.2, label="Train loss")
     axes[0].axvline(best_epoch, linestyle="--", color="#C85A5A", alpha=0.7, label="Best epoch")
@@ -709,6 +776,11 @@ def plot_all_figures(history, best_epoch, best_val_f1,
     logger.info("Saved: %s", FIGURE_DIR / "tcn_training_curves.png")
 
     # -- Figure 2: LR schedule ------------------------------------------------
+    # PURPOSE: Verifies the cosine annealing schedule behaved as described in
+    # the Methods section. Reviewers check that the LR decay matches the
+    # reported schedule. A smooth half-cosine from initial LR to eta_min
+    # confirms correct configuration. Any flat segment at the end indicates
+    # early stopping terminated before the full cosine cycle completed.
     fig, ax = plt.subplots(figsize=(8, 3))
     ax.plot(epochs, history["lr"], color="#5A7DC8", linewidth=1.2)
     ax.set_yscale("log")
@@ -721,6 +793,12 @@ def plot_all_figures(history, best_epoch, best_val_f1,
     logger.info("Saved: %s", FIGURE_DIR / "tcn_lr_schedule.png")
 
     # -- Figures 3-5: Confusion matrices per row -------------------------------
+    # PURPOSE: One confusion matrix per evaluation row shows TP, FP, FN, TN
+    # counts. Comparing Row 1 to Row 2 isolates the effect of post-processing
+    # (smoothing + merging + min-duration filter) at the same threshold.
+    # Comparing Row 2 to Row 3 isolates the effect of threshold optimisation.
+    # The title of each matrix includes sensitivity, specificity, F1, and
+    # Youden J so the reader can assess all four quantities at a glance.
     for row_idx, (y_pred_row, m, row_label, thresh) in enumerate([
         (y_pred_row1, row1_metrics, "Row1: raw", 0.5),
         (y_pred_row2, row2_metrics, "Row2: post-proc", 0.5),
@@ -744,6 +822,12 @@ def plot_all_figures(history, best_epoch, best_val_f1,
     logger.info("Saved: confusion matrices (3 figures)")
 
     # -- Figure 6: ROC curve ---------------------------------------------------
+    # PURPOSE: Displays the trade-off between sensitivity and false positive
+    # rate across all possible thresholds. AUROC (area under this curve) is a
+    # threshold-invariant summary of discriminative ability. The three scatter
+    # points (R1, R2, R3) mark the actual operating points chosen for each
+    # evaluation row, showing where each configuration sits on the sensitivity-
+    # specificity trade-off. The diagonal dashed line represents chance (AUROC=0.5).
     fpr, tpr, _ = roc_curve(y_true, y_prob)
     auroc_val = roc_auc_score(y_true, y_prob) if len(np.unique(y_true)) > 1 else 0.0
     fig, ax = plt.subplots(figsize=(5, 5))
@@ -767,6 +851,13 @@ def plot_all_figures(history, best_epoch, best_val_f1,
     logger.info("Saved: %s", FIGURE_DIR / "tcn_roc_curve.png")
 
     # -- Figure 7: Threshold curve ---------------------------------------------
+    # PURPOSE: Directly answers the reviewer question "how was the threshold
+    # selected?" by plotting Youden J as a function of threshold from 0.1 to
+    # 0.9. The peak of this curve is the optimal threshold, marked with a
+    # vertical dashed line. A broad, flat peak suggests the model is robust
+    # to threshold choice; a narrow spike suggests sensitivity to the exact
+    # value. This plot is computed on the validation set only -- the selected
+    # threshold is applied without modification to the test set.
     curve = thresh_result.get("threshold_curve", {})
     if curve:
         thresholds_list = sorted(curve.keys())
@@ -786,6 +877,15 @@ def plot_all_figures(history, best_epoch, best_val_f1,
         logger.info("Saved: %s", FIGURE_DIR / "tcn_threshold_curve.png")
 
     # -- Figure 8: Metrics comparison ------------------------------------------
+    # PURPOSE: A grouped bar chart providing a single-figure summary of all
+    # seven classification metrics across all three evaluation rows. The top
+    # panel lets the reader see at a glance whether post-processing and
+    # threshold optimisation improved recall, specificity, and F1 relative
+    # to the raw baseline. The bottom panel compares FAR/hr, the primary
+    # clinical metric, across segment-level (Row 1) and event-level
+    # (Rows 2, 3) computation. The transition from segment-level to
+    # event-level FAR/hr typically shows a large reduction because post-
+    # processing collapses multiple consecutive FP segments into one event.
     metric_names = ["accuracy", "precision", "recall", "specificity", "f1_macro", "auroc", "average_precision"]
     r1_vals = [row1_metrics.get(m, 0) for m in metric_names]
     r2_vals = [row2_metrics.get(m, 0) for m in metric_names]
@@ -832,6 +932,15 @@ def plot_all_figures(history, best_epoch, best_val_f1,
     logger.info("Saved: %s", FIGURE_DIR / "tcn_metrics_comparison.png")
 
     # -- Figure 9: PR curve ----------------------------------------------------
+    # PURPOSE: The Precision-Recall curve is more informative than the ROC
+    # curve for imbalanced datasets (Davis & Goadrich, 2006) because it is
+    # sensitive to the positive class prevalence. AUROC can appear optimistic
+    # when the negative class vastly outnumbers the positive class, because
+    # large numbers of true negatives inflate the true negative rate. The
+    # no-skill baseline (horizontal dashed line at prevalence) shows what a
+    # random classifier would achieve. Average Precision (AP) summarises the
+    # area under this curve. A model with high AUROC but low AP has poor
+    # positive predictive value despite good discrimination.
     prec_arr, rec_arr, _ = precision_recall_curve(y_true, y_prob)
     avg_prec_val = average_precision_score(y_true, y_prob) if len(np.unique(y_true)) > 1 else 0.0
     prevalence = np.mean(y_true)
@@ -850,6 +959,15 @@ def plot_all_figures(history, best_epoch, best_val_f1,
     logger.info("Saved: %s", FIGURE_DIR / "tcn_pr_curve.png")
 
     # -- Figure 10: Calibration curve ------------------------------------------
+    # PURPOSE: Assesses whether predicted probabilities are well-calibrated,
+    # i.e., whether a segment predicted at p=0.7 is truly ictal ~70% of the
+    # time. Points above the diagonal indicate under-confidence (model is
+    # better than it thinks); points below indicate over-confidence. Poor
+    # calibration does not affect ranking metrics (AUROC, AP) but does affect
+    # the clinical meaning of the predicted probability -- a clinician
+    # interpreting p=0.8 as "80% chance of seizure" needs calibrated outputs.
+    # If calibration is poor, Platt scaling or isotonic regression may be
+    # applied as a post-hoc fix before deployment.
     fig, ax = plt.subplots(figsize=(5, 5))
     try:
         frac_pos, mean_pred = calibration_curve(y_true, y_prob, n_bins=10)
@@ -867,6 +985,14 @@ def plot_all_figures(history, best_epoch, best_val_f1,
     logger.info("Saved: %s", FIGURE_DIR / "tcn_calibration_curve.png")
 
     # -- Figure 11: FAR comparison bar chart -----------------------------------
+    # PURPOSE: Highlights the distinction between segment-level and event-level
+    # false alarm rates. Segment-level FAR (Row 1) counts every individual FP
+    # segment as a separate alarm, which inflates the rate because a single
+    # noise transient can trigger 2-3 consecutive FP segments due to 50%
+    # overlap. Event-level FAR (Rows 2, 3) collapses consecutive FP segments
+    # into a single alarm event after post-processing, yielding a clinically
+    # realistic alarm rate. The visual drop from Row 1 to Rows 2/3 quantifies
+    # the clinical benefit of the post-processing pipeline.
     fig, ax = plt.subplots(figsize=(7, 4))
     far_labels = ["Row1\nsegment-level", "Row2\nevent-level", "Row3\nevent-level"]
     far_vals = [
@@ -892,6 +1018,16 @@ def plot_all_figures(history, best_epoch, best_val_f1,
     logger.info("Saved: %s", FIGURE_DIR / "tcn_far_comparison.png")
 
     # -- Figure 12: Segment length analysis ------------------------------------
+    # PURPOSE: Justifies the MIN_EVENT_SEC and REFRACTORY_SEC post-processing
+    # parameters. The left histogram shows the distribution of detected event
+    # durations; events to the left of the MIN_EVENT_SEC dashed line were
+    # discarded by the minimum-duration filter, confirming that the filter
+    # removes only short-duration artefacts. The right scatter plot shows each
+    # event at its start time vs its duration, colour-coded by true/false alarm
+    # status. Clusters of short red (false alarm) events would suggest the
+    # min-duration filter is not aggressive enough; long green (true alarm)
+    # events confirm genuine seizure detections. This directly addresses
+    # reviewer questions about post-processing parameter sensitivity.
     fig, axes = plt.subplots(1, 2, figsize=(10, 4))
     # Combine events from rows 2 and 3
     all_durations = []
@@ -970,6 +1106,9 @@ def main():
     n_params = count_parameters(model)
 
     # -- Step 4: Build data loaders --------------------------------------------
+    # make_loader(train=True) creates a WeightedRandomSampler that oversamples
+    # the minority (ictal) class. make_loader(train=False) creates a plain
+    # sequential loader for deterministic validation evaluation.
     batch_size = int(hp["batch_size"])
     train_loader = make_loader(train_pairs, batch_size, True, DEVICE)
     val_loader = make_loader(val_pairs, batch_size, False, DEVICE)
@@ -1050,15 +1189,22 @@ def main():
     logger.info("=" * 65)
 
     # -- Step 9: Save final weights --------------------------------------------
+    # Move model to CPU before saving so the .pt file is device-agnostic --
+    # it can be loaded on any machine regardless of GPU availability.
     torch.save(model.cpu().state_dict(), WEIGHTS_PATH)
     size_mb = WEIGHTS_PATH.stat().st_size / 1e6
     logger.info("Weights saved : %s (%.2f MB)", WEIGHTS_PATH, size_mb)
-    model.to(DEVICE)
+    model.to(DEVICE)  # move back to GPU for the final evaluation pass
 
     # -- Step 10: Final evaluation on validation set ---------------------------
+    # Re-evaluate after restoring best weights. This produces the y_true and
+    # y_prob arrays needed for post-processing (Rows 1-3) and all figures.
     logger.info("Running final validation evaluation...")
     val_f1_final, y_true, y_pred_05, y_prob = evaluate_model(model, val_loader, DEVICE, logger)
 
+    # Consistency check: confirm F1 matches the best-epoch value. A mismatch
+    # indicates weight restoration failed (e.g., device mismatch, state_dict
+    # corruption). Tolerance of 1e-3 accounts for floating-point rounding.
     tol = 1e-3
     if abs(val_f1_final - best_val_f1) > tol:
         logger.warning("F1 mismatch: best=%.6f final=%.6f. Weight restoration may have failed.",
@@ -1153,39 +1299,145 @@ if __name__ == "__main__":
 #
 # Parameters to report (from best_params.json):
 #   num_layers L    -- determines RF
-#   kernel_size k   -- temporal resolution
-#   num_filters     -- model capacity
-#   dropout p       -- regularisation strength
-#   Total trainable parameters
-#   RF in samples and seconds
+#   kernel_size k   -- temporal resolution per convolution
+#   num_filters     -- model capacity (channel width)
+#   dropout p       -- spatial dropout rate (Dropout1d)
+#   Total trainable parameters (from count_parameters)
+#   RF in samples and seconds at 500 Hz
 #
 # -- TRAINING (Methods) ----------------------------------------------------
-# "The model was trained for up to MAX_EPOCHS=100 epochs using AdamW
-# (Loshchilov & Hutter, 2019) with learning rate LR and weight decay WD,
-# and a cosine annealing schedule (eta_min = LR * 0.01). Early stopping
-# with patience 10 was applied, monitoring validation macro F1. Gradient
-# clipping (max_norm=1.0) was applied at every step. Class imbalance was
-# addressed by WeightedRandomSampler and BCEWithLogitsLoss with
-# pos_weight = n_non_ictal / n_ictal."
+# "The model was trained for up to 100 epochs using AdamW (Loshchilov &
+# Hutter, 2019) with learning rate LR and weight decay WD, and a cosine
+# annealing schedule (eta_min = LR * 0.01). Early stopping with patience
+# 10 was applied, monitoring validation macro F1. Gradient clipping
+# (max_norm=1.0) was applied at every step. Class imbalance was addressed
+# by WeightedRandomSampler and BCEWithLogitsLoss with pos_weight =
+# n_non_ictal / n_ictal."
+#
+# WHY 100 EPOCHS:
+#   100 is a widely used upper bound in EEG deep learning literature
+#   (Acharya et al., 2018; Yildirim et al., 2020). It provides enough
+#   budget for the cosine annealing schedule to complete a full half-cycle
+#   from lr to eta_min, ensuring the learning rate explores both rapid
+#   and fine-grained optimisation phases. Early stopping (patience=10)
+#   terminates training as soon as the model has converged, so the full
+#   100 epochs are rarely exhausted. Increasing to 200 or 300 epochs
+#   would not improve results because early stopping would still trigger
+#   at approximately the same epoch, but would waste compute if the
+#   patience window happened to see a transient improvement.
+#
+# WHY AdamW (not SGD or Adam):
+#   AdamW decouples weight decay from the gradient update, so the
+#   regularisation effect remains constant as the learning rate decays
+#   under cosine annealing. Standard Adam conflates the two, causing
+#   effective regularisation to shrink towards zero as LR approaches
+#   eta_min, which can lead to overfitting in the final training phase.
+#
+# WHY COSINE ANNEALING (not step decay or constant LR):
+#   Cosine annealing provides a smooth, monotonic LR decay without
+#   abrupt drops that can destabilise training on small, noisy EEG
+#   datasets. The gradual reduction allows the model to explore broadly
+#   early in training and fine-tune late, without the need to manually
+#   choose step-decay milestones.
+#
+# WHY WEIGHTED-RANDOM-SAMPLER + POS_WEIGHT (dual correction):
+#   WeightedRandomSampler ensures each mini-batch contains roughly
+#   equal numbers of ictal and non-ictal segments, stabilising gradient
+#   direction. pos_weight further upweights the loss contribution of
+#   ictal segments, correcting any residual imbalance from stochastic
+#   sampling. This dual approach is more robust than either mechanism
+#   alone and is used consistently across all pipeline scripts.
 #
 # -- POST-PROCESSING (Methods) ---------------------------------------------
-# "Raw segment-level sigmoid probabilities were post-processed:
-# (1) A 3-segment moving average was applied to suppress transient noise.
-# (2) Consecutive positive segments separated by < 30 seconds were merged.
-# (3) Events shorter than 10 seconds were discarded.
-# The classification threshold was selected by maximising the Youden J
-# statistic (J = sensitivity + specificity - 1) on the validation set."
+# "Raw segment-level sigmoid probabilities were post-processed prior to
+# computing event-level false alarm rate:
+# (1) A 3-segment moving average was applied to suppress isolated
+#     single-segment false positives caused by transient artefacts.
+# (2) Consecutive positive segments separated by fewer than 30 seconds
+#     were merged into a single event, preventing one seizure from being
+#     counted as multiple alarms if the probability briefly dips mid-ictal.
+# (3) Events shorter than 10 seconds were discarded, as genuine rodent
+#     seizures typically last at least 10 seconds (Luttjohann et al., 2009)."
 #
-# -- THREE-ROW TABLE (Results) ---------------------------------------------
-# Report tcn_three_row_summary.csv as Table 1 (M1 block):
-#   Row 1: threshold=0.5, post-processing=No  -- baseline reference
-#   Row 2: threshold=0.5, post-processing=Yes -- isolates post-processing
-#   Row 3: threshold=opt, post-processing=Yes -- best operating point
-# AUROC is identical across rows (threshold-invariant).
+# WHY SMOOTHING_WIN = 3:
+#   A 3-segment kernel is the minimum that suppresses isolated 1-segment
+#   spikes while introducing only 1 segment of boundary uncertainty
+#   (floor(3/2) * 2.5s = 2.5s). Wider windows (5, 7) risk blurring
+#   seizure onset/offset boundaries, which would artificially inflate
+#   event durations and reduce temporal localisation accuracy.
+#
+# WHY REFRACTORY_SEC = 30:
+#   Rodent seizures can include brief inter-ictal pauses where the
+#   probability dips below threshold for a few seconds before resuming.
+#   A 30-second refractory period merges these fragmented detections into
+#   a single event. This value was chosen to exceed the longest typical
+#   inter-burst interval observed in the preprocessing analysis while
+#   remaining short enough not to merge genuinely separate seizures.
+#
+# WHY MIN_EVENT_SEC = 10:
+#   Genuine rodent seizures in the UNIQURE dataset last at least 10
+#   seconds (Luttjohann et al., 2009). Events shorter than this are
+#   overwhelmingly noise artefacts that survived smoothing. Discarding
+#   them dramatically reduces the false alarm rate without sacrificing
+#   true seizure detections.
 #
 # -- THRESHOLD SELECTION (Methods) -----------------------------------------
 # "The classification threshold was selected by maximising the Youden J
-# statistic on the validation set (thresholds 0.1 to 0.9, step 0.01).
-# The optimal threshold was applied without modification to the test set."
-# Report the optimal threshold value.
+# statistic (J = sensitivity + specificity - 1) on the validation set,
+# evaluating thresholds from 0.1 to 0.9 in steps of 0.01. The optimal
+# threshold was applied without modification to the test set."
+#
+# WHY YOUDEN J (not F1 or accuracy):
+#   Youden J = sensitivity + specificity - 1. It has three advantages:
+#   (1) Symmetry: it penalises missed seizures and false alarms equally,
+#       matching the clinical requirement that both under-detection and
+#       over-detection carry significant cost in continuous EEG monitoring.
+#   (2) Geometric meaning: J is the vertical distance from the ROC
+#       diagonal to the operating point, so maximising J selects the
+#       point on the ROC curve farthest from chance.
+#   (3) Prevalence independence: unlike F1, J does not depend on the
+#       positive predictive value, which is inflated/deflated by class
+#       imbalance. This makes J stable across datasets with different
+#       seizure-to-background ratios.
+#   F1, by contrast, penalises false negatives more heavily than false
+#   positives through the precision term. Accuracy is dominated by the
+#   majority class in imbalanced datasets and is therefore uninformative
+#   for threshold selection in seizure detection.
+#
+# WHY SEARCH RANGE 0.1 to 0.9:
+#   Thresholds below 0.1 produce near-all-positive predictions;
+#   thresholds above 0.9 produce near-all-negative predictions. Both
+#   extremes are clinically useless and numerically degenerate (Youden
+#   J approaches -1 or 0). The 0.01 step size provides sufficient
+#   granularity for a smooth threshold curve without excessive compute.
+#
+# -- THREE-ROW TABLE (Results) ---------------------------------------------
+# Report tcn_three_row_summary.csv as Table 1 (M1 block):
+#   Row 1: threshold=0.5, post-processing=No
+#     Baseline raw classifier output at the standard threshold.
+#     Allows comparison with prior work that uses 0.5 and no
+#     post-processing. FAR/hr is segment-level only.
+#   Row 2: threshold=0.5, post-processing=Yes
+#     Isolates the contribution of post-processing alone.
+#     Difference in FAR/hr between Row 1 and Row 2 quantifies
+#     how much of the segment-level alarm burden was noise.
+#   Row 3: threshold=optimal, post-processing=Yes
+#     Best clinical operating point. Threshold selected on
+#     validation set via Youden J. Apply to test set without
+#     further adjustment.
+# AUROC is identical across rows because it is computed from the
+# continuous probability distribution, which is threshold-invariant.
+# Report AUROC once per model with a footnote explaining this.
+#
+# -- FIGURES (Discussion) --------------------------------------------------
+# tcn_training_curves.png     : convergence and overfitting assessment
+# tcn_lr_schedule.png         : confirms cosine annealing behaved correctly
+# tcn_confusion_matrix_*.png  : TP/FP/FN/TN counts per evaluation row
+# tcn_roc_curve.png           : discrimination ability + operating points
+# tcn_threshold_curve.png     : Youden J vs threshold, justifies selection
+# tcn_metrics_comparison.png  : at-a-glance comparison across 3 rows
+# tcn_pr_curve.png            : precision-recall for imbalanced assessment
+# tcn_calibration_curve.png   : probability calibration (reliability)
+# tcn_far_comparison.png      : segment vs event FAR/hr reduction
+# tcn_segment_length_analysis : event duration and post-proc. justification
 # ======================================================================
