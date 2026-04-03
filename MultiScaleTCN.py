@@ -1,0 +1,1609 @@
+"""
+MultiScaleTCN.py
+================
+Training script for Model 3: Multi-Scale TCN.
+
+Mirrors TCN.py in structure. Adapted for the
+MultiScaleTCN architecture from tcn_utils.py.
+
+Trains for exactly 100 epochs with early stopping
+on validation macro F1 (patience 10). Saves model
+weights, checkpoints, logs, and a full evaluation
+report on the validation set.
+
+Architecture: MultiScaleTCN (tcn_utils.py)
+Three parallel CausalConvBlock branches:
+  Branch 1: dilations [1, 2, 4]   -- fine scale
+  Branch 2: dilations [2, 4, 8]   -- medium scale
+  Branch 3: dilations [4, 8, 16]  -- coarse scale
+Branch outputs fused then globally average-pooled.
+
+Hyperparameters loaded from:
+  outputs/best_multiscale_params.json
+  (produced by tune_multiscale_tcn.py)
+
+Three evaluation rows:
+  Row 1: raw predictions at threshold 0.5
+  Row 2: post-processed at threshold 0.5
+  Row 3: post-processed at optimal threshold
+
+The test set is never loaded in this script.
+It is reserved for final_evaluation.py.
+
+Pipeline position
+-----------------
+After  : tune_multiscale_tcn.py
+Before : final_evaluation.py
+
+Usage
+-----
+python MultiScaleTCN.py
+
+Key outputs
+-----------
+outputs/MultiScaleTCN/multiscale_tcn_final_weights.pt
+outputs/MultiScaleTCN/multiscale_tcn_evaluation_report.json
+outputs/MultiScaleTCN/multiscale_tcn_three_row_summary.csv
+outputs/MultiScaleTCN/figures/  (13 figures)
+"""
+
+# ---------------------------------------------------------------------------
+# Imports
+# ---------------------------------------------------------------------------
+import json
+import logging
+import sys
+import csv
+import datetime
+import shutil
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn as nn
+
+import matplotlib
+matplotlib.use("Agg")                                  # non-interactive backend before any plt import
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score,
+    f1_score, roc_auc_score, confusion_matrix,
+    roc_curve, precision_recall_curve,
+    average_precision_score,
+    classification_report, calibration_curve,
+)
+
+# tcn_utils imports -- exact names confirmed from reading tcn_utils.py.
+# run_training() exists but is not used here; an explicit training loop
+# provides full control over checkpointing, logging, and per-epoch CSV output.
+from tcn_utils import (
+    set_seed,
+    MultiScaleTCN,
+    make_loader,
+    compute_pos_weight,
+    train_one_epoch,
+    evaluate,
+    count_parameters,
+    segment_predictions_to_events,
+    compute_event_level_far,
+    find_optimal_threshold,
+)
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+SEED              = 42                                 # global seed (Python, NumPy, PyTorch CPU+CUDA)
+# 100 epochs provides a generous upper bound that lets the cosine annealing
+# schedule complete a full half-cycle from lr to eta_min. Early stopping
+# (patience=10) terminates training well before 100 epochs if the model has
+# converged, so the budget is rarely exhausted. This value is standard in
+# EEG deep learning literature (Acharya et al., 2018; Yildirim et al., 2020)
+# and balances compute cost against the risk of premature termination when
+# validation F1 plateaus temporarily before a later improvement. Increasing
+# to 200+ epochs would not help because early stopping would still fire at
+# the same epoch; reducing to 50 risks cutting off the cosine cycle before
+# the learning rate reaches its minimum, preventing fine-grained convergence.
+MAX_EPOCHS        = 100                                # max training epochs (upper bound)
+ES_PATIENCE       = 10                                 # epochs without val F1 improvement before stopping
+CHECKPOINT_FREQ   = 5                                  # save periodic checkpoint every N epochs for crash recovery
+KEEP_CKPTS        = 3                                  # disk-space cap: keep only 3 most recent periodic ckpts
+FS                = 500                                # native EDF sampling rate (Hz)
+SEGMENT_LEN       = 2500                               # samples per segment: 5 s * 500 Hz
+SEGMENT_SEC       = 5.0                                # segment duration in seconds (= SEGMENT_LEN / FS)
+STEP_SEC          = 2.5                                # step between segment starts: 50% overlap for continuity
+# Minimum event duration filter: genuine rodent seizures typically last at
+# least 10 seconds (Luttjohann et al., 2009). Events shorter than this are
+# almost certainly transient artefacts or noise that survived smoothing.
+MIN_EVENT_SEC     = 10.0                               # discard detected events shorter than this (seconds)
+# Refractory period: a single seizure can produce a brief mid-event dip
+# below threshold. Merging events separated by < 30 s prevents one seizure
+# from being counted as multiple alarms.
+REFRACTORY_SEC    = 30.0                               # merge events separated by fewer than this (seconds)
+# Smoothing window: a 3-segment uniform moving average suppresses isolated
+# single-segment false-positive spikes. Wider windows blur seizure onset
+# boundaries; narrower windows provide insufficient suppression.
+SMOOTHING_WIN     = 3                                  # number of segments in probability smoothing kernel
+MODEL_NAME        = "MultiScaleTCN"                    # model identifier for filenames and JSON records
+
+OUTPUT_ROOT       = Path("outputs") / "MultiScaleTCN"            # all M3 outputs under this directory
+CKPT_DIR          = OUTPUT_ROOT / "checkpoints"                  # periodic and best-model checkpoints
+LOG_DIR           = OUTPUT_ROOT / "logs"                         # training log (DEBUG-level detail)
+FIGURE_DIR        = OUTPUT_ROOT / "figures"                      # all 13 evaluation figures
+WEIGHTS_PATH      = OUTPUT_ROOT / "multiscale_tcn_final_weights.pt"      # final weights (best epoch)
+TRAIN_LOG_PATH    = OUTPUT_ROOT / "multiscale_tcn_training_log.json"     # full history + branch RFs
+EVAL_REPORT_PATH  = OUTPUT_ROOT / "multiscale_tcn_evaluation_report.json"  # three-row eval report
+THRESH_PATH       = OUTPUT_ROOT / "multiscale_tcn_optimal_threshold.json"  # Youden-optimal threshold
+EPOCH_CSV         = OUTPUT_ROOT / "multiscale_tcn_epoch_metrics.csv"     # per-epoch loss, F1, LR
+THREE_ROW_CSV     = OUTPUT_ROOT / "multiscale_tcn_three_row_summary.csv" # paper Table (M3 block)
+# data_splits.json lives at data_splits_outputs/ per generate_data_splits.py;
+# SPLITS_PATH_ALT is a fallback in case the user moved it to outputs/
+SPLITS_PATH_PRIMARY = Path("data_splits_outputs") / "data_splits.json"
+SPLITS_PATH_ALT     = Path("outputs") / "data_splits.json"
+BEST_PARAMS_PATH    = Path("outputs") / "best_multiscale_params.json"    # from tune_multiscale_tcn.py
+PREV_THRESH_PATH    = Path("outputs") / "optimal_threshold_multiscale.json"  # reuse if already computed
+
+# Fallback dilation schedules if branch_dilations not in JSON
+DEFAULT_BRANCH1 = [1, 2, 4]                            # fine temporal scale
+DEFAULT_BRANCH2 = [2, 4, 8]                            # medium temporal scale
+DEFAULT_BRANCH3 = [4, 8, 16]                           # coarse temporal scale
+
+
+# ---------------------------------------------------------------------------
+# setup_logging
+# ---------------------------------------------------------------------------
+def setup_logging():
+    """Create all output directories and configure the logger.
+
+    Mirror of TCN.py setup_logging() -- no differences except logger name
+    and log file path.
+
+    Returns
+    -------
+    logger : logging.Logger
+    """
+    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+    CKPT_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    FIGURE_DIR.mkdir(parents=True, exist_ok=True)
+
+    log_file = LOG_DIR / "MultiScaleTCN_training.log"
+    logger = logging.getLogger("MultiScaleTCN_training")
+    logger.setLevel(logging.DEBUG)
+
+    fmt = logging.Formatter(
+        "%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S")
+
+    fh = logging.FileHandler(log_file, mode="w", encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(fmt)
+
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setLevel(logging.INFO)
+    sh.setFormatter(fmt)
+
+    logger.addHandler(fh)
+    logger.addHandler(sh)
+    return logger
+
+
+# ---------------------------------------------------------------------------
+# load_best_params
+# ---------------------------------------------------------------------------
+def load_best_params(logger):
+    """Load best MultiScaleTCN hyperparameters from best_multiscale_params.json.
+
+    DIFFERENCE FROM TCN.py:
+      Also extracts branch_dilations from the JSON under key 'branch_dilations'
+      (saved by tune_multiscale_tcn.py). Falls back to DEFAULT_BRANCH1/2/3 if absent.
+
+    Returns
+    -------
+    tuple of (full_config: dict, hp: dict, branch_dilations: dict)
+    """
+    if not BEST_PARAMS_PATH.exists():
+        logger.error("best_multiscale_params.json not found at %s. "
+                     "Run tune_multiscale_tcn.py first.", BEST_PARAMS_PATH)
+        raise FileNotFoundError(str(BEST_PARAMS_PATH))
+
+    with open(BEST_PARAMS_PATH, "r", encoding="utf-8") as f:
+        config = json.load(f)
+
+    if "hyperparameters" not in config:
+        logger.error("'hyperparameters' key missing from %s.", BEST_PARAMS_PATH)
+        raise KeyError("hyperparameters")
+
+    hp = config["hyperparameters"]
+
+    # Extract branch dilations from JSON or fall back to constants
+    branch_dilations = config.get("branch_dilations", None)
+    if branch_dilations is None:
+        logger.warning("branch_dilations not found in JSON. "
+                       "Using DEFAULT_BRANCH1/2/3 constants. "
+                       "Verify this matches the tuning run.")
+        branch_dilations = {
+            "branch1": DEFAULT_BRANCH1,
+            "branch2": DEFAULT_BRANCH2,
+            "branch3": DEFAULT_BRANCH3,
+        }
+
+    logger.info("MultiScaleTCN hyperparameters loaded from %s:", BEST_PARAMS_PATH)
+    for k, v in hp.items():
+        logger.info("  %-20s: %s", k, v)
+    for bname, dils in branch_dilations.items():
+        logger.info("  %-20s: %s", bname, dils)
+
+    # Per-branch receptive field: RF = 1 + 2 * sum((k-1)*d for d in dilations)
+    # Factor of 2 accounts for two convolutions per CausalConvBlock
+    ks = int(hp["kernel_size"])
+    for bname, dils in branch_dilations.items():
+        rf = 1 + 2 * sum((ks - 1) * d for d in dils)
+        logger.info("  %s RF: %d samples (%.3f s at %d Hz)", bname, rf, rf / FS, FS)
+
+    # Log best tuning F1 as a reference value
+    best_tuning_f1 = config.get("best_val_f1", "not recorded")
+    logger.info("Best tuning val F1 (reference): %s", best_tuning_f1)
+
+    return config, hp, branch_dilations
+
+
+# ---------------------------------------------------------------------------
+# load_splits
+# ---------------------------------------------------------------------------
+def load_splits(logger):
+    """Load train and val file-label pairs from data_splits.json.
+
+    Mirror of TCN.py load_splits() -- no differences.
+    Never loads test pairs.
+
+    Returns
+    -------
+    tuple of (train_pairs, val_pairs)
+    """
+    if SPLITS_PATH_PRIMARY.exists():
+        splits_path = SPLITS_PATH_PRIMARY
+    elif SPLITS_PATH_ALT.exists():
+        splits_path = SPLITS_PATH_ALT
+    else:
+        logger.error("data_splits.json not found at %s or %s. "
+                     "Run generate_data_splits.py first.",
+                     SPLITS_PATH_PRIMARY, SPLITS_PATH_ALT)
+        raise FileNotFoundError("data_splits.json")
+
+    logger.info("Loading splits from: %s", splits_path)
+    with open(splits_path, "r", encoding="utf-8") as f:
+        splits = json.load(f)
+
+    train_pairs = [(rec["filepath"], rec["label"]) for rec in splits["train"]]
+    val_pairs = [(rec["filepath"], rec["label"]) for rec in splits["val"]]
+
+    if not train_pairs:
+        logger.error("Train partition is empty.")
+        raise RuntimeError("Empty train partition")
+    if not val_pairs:
+        logger.error("Val partition is empty.")
+        raise RuntimeError("Empty val partition")
+
+    for name, pairs in [("TRAIN", train_pairs), ("VAL", val_pairs)]:
+        n_total = len(pairs)
+        n_sz = sum(1 for _, l in pairs if l == 1)
+        n_nsz = n_total - n_sz
+        pct = n_sz / n_total * 100 if n_total > 0 else 0.0
+        mouse_ids = sorted({Path(fp).stem.split("_")[0] for fp, _ in pairs})
+        logger.info("%s: %d total | %d seizure | %d non-seizure | %.1f%% ictal | %d mice",
+                    name, n_total, n_sz, n_nsz, pct, len(mouse_ids))
+
+    test_status = splits.get("metadata", {}).get("test_status", "pending")
+    if test_status != "complete":
+        logger.info("Test data not yet ready -- test split not loaded here.")
+
+    return train_pairs, val_pairs
+
+
+# ---------------------------------------------------------------------------
+# build_model
+# ---------------------------------------------------------------------------
+def build_model(hp, branch_dilations, device, logger):
+    """Instantiate MultiScaleTCN using hyperparameters and dilation schedules.
+
+    DIFFERENCE FROM TCN.py:
+      Accepts branch_dilations and passes all three dilation lists to
+      MultiScaleTCN. Uses the exact MultiScaleTCN.__init__ signature.
+
+    Returns
+    -------
+    model : nn.Module
+    """
+    # Fix seed before weight init so every run starts from identical parameters.
+    # This isolates the effect of hyperparameters from initialisation randomness.
+    set_seed(SEED)
+    # MultiScaleTCN.__init__(num_filters, kernel_size, dropout,
+    #   branch1_dilations=None, branch2_dilations=None, branch3_dilations=None,
+    #   fusion="concat", return_embedding=False)
+    # All architecture params come from Optuna best trial in best_multiscale_params.json.
+    # Branch dilations come from the same JSON under "branch_dilations".
+    model = MultiScaleTCN(
+        num_filters=int(hp["num_filters"]),              # channel width shared across all 3 branches
+        kernel_size=int(hp["kernel_size"]),               # local temporal resolution per convolution
+        dropout=float(hp["dropout"]),                     # spatial dropout rate (Dropout1d)
+        branch1_dilations=branch_dilations["branch1"],   # fine scale: e.g. [1, 2, 4]
+        branch2_dilations=branch_dilations["branch2"],   # medium scale: e.g. [2, 4, 8]
+        branch3_dilations=branch_dilations["branch3"],   # coarse scale: e.g. [4, 8, 16]
+        fusion=str(hp["fusion"]),                         # "concat" (1x1 proj) or "average"
+    )
+    model = model.to(device)                              # move all parameters to GPU if available
+    n_params = count_parameters(model)                    # sum of requires_grad=True elements
+    logger.info("Model      : %s", MODEL_NAME)
+    logger.info("Parameters : %s", "{:,}".format(n_params))
+    logger.info("Device     : %s", device)
+    logger.info("Fusion     : %s", hp["fusion"])
+    for bname in ["branch1", "branch2", "branch3"]:
+        logger.info("  %s dilations: %s", bname, branch_dilations[bname])
+    return model
+
+
+# ---------------------------------------------------------------------------
+# build_training_components
+# ---------------------------------------------------------------------------
+def build_training_components(model, train_pairs, hp, device, logger):
+    """Build optimiser, scheduler, and loss function.
+
+    Mirror of TCN.py build_training_components() -- no differences.
+
+    Returns (optimiser, scheduler, criterion).
+    """
+    # AdamW decouples weight decay from the gradient update (Loshchilov & Hutter,
+    # 2019), preventing regularisation strength from shrinking as LR decays.
+    optimiser = torch.optim.AdamW(
+        model.parameters(),
+        lr=float(hp["learning_rate"]),                    # initial LR from Optuna best trial
+        weight_decay=float(hp["weight_decay"]))           # L2 regularisation coefficient
+    # Cosine annealing smoothly decays LR from initial value to eta_min over
+    # T_max epochs. T_max = MAX_EPOCHS so one full half-cycle spans the budget.
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimiser,
+        T_max=MAX_EPOCHS,
+        eta_min=float(hp["learning_rate"]) * 0.01)        # floor at 1% of initial LR
+    # pos_weight = n_non_ictal / n_ictal upweights ictal gradient contribution.
+    # Combined with WeightedRandomSampler in make_loader(train=True), this
+    # provides dual imbalance correction: balanced batches + weighted loss.
+    pos_weight = compute_pos_weight(train_pairs, device)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)  # built-in sigmoid + BCE
+    logger.info("Optimiser: AdamW (lr=%.2e, wd=%.2e)", hp["learning_rate"], hp["weight_decay"])
+    logger.info("Scheduler: CosineAnnealingLR (T_max=%d)", MAX_EPOCHS)
+    logger.info("pos_weight: %.4f", pos_weight.item())
+    return optimiser, scheduler, criterion
+
+
+# ---------------------------------------------------------------------------
+# save_checkpoint
+# ---------------------------------------------------------------------------
+def save_checkpoint(epoch, model, optimiser, scheduler, val_f1, train_loss, hp, path, logger):
+    """Save a full training state checkpoint. Non-fatal on failure.
+
+    Mirror of TCN.py save_checkpoint() -- no differences.
+    """
+    try:
+        torch.save({
+            "epoch": epoch,
+            "model_state": model.state_dict(),
+            "optimiser_state": optimiser.state_dict(),
+            "scheduler_state": scheduler.state_dict(),
+            "val_f1": val_f1,
+            "train_loss": train_loss,
+            "hyperparameters": hp,
+            "timestamp": datetime.datetime.now().isoformat(),
+        }, path)
+        logger.debug("Checkpoint saved: %s", path)
+    except Exception as exc:
+        logger.error("Checkpoint save failed (%s): %s", path, exc)
+
+
+# ---------------------------------------------------------------------------
+# cleanup_checkpoints
+# ---------------------------------------------------------------------------
+def cleanup_checkpoints(ckpt_dir, keep_last_n, logger):
+    """Delete old periodic checkpoints, keeping only the most recent keep_last_n.
+
+    Mirror of TCN.py cleanup_checkpoints() -- pattern adapted for multiscale_tcn prefix.
+    Never deletes multiscale_tcn_best.pt.
+    """
+    pattern = "multiscale_tcn_epoch_*.pt"
+    ckpts = sorted(ckpt_dir.glob(pattern), key=lambda p: p.stat().st_mtime)
+    to_remove = ckpts[:-keep_last_n] if len(ckpts) > keep_last_n else []
+    for p in to_remove:
+        p.unlink(missing_ok=True)
+        logger.debug("Removed old checkpoint: %s", p.name)
+
+
+# ---------------------------------------------------------------------------
+# train_epoch
+# ---------------------------------------------------------------------------
+def train_epoch(model, loader, optimiser, criterion, device):
+    """Run one training epoch using train_one_epoch() from tcn_utils.py.
+
+    Mirror of TCN.py train_epoch() -- no differences.
+    Returns mean training loss.
+    """
+    return train_one_epoch(model, loader, optimiser, criterion, device)
+
+
+# ---------------------------------------------------------------------------
+# evaluate_model
+# ---------------------------------------------------------------------------
+def evaluate_model(model, loader, device, logger):
+    """Evaluate model and collect predictions and probabilities.
+
+    Mirror of TCN.py evaluate_model() -- no differences.
+    Returns (val_f1, y_true, y_pred, y_prob).
+    """
+    # evaluate() returns macro F1, ground truth, and binary preds at threshold 0.5.
+    # It does NOT return continuous probabilities, which are needed for AUROC,
+    # calibration curves, PR curves, and the post-processing pipeline.
+    val_f1, y_true, y_pred = evaluate(model, loader, device)
+
+    # Second inference pass collects continuous sigmoid probabilities (y_prob).
+    # This is a separate pass because evaluate() in tcn_utils.py only stores
+    # binarised predictions. The overhead is acceptable because inference is
+    # fast relative to the training epoch that preceded it.
+    model.eval()                                         # ensure dropout/batchnorm are off
+    all_probs = []
+    with torch.no_grad():                                # disable gradient tracking for speed
+        for x, _ in loader:
+            x = x.to(device)                             # transfer batch to GPU
+            probs = torch.sigmoid(model(x)).cpu().numpy()  # sigmoid maps logits to [0,1]
+            all_probs.extend(probs)                      # accumulate on CPU to avoid VRAM buildup
+    y_prob = np.array(all_probs)                         # shape: (n_segments,) continuous in [0,1]
+
+    return val_f1, y_true, y_pred, y_prob
+
+
+# ---------------------------------------------------------------------------
+# compute_all_metrics
+# ---------------------------------------------------------------------------
+def compute_all_metrics(y_true, y_pred, y_prob, segment_sec, logger, label=""):
+    """Compute all evaluation metrics for one evaluation row.
+
+    Mirror of TCN.py compute_all_metrics() -- no differences.
+    Returns a dict with all values for JSON serialisation.
+    """
+    # labels=[0,1] forces a 2x2 matrix even if one class is absent in y_pred
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+    tn, fp, fn, tp = int(tn), int(fp), int(fn), int(tp)  # cast to Python int for JSON
+
+    accuracy    = accuracy_score(y_true, y_pred)           # (TP+TN) / total
+    prec        = precision_score(y_true, y_pred, pos_label=1, zero_division=0)  # TP / (TP+FP)
+    recall      = recall_score(y_true, y_pred, pos_label=1, zero_division=0)     # TP / (TP+FN) = sensitivity
+    f1_macro    = f1_score(y_true, y_pred, average="macro", zero_division=0)     # mean of per-class F1
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0   # TN / (TN+FP)
+    # AUROC uses continuous probabilities, not binary predictions, so it is
+    # threshold-invariant and identical across all three evaluation rows.
+    auroc       = roc_auc_score(y_true, y_prob) if len(np.unique(y_true)) > 1 else 0.0
+    avg_prec    = average_precision_score(y_true, y_prob) if len(np.unique(y_true)) > 1 else 0.0
+    # Youden J = sensitivity + specificity - 1. Ranges from -1 (anti-classifier)
+    # to +1 (perfect). It is the vertical distance from the ROC diagonal to the
+    # operating point. Used as the threshold selection objective because it
+    # treats missed seizures and false alarms symmetrically.
+    youden_j    = recall + specificity - 1.0
+
+    # Segment-level FAR/hr: raw FP segments divided by non-ictal recording hours.
+    # Only non-ictal segments contribute to the denominator because FAR measures
+    # alarms during normal brain activity, not during seizures.
+    n_non_ic   = tn + fp                                   # total non-ictal segments
+    non_ic_hrs = (n_non_ic * segment_sec) / 3600.0         # non-ictal duration in hours
+    far_seg    = fp / non_ic_hrs if non_ic_hrs > 0 else 0.0
+
+    logger.info("-- Metrics [%s] --", label)
+    logger.info("  Accuracy          : %.4f", accuracy)
+    logger.info("  Precision         : %.4f", prec)
+    logger.info("  Recall/Sensitivity: %.4f", recall)
+    logger.info("  Specificity       : %.4f", specificity)
+    logger.info("  Youden J          : %.4f", youden_j)
+    logger.info("  F1-score (macro)  : %.4f", f1_macro)
+    logger.info("  AUROC             : %.4f", auroc)
+    logger.info("  Avg Precision     : %.4f", avg_prec)
+    logger.info("  FAR/hr (segment)  : %.4f", far_seg)
+    logger.info("  TP=%d FP=%d FN=%d TN=%d", tp, fp, fn, tn)
+
+    return {
+        "accuracy":          round(accuracy, 6),
+        "precision":         round(prec, 6),
+        "recall":            round(recall, 6),
+        "specificity":       round(specificity, 6),
+        "youden_j":          round(youden_j, 6),
+        "f1_macro":          round(f1_macro, 6),
+        "auroc":             round(auroc, 6),
+        "average_precision": round(avg_prec, 6),
+        "far_per_hour_seg":  round(far_seg, 6),
+        "tp": tp, "fp": fp, "fn": fn, "tn": tn,
+    }
+
+
+# ---------------------------------------------------------------------------
+# run_postprocessing_evaluations
+# ---------------------------------------------------------------------------
+def run_postprocessing_evaluations(y_true, y_prob, logger):
+    """Run all three evaluation rows and compute optimal threshold.
+
+    Mirror of TCN.py run_postprocessing_evaluations(). Paths adapted for
+    MultiScaleTCN output directory.
+
+    Returns (row1_metrics, row2_metrics, row3_metrics,
+             post_row2, post_row3, far_row2, far_row3,
+             thresh_result, optimal_threshold).
+    """
+    # -- Row 1: raw at 0.5 ----------------------------------------------------
+    y_pred_row1 = (y_prob >= 0.5).astype(int)
+    row1_metrics = compute_all_metrics(y_true, y_pred_row1, y_prob, SEGMENT_SEC, logger,
+                                       label="Row1_raw_0.5")
+    row1_metrics["threshold"] = 0.5
+    row1_metrics["postprocessed"] = False
+
+    # -- Find optimal threshold ------------------------------------------------
+    # Youden J statistic (J = sensitivity + specificity - 1) is chosen as the
+    # threshold selection objective for three reasons:
+    #   1. Symmetry: it penalises missed seizures (low sensitivity) and false
+    #      alarms (low specificity) equally, which matches the clinical priority
+    #      of seizure detection where both under- and over-detection carry cost.
+    #   2. Geometric meaning: J is the vertical distance from the ROC diagonal
+    #      to the operating point, so maximising J selects the point on the ROC
+    #      curve farthest from chance.
+    #   3. Independence from prevalence: unlike F1, J does not depend on the
+    #      positive predictive value, which is inflated or deflated by class
+    #      imbalance. This makes it stable across datasets with different
+    #      seizure-to-background ratios.
+    # The alternative (F1) weights false negatives more heavily than false
+    # positives via the precision term, which may not reflect the clinical
+    # balance required in continuous EEG monitoring.
+    if PREV_THRESH_PATH.exists():
+        with open(PREV_THRESH_PATH, "r", encoding="utf-8") as f:
+            td = json.load(f)
+        optimal_threshold = td["optimal_threshold"]
+        thresh_result = find_optimal_threshold(y_true, y_prob, objective="youden")
+        logger.info("Optimal threshold loaded from %s: %.4f", PREV_THRESH_PATH, optimal_threshold)
+    else:
+        thresh_result = find_optimal_threshold(y_true, y_prob, objective="youden")
+        optimal_threshold = thresh_result["optimal_threshold"]
+        with open(THRESH_PATH, "w", encoding="utf-8") as f:
+            json.dump({
+                "model": MODEL_NAME,
+                "timestamp": datetime.datetime.now().isoformat(),
+                "optimal_threshold": optimal_threshold,
+                "objective": "youden",
+                "optimal_score": thresh_result["optimal_score"],
+                "sensitivity_at_opt": thresh_result["sensitivity_at_opt"],
+                "specificity_at_opt": thresh_result["specificity_at_opt"],
+                "post_processing": {
+                    "smoothing_window": SMOOTHING_WIN,
+                    "refractory_period_sec": REFRACTORY_SEC,
+                    "min_event_duration_sec": MIN_EVENT_SEC,
+                    "step_sec": STEP_SEC,
+                },
+            }, f, indent=2)
+        logger.info("Optimal threshold computed and saved: %.4f", optimal_threshold)
+
+    # -- Row 2: post-processed at 0.5 -----------------------------------------
+    post_row2 = segment_predictions_to_events(
+        y_pred=(y_prob >= 0.5).astype(int),
+        y_prob=y_prob,
+        segment_len_sec=SEGMENT_SEC,
+        step_sec=STEP_SEC,
+        min_event_duration_sec=MIN_EVENT_SEC,
+        refractory_period_sec=REFRACTORY_SEC,
+        smoothing_window=SMOOTHING_WIN,
+        threshold=0.5)
+    far_row2 = compute_event_level_far(
+        y_true_segments=y_true,
+        post_processed=post_row2,
+        step_sec=STEP_SEC,
+        segment_len_sec=SEGMENT_SEC)
+
+    y_pred_row2 = post_row2["smoothed_preds"]
+    row2_metrics = compute_all_metrics(y_true, y_pred_row2, y_prob, SEGMENT_SEC, logger,
+                                       label="Row2_postproc_0.5")
+    row2_metrics["threshold"] = 0.5
+    row2_metrics["postprocessed"] = True
+    row2_metrics["far_per_hour_event"] = round(float(far_row2["far_per_hour"]), 6)
+    row2_metrics["n_true_alarms"] = far_row2["n_true_alarms"]
+    row2_metrics["n_false_alarms"] = far_row2["n_false_alarms"]
+    row2_metrics["n_total_events"] = far_row2["n_total_events"]
+    logger.info("Row2 events: %d total | %d true | %d false | FAR/hr=%.4f",
+                far_row2["n_total_events"], far_row2["n_true_alarms"],
+                far_row2["n_false_alarms"], far_row2["far_per_hour"])
+
+    # -- Row 3: post-processed at optimal threshold ----------------------------
+    post_row3 = segment_predictions_to_events(
+        y_pred=(y_prob >= optimal_threshold).astype(int),
+        y_prob=y_prob,
+        segment_len_sec=SEGMENT_SEC,
+        step_sec=STEP_SEC,
+        min_event_duration_sec=MIN_EVENT_SEC,
+        refractory_period_sec=REFRACTORY_SEC,
+        smoothing_window=SMOOTHING_WIN,
+        threshold=optimal_threshold)
+    far_row3 = compute_event_level_far(
+        y_true_segments=y_true,
+        post_processed=post_row3,
+        step_sec=STEP_SEC,
+        segment_len_sec=SEGMENT_SEC)
+
+    y_pred_row3 = post_row3["smoothed_preds"]
+    row3_metrics = compute_all_metrics(y_true, y_pred_row3, y_prob, SEGMENT_SEC, logger,
+                                       label="Row3_postproc_opt%.3f" % optimal_threshold)
+    row3_metrics["threshold"] = optimal_threshold
+    row3_metrics["postprocessed"] = True
+    row3_metrics["far_per_hour_event"] = round(float(far_row3["far_per_hour"]), 6)
+    row3_metrics["n_true_alarms"] = far_row3["n_true_alarms"]
+    row3_metrics["n_false_alarms"] = far_row3["n_false_alarms"]
+    row3_metrics["n_total_events"] = far_row3["n_total_events"]
+    logger.info("Row3 events: %d total | %d true | %d false | FAR/hr=%.4f",
+                far_row3["n_total_events"], far_row3["n_true_alarms"],
+                far_row3["n_false_alarms"], far_row3["far_per_hour"])
+
+    return (row1_metrics, row2_metrics, row3_metrics,
+            post_row2, post_row3, far_row2, far_row3,
+            thresh_result, optimal_threshold)
+
+
+# ---------------------------------------------------------------------------
+# save_all_results
+# ---------------------------------------------------------------------------
+def save_all_results(history, row1_metrics, row2_metrics, row3_metrics,
+                     far_row2, far_row3, hp, branch_dilations,
+                     best_epoch, best_val_f1, elapsed, device, n_params,
+                     y_true, y_pred_row1, y_pred_row2, y_pred_row3, logger):
+    """Save all structured results to files (no figures).
+
+    DIFFERENCE FROM TCN.py: accepts branch_dilations, includes it in JSON
+    outputs alongside receptive_field_per_branch for full reproducibility.
+    """
+    ks = int(hp["kernel_size"])
+
+    # Per-branch RF: 1 + 2 * sum((k-1)*d for d in dilations)
+    rf_per_branch = {}
+    for bname, dils in branch_dilations.items():
+        rf = 1 + 2 * sum((ks - 1) * d for d in dils)
+        rf_per_branch[bname] = {"samples": rf, "seconds": round(rf / FS, 4)}
+
+    # -- a. Training log JSON --------------------------------------------------
+    train_log = {
+        "model": MODEL_NAME,
+        "timestamp": datetime.datetime.now().isoformat(),
+        "total_epochs": len(history["epoch"]),
+        "best_epoch": best_epoch,
+        "best_val_f1": round(best_val_f1, 6),
+        "early_stopped": len(history["epoch"]) < MAX_EPOCHS,
+        "duration_seconds": round(elapsed.total_seconds(), 1),
+        "hyperparameters": hp,
+        "branch_dilations": branch_dilations,
+        "receptive_field_per_branch": rf_per_branch,
+        "architecture_note": ("MultiScaleTCN with three parallel branches. "
+                              "See branch_dilations for exact schedules used."),
+        "trainable_params": n_params,
+        "device": str(device),
+        "history": history,
+    }
+    with open(TRAIN_LOG_PATH, "w", encoding="utf-8") as f:
+        json.dump(train_log, f, indent=2)
+    logger.info("Saved: %s", TRAIN_LOG_PATH)
+
+    # -- b. Evaluation report JSON ---------------------------------------------
+    eval_report = {
+        "model": MODEL_NAME,
+        "timestamp": datetime.datetime.now().isoformat(),
+        "weights_path": str(WEIGHTS_PATH),
+        "evaluation_set": "validation",
+        "note": "Test set reserved for final_evaluation.py",
+        "tuning_source": "best_multiscale_params.json",
+        "branch_dilations": branch_dilations,
+        "fusion": hp.get("fusion", "concat"),
+        "post_processing_params": {
+            "smoothing_window": SMOOTHING_WIN,
+            "refractory_period_sec": REFRACTORY_SEC,
+            "min_event_duration_sec": MIN_EVENT_SEC,
+            "step_sec": STEP_SEC,
+        },
+        "row1_raw_threshold_0_5": row1_metrics,
+        "row2_postproc_threshold_0_5": row2_metrics,
+        "row3_postproc_optimal_thresh": row3_metrics,
+    }
+    with open(EVAL_REPORT_PATH, "w", encoding="utf-8") as f:
+        json.dump(eval_report, f, indent=2)
+    logger.info("Saved: %s", EVAL_REPORT_PATH)
+
+    # -- c. Epoch metrics CSV --------------------------------------------------
+    with open(EPOCH_CSV, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["epoch", "train_loss", "val_f1", "lr"])
+        writer.writeheader()
+        for i in range(len(history["epoch"])):
+            writer.writerow({
+                "epoch": history["epoch"][i],
+                "train_loss": round(history["train_loss"][i], 6),
+                "val_f1": round(history["val_f1"][i], 6),
+                "lr": history["lr"][i],
+            })
+    logger.info("Saved: %s", EPOCH_CSV)
+
+    # -- d. Three-row summary CSV (paper Table for M3) -------------------------
+    fieldnames_3r = [
+        "row", "threshold", "postprocessed",
+        "accuracy", "precision", "recall", "specificity", "youden_j",
+        "f1_macro", "auroc", "average_precision",
+        "far_per_hour_seg", "far_per_hour_event",
+        "n_true_alarms", "n_false_alarms", "n_total_events",
+        "tp", "tn", "fp", "fn",
+    ]
+    with open(THREE_ROW_CSV, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames_3r)
+        writer.writeheader()
+        for idx, (label, m) in enumerate([
+            ("Row1_raw_0.5", row1_metrics),
+            ("Row2_postproc_0.5", row2_metrics),
+            ("Row3_postproc_opt", row3_metrics),
+        ], 1):
+            writer.writerow({
+                "row": label,
+                "threshold": m.get("threshold", ""),
+                "postprocessed": m.get("postprocessed", False),
+                "accuracy": m.get("accuracy", ""),
+                "precision": m.get("precision", ""),
+                "recall": m.get("recall", ""),
+                "specificity": m.get("specificity", ""),
+                "youden_j": m.get("youden_j", ""),
+                "f1_macro": m.get("f1_macro", ""),
+                "auroc": m.get("auroc", ""),
+                "average_precision": m.get("average_precision", ""),
+                "far_per_hour_seg": m.get("far_per_hour_seg", ""),
+                "far_per_hour_event": m.get("far_per_hour_event", "N/A"),
+                "n_true_alarms": m.get("n_true_alarms", "N/A"),
+                "n_false_alarms": m.get("n_false_alarms", "N/A"),
+                "n_total_events": m.get("n_total_events", "N/A"),
+                "tp": m.get("tp", ""), "tn": m.get("tn", ""),
+                "fp": m.get("fp", ""), "fn": m.get("fn", ""),
+            })
+    logger.info("Saved: %s", THREE_ROW_CSV)
+
+    # -- e. Per-row sklearn classification reports -----------------------------
+    for row_idx, (y_pred_row, row_label) in enumerate([
+        (y_pred_row1, "row1"), (y_pred_row2, "row2"), (y_pred_row3, "row3"),
+    ], 1):
+        report_dict = classification_report(
+            y_true, y_pred_row,
+            target_names=["Non-ictal", "Ictal"],
+            output_dict=True, zero_division=0)
+        report_path = OUTPUT_ROOT / ("multiscale_tcn_classification_report_%s.json" % row_label)
+        with open(report_path, "w", encoding="utf-8") as f:
+            json.dump(report_dict, f, indent=2)
+        logger.info("Saved: %s", report_path)
+
+    # -- f. Event detail CSVs --------------------------------------------------
+    for far_result, row_label in [(far_row2, "row2"), (far_row3, "row3")]:
+        csv_path = OUTPUT_ROOT / ("multiscale_tcn_event_details_%s.csv" % row_label)
+        details = far_result.get("event_details", [])
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(
+                f, fieldnames=["start_sec", "end_sec", "duration_sec", "is_true_alarm"])
+            writer.writeheader()
+            for evt in details:
+                writer.writerow({
+                    "start_sec": evt["start_sec"],
+                    "end_sec": evt["end_sec"],
+                    "duration_sec": evt["duration_sec"],
+                    "is_true_alarm": evt["is_true_alarm"],
+                })
+        logger.info("Saved: %s (%d events)", csv_path, len(details))
+
+
+# ---------------------------------------------------------------------------
+# plot_all_figures
+# ---------------------------------------------------------------------------
+def plot_all_figures(history, best_epoch, best_val_f1,
+                    y_true, y_prob,
+                    y_pred_row1, y_pred_row2, y_pred_row3,
+                    row1_metrics, row2_metrics, row3_metrics,
+                    post_row2, post_row3,
+                    thresh_result, optimal_threshold,
+                    branch_dilations, hp, logger):
+    """Produce and save all 13 figures at dpi=150.
+
+    DIFFERENCE FROM TCN.py: accepts branch_dilations and hp for Figure 13
+    (branch RF diagram). All other figures mirror TCN.py with adapted titles.
+    """
+    pfx = "multiscale_tcn"  # filename prefix
+    epochs = history["epoch"]
+
+    # -- Figure 1: Training curves ---------------------------------------------
+    # PURPOSE: Demonstrates model convergence behaviour. Left panel shows
+    # training loss declining over epochs, confirming the optimiser is reducing
+    # the objective. Right panel shows validation macro F1, the metric that
+    # drives early stopping. Together they reveal whether the model overfit
+    # (loss drops but F1 plateaus/declines), underfit (both remain poor), or
+    # converged healthily. The vertical dashed line marks the best epoch.
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4))
+    axes[0].plot(epochs, history["train_loss"], color="#5A7DC8", linewidth=1.2, label="Train loss")
+    axes[0].axvline(best_epoch, linestyle="--", color="#C85A5A", alpha=0.7, label="Best epoch")
+    axes[0].set_xlabel("Epoch")
+    axes[0].set_ylabel("BCEWithLogitsLoss")
+    axes[0].set_title("Multi-Scale TCN Training Loss")
+    axes[0].legend(fontsize=9)
+    axes[1].plot(epochs, history["val_f1"], color="#5A7DC8", linewidth=1.2, label="Val F1")
+    axes[1].axvline(best_epoch, linestyle="--", color="#C85A5A", alpha=0.7, label="Best epoch")
+    axes[1].annotate("%.4f" % best_val_f1, xy=(best_epoch, best_val_f1),
+                     xytext=(5, -15), textcoords="offset points", fontsize=9, color="#C85A5A")
+    axes[1].set_xlabel("Epoch")
+    axes[1].set_ylabel("Macro F1-score")
+    axes[1].set_title("Multi-Scale TCN Validation Macro F1")
+    axes[1].legend(fontsize=9)
+    plt.tight_layout()
+    plt.savefig(FIGURE_DIR / ("%s_training_curves.png" % pfx), dpi=150, bbox_inches="tight")
+    plt.close()
+    logger.info("Saved: %s", FIGURE_DIR / ("%s_training_curves.png" % pfx))
+
+    # -- Figure 2: LR schedule ------------------------------------------------
+    # PURPOSE: Verifies the cosine annealing schedule behaved as described in
+    # the Methods section. A smooth half-cosine from initial LR to eta_min
+    # confirms correct configuration. Any flat segment at the end indicates
+    # early stopping terminated before the full cosine cycle completed.
+    fig, ax = plt.subplots(figsize=(8, 3))
+    ax.plot(epochs, history["lr"], color="#5A7DC8", linewidth=1.2)
+    ax.set_yscale("log")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Learning rate (log scale)")
+    ax.set_title("Multi-Scale TCN Cosine Annealing LR Schedule")
+    plt.tight_layout()
+    plt.savefig(FIGURE_DIR / ("%s_lr_schedule.png" % pfx), dpi=150, bbox_inches="tight")
+    plt.close()
+    logger.info("Saved: %s", FIGURE_DIR / ("%s_lr_schedule.png" % pfx))
+
+    # -- Figures 3-5: Confusion matrices per row -------------------------------
+    # PURPOSE: One confusion matrix per evaluation row shows TP, FP, FN, TN.
+    # Comparing Row 1 to Row 2 isolates the effect of post-processing at the
+    # same threshold. Comparing Row 2 to Row 3 isolates threshold optimisation.
+    # Titles include sensitivity, specificity, F1, and Youden J at a glance.
+    for row_idx, (y_pred_row, m, row_label, thresh) in enumerate([
+        (y_pred_row1, row1_metrics, "Row1: raw", 0.5),
+        (y_pred_row2, row2_metrics, "Row2: post-proc", 0.5),
+        (y_pred_row3, row3_metrics, "Row3: post-proc", optimal_threshold),
+    ], 1):
+        cm = confusion_matrix(y_true, y_pred_row, labels=[0, 1])
+        fig, ax = plt.subplots(figsize=(5, 4))
+        sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+                    xticklabels=["Non-ictal", "Ictal"],
+                    yticklabels=["Non-ictal", "Ictal"],
+                    linewidths=0.5, ax=ax)
+        ax.set_xlabel("Predicted")
+        ax.set_ylabel("True")
+        ax.set_title("MS-TCN %s | t=%.3f | Sens=%.3f Spec=%.3f F1=%.3f J=%.3f" % (
+            row_label, thresh, m["recall"], m["specificity"], m["f1_macro"], m["youden_j"]))
+        plt.tight_layout()
+        plt.savefig(FIGURE_DIR / ("%s_confusion_matrix_row%d.png" % (pfx, row_idx)),
+                    dpi=150, bbox_inches="tight")
+        plt.close()
+    logger.info("Saved: confusion matrices (3 figures)")
+
+    # -- Figure 6: ROC curve ---------------------------------------------------
+    # PURPOSE: Displays the trade-off between sensitivity and false positive
+    # rate across all thresholds. AUROC summarises discriminative ability and
+    # is threshold-invariant. Three scatter points (R1, R2, R3) mark the actual
+    # operating points for each evaluation row. The diagonal is chance (AUROC=0.5).
+    fpr, tpr, _ = roc_curve(y_true, y_prob)
+    auroc_val = roc_auc_score(y_true, y_prob) if len(np.unique(y_true)) > 1 else 0.0
+    fig, ax = plt.subplots(figsize=(5, 5))
+    ax.plot(fpr, tpr, color="#5A7DC8", linewidth=1.5,
+            label="MultiScaleTCN (AUROC = %.4f)" % auroc_val)
+    ax.plot([0, 1], [0, 1], linestyle="--", color="gray", alpha=0.5, label="Chance")
+    ax.fill_between(fpr, tpr, alpha=0.08, color="#5A7DC8")
+    for m, lbl, marker in [
+        (row1_metrics, "R1", "o"), (row2_metrics, "R2", "s"), (row3_metrics, "R3", "D"),
+    ]:
+        ax.scatter([1 - m["specificity"]], [m["recall"]], marker=marker, s=60, zorder=5, label=lbl)
+    ax.set_xlabel("False positive rate (1 - Specificity)")
+    ax.set_ylabel("True positive rate (Sensitivity)")
+    ax.set_title("Multi-Scale TCN ROC Curve -- Validation set")
+    ax.legend(fontsize=8, loc="lower right")
+    plt.tight_layout()
+    plt.savefig(FIGURE_DIR / ("%s_roc_curve.png" % pfx), dpi=150, bbox_inches="tight")
+    plt.close()
+    logger.info("Saved: %s", FIGURE_DIR / ("%s_roc_curve.png" % pfx))
+
+    # -- Figure 7: Threshold curve ---------------------------------------------
+    # PURPOSE: Directly answers "how was the threshold selected?" by plotting
+    # Youden J as a function of threshold from 0.1 to 0.9. The peak is the
+    # optimal threshold. A broad, flat peak means robustness to threshold choice;
+    # a narrow spike means sensitivity to the exact value. Computed on the
+    # validation set only -- the threshold is applied unchanged to the test set.
+    curve = thresh_result.get("threshold_curve", {})
+    if curve:
+        thresholds_list = sorted(curve.keys())
+        scores_list = [curve[t] for t in thresholds_list]
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.plot(thresholds_list, scores_list, color="#5A7DC8", linewidth=1.2)
+        ax.axvline(optimal_threshold, linestyle="--", color="#C85A5A", linewidth=1.2)
+        ax.annotate("Optimal t=%.3f" % optimal_threshold,
+                    xy=(optimal_threshold, max(scores_list) if scores_list else 0),
+                    xytext=(10, -10), textcoords="offset points", fontsize=9, color="#C85A5A")
+        ax.set_xlabel("Threshold")
+        ax.set_ylabel("Youden J statistic")
+        ax.set_title("Multi-Scale TCN Threshold Selection -- Youden J vs threshold")
+        plt.tight_layout()
+        plt.savefig(FIGURE_DIR / ("%s_threshold_curve.png" % pfx), dpi=150, bbox_inches="tight")
+        plt.close()
+        logger.info("Saved: %s", FIGURE_DIR / ("%s_threshold_curve.png" % pfx))
+
+    # -- Figure 8: Metrics comparison ------------------------------------------
+    # PURPOSE: Grouped bar chart providing a single-figure summary of all seven
+    # classification metrics across all three evaluation rows. The top panel
+    # shows whether post-processing and threshold optimisation improved recall,
+    # specificity, and F1 relative to the raw baseline. The bottom panel
+    # compares FAR/hr -- the transition from segment-level (Row 1) to event-
+    # level (Rows 2, 3) typically shows a large reduction because post-processing
+    # collapses consecutive FP segments into one event.
+    metric_names = ["accuracy", "precision", "recall", "specificity", "f1_macro", "auroc", "average_precision"]
+    r1_vals = [row1_metrics.get(m, 0) for m in metric_names]
+    r2_vals = [row2_metrics.get(m, 0) for m in metric_names]
+    r3_vals = [row3_metrics.get(m, 0) for m in metric_names]
+
+    fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(12, 7),
+                                          gridspec_kw={"height_ratios": [7, 3]})
+    x_pos = np.arange(len(metric_names))
+    w = 0.25
+    bars1 = ax_top.bar(x_pos - w, r1_vals, w, color="#E8A87C", label="Row1: raw t=0.5")
+    bars2 = ax_top.bar(x_pos, r2_vals, w, color="#5A7DC8", label="Row2: post-proc t=0.5")
+    bars3 = ax_top.bar(x_pos + w, r3_vals, w, color="#41B3A3", label="Row3: post-proc t=opt")
+    for bars in [bars1, bars2, bars3]:
+        for bar in bars:
+            h = bar.get_height()
+            ax_top.annotate("%.2f" % h, xy=(bar.get_x() + bar.get_width() / 2, h),
+                            xytext=(0, 2), textcoords="offset points", ha="center", fontsize=6)
+    ax_top.set_xticks(x_pos)
+    ax_top.set_xticklabels(metric_names, fontsize=8)
+    ax_top.set_ylabel("Score")
+    ax_top.set_title("Multi-Scale TCN Evaluation Metrics")
+    ax_top.legend(fontsize=8)
+    ax_top.set_ylim(0, 1.15)
+
+    far_labels = ["Row1\nseg-level", "Row2\nevent-level", "Row3\nevent-level"]
+    far_vals = [
+        row1_metrics.get("far_per_hour_seg", 0),
+        row2_metrics.get("far_per_hour_event", 0),
+        row3_metrics.get("far_per_hour_event", 0),
+    ]
+    far_colors = ["#C85A5A", "#5A7DC8", "#41B3A3"]
+    bars_far = ax_bot.bar(far_labels, far_vals, color=far_colors)
+    for bar in bars_far:
+        h = bar.get_height()
+        ax_bot.annotate("%.2f" % h, xy=(bar.get_x() + bar.get_width() / 2, h),
+                        xytext=(0, 2), textcoords="offset points", ha="center", fontsize=8)
+    ax_bot.set_ylabel("FAR/hr")
+    ax_bot.set_title("False Alarm Rate per Hour")
+    plt.tight_layout()
+    plt.savefig(FIGURE_DIR / ("%s_metrics_comparison.png" % pfx), dpi=150, bbox_inches="tight")
+    plt.close()
+    logger.info("Saved: %s", FIGURE_DIR / ("%s_metrics_comparison.png" % pfx))
+
+    # -- Figure 9: PR curve ----------------------------------------------------
+    # PURPOSE: More informative than ROC for imbalanced datasets (Davis &
+    # Goadrich, 2006). AUROC can appear optimistic when negatives vastly
+    # outnumber positives because large TN counts inflate the TNR. The
+    # no-skill baseline at prevalence shows what a random classifier achieves.
+    # Average Precision (AP) summarises the area under this curve. A model
+    # with high AUROC but low AP has poor positive predictive value.
+    prec_arr, rec_arr, _ = precision_recall_curve(y_true, y_prob)
+    avg_prec_val = average_precision_score(y_true, y_prob) if len(np.unique(y_true)) > 1 else 0.0
+    prevalence = np.mean(y_true)
+    fig, ax = plt.subplots(figsize=(5, 5))
+    ax.plot(rec_arr, prec_arr, color="#5A7DC8", linewidth=1.5,
+            label="MultiScaleTCN (AP = %.4f)" % avg_prec_val)
+    ax.axhline(prevalence, linestyle="--", color="gray", alpha=0.5, label="No-skill (%.3f)" % prevalence)
+    ax.fill_between(rec_arr, prec_arr, alpha=0.08, color="#5A7DC8")
+    ax.set_xlabel("Recall (Sensitivity)")
+    ax.set_ylabel("Precision")
+    ax.set_title("Multi-Scale TCN PR Curve -- Validation set")
+    ax.legend(fontsize=9)
+    plt.tight_layout()
+    plt.savefig(FIGURE_DIR / ("%s_pr_curve.png" % pfx), dpi=150, bbox_inches="tight")
+    plt.close()
+    logger.info("Saved: %s", FIGURE_DIR / ("%s_pr_curve.png" % pfx))
+
+    # -- Figure 10: Calibration curve ------------------------------------------
+    # PURPOSE: Assesses whether predicted probabilities are well-calibrated --
+    # i.e., a segment predicted at p=0.7 is truly ictal ~70% of the time.
+    # Points above the diagonal = under-confidence; below = over-confidence.
+    # Poor calibration does not affect ranking metrics (AUROC, AP) but does
+    # affect clinical interpretation of predicted probabilities. If calibration
+    # is poor, Platt scaling or isotonic regression can be applied post-hoc.
+    fig, ax = plt.subplots(figsize=(5, 5))
+    try:
+        frac_pos, mean_pred = calibration_curve(y_true, y_prob, n_bins=10)
+        ax.plot(mean_pred, frac_pos, "o-", color="#5A7DC8", label="MultiScaleTCN")
+    except ValueError:
+        pass
+    ax.plot([0, 1], [0, 1], linestyle="--", color="gray", alpha=0.5, label="Perfect calibration")
+    ax.set_xlabel("Mean predicted probability")
+    ax.set_ylabel("Fraction of positives")
+    ax.set_title("Multi-Scale TCN Calibration Curve")
+    ax.legend(fontsize=9)
+    plt.tight_layout()
+    plt.savefig(FIGURE_DIR / ("%s_calibration_curve.png" % pfx), dpi=150, bbox_inches="tight")
+    plt.close()
+    logger.info("Saved: %s", FIGURE_DIR / ("%s_calibration_curve.png" % pfx))
+
+    # -- Figure 11: FAR comparison bar chart -----------------------------------
+    # PURPOSE: Highlights the distinction between segment-level and event-level
+    # false alarm rates. Segment-level FAR (Row 1) counts every FP segment as a
+    # separate alarm, inflating the rate because 50% overlap means one noise
+    # transient triggers 2-3 consecutive FP segments. Event-level FAR (Rows 2, 3)
+    # collapses these into a single alarm event after post-processing, yielding a
+    # clinically realistic rate. The visual drop quantifies the clinical benefit
+    # of the post-processing pipeline.
+    fig, ax = plt.subplots(figsize=(7, 4))
+    far_labels2 = ["Row1\nsegment-level", "Row2\nevent-level", "Row3\nevent-level"]
+    far_vals2 = [
+        row1_metrics.get("far_per_hour_seg", 0),
+        row2_metrics.get("far_per_hour_event", 0),
+        row3_metrics.get("far_per_hour_event", 0),
+    ]
+    bars = ax.bar(far_labels2, far_vals2, color=["#C85A5A", "#5A7DC8", "#41B3A3"], edgecolor="white")
+    for bar in bars:
+        h = bar.get_height()
+        ax.annotate("%.2f" % h, xy=(bar.get_x() + bar.get_width() / 2, h),
+                    xytext=(0, 3), textcoords="offset points", ha="center", fontsize=9)
+    ax.set_ylabel("False alarm rate per hour")
+    ax.set_title("Multi-Scale TCN FAR/hr: segment-level vs event-level")
+    ax.text(0.02, 0.95, "Segment-level: FP segments / non-ictal hours\n"
+                         "Event-level: false alarm events / non-ictal hours",
+            transform=ax.transAxes, fontsize=7, verticalalignment="top",
+            bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.4))
+    plt.tight_layout()
+    plt.savefig(FIGURE_DIR / ("%s_far_comparison.png" % pfx), dpi=150, bbox_inches="tight")
+    plt.close()
+    logger.info("Saved: %s", FIGURE_DIR / ("%s_far_comparison.png" % pfx))
+
+    # -- Figure 12: Segment length analysis ------------------------------------
+    # PURPOSE: Justifies MIN_EVENT_SEC and REFRACTORY_SEC post-processing
+    # parameters. Left histogram shows event duration distribution; events left
+    # of the MIN_EVENT_SEC dashed line were discarded, confirming the filter
+    # removes only short artefacts. Right scatter shows each event at its start
+    # time vs duration, colour-coded by true/false alarm. Clusters of short red
+    # events suggest the min-duration filter is not aggressive enough; long green
+    # events confirm genuine seizure detections.
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+    all_durations = []
+    for post in [post_row2, post_row3]:
+        for evt in post.get("events", []):
+            all_durations.append(evt.get("duration_sec", 0))
+    if all_durations:
+        axes[0].hist(all_durations, bins=20, color="#5A7DC8", edgecolor="white", alpha=0.85)
+        axes[0].axvline(MIN_EVENT_SEC, linestyle="--", color="#C85A5A", linewidth=1.2,
+                        label="Min duration = %.0fs" % MIN_EVENT_SEC)
+        axes[0].legend(fontsize=8)
+    axes[0].set_xlabel("Event duration (s)")
+    axes[0].set_ylabel("Count")
+    axes[0].set_title("Multi-Scale TCN Event Duration Distribution")
+
+    events_r3 = compute_event_level_far(
+        y_true, post_row3, STEP_SEC, SEGMENT_SEC
+    ).get("event_details", [])
+    if events_r3:
+        starts = [e["start_sec"] for e in events_r3]
+        durations = [e["duration_sec"] for e in events_r3]
+        colors = ["#41B3A3" if e["is_true_alarm"] else "#C85A5A" for e in events_r3]
+        axes[1].scatter(starts, durations, c=colors, s=30, alpha=0.7)
+        axes[1].axhline(MIN_EVENT_SEC, linestyle="--", color="gray", alpha=0.5)
+        axes[1].scatter([], [], c="#41B3A3", label="True alarm")
+        axes[1].scatter([], [], c="#C85A5A", label="False alarm")
+        axes[1].legend(fontsize=8)
+    axes[1].set_xlabel("Event start time (s)")
+    axes[1].set_ylabel("Event duration (s)")
+    axes[1].set_title("Event Timeline -- Row 3 (optimal threshold)")
+    plt.tight_layout()
+    plt.savefig(FIGURE_DIR / ("%s_segment_length_analysis.png" % pfx), dpi=150, bbox_inches="tight")
+    plt.close()
+    logger.info("Saved: %s", FIGURE_DIR / ("%s_segment_length_analysis.png" % pfx))
+
+    # -- Figure 13: Branch RF diagram (MultiScaleTCN-specific) -----------------
+    # PURPOSE: Directly answers the reviewer question "do the three branches
+    # cover meaningfully different temporal scales?" Left bar chart shows each
+    # branch's receptive field in samples alongside the segment length (2500),
+    # revealing whether any branch exceeds the input window. Right subplot
+    # visualises the dilation schedule per branch, showing how exponentially
+    # increasing dilations expand the RF at each block. Branches with identical
+    # or heavily overlapping RFs would indicate redundant design; well-separated
+    # RFs confirm that each branch captures a distinct temporal scale. Include
+    # this figure in the architecture section or supplementary material.
+    ks = int(hp["kernel_size"])
+    branch_names = ["branch1", "branch2", "branch3"]
+    branch_labels = []
+    rfs = []
+    for bname in branch_names:
+        dils = branch_dilations[bname]
+        rf = 1 + 2 * sum((ks - 1) * d for d in dils)
+        rfs.append(rf)
+        branch_labels.append("Branch %s\n%s" % (bname[-1], dils))
+
+    fig, (ax_left, ax_right) = plt.subplots(1, 2, figsize=(10, 5))
+
+    # Left: RF per branch bar chart
+    bar_colors = ["#E8A87C", "#5A7DC8", "#41B3A3"]
+    y_positions = np.arange(len(branch_names))
+    ax_left.barh(y_positions, rfs, color=bar_colors, edgecolor="white", height=0.5)
+    for i, rf in enumerate(rfs):
+        ax_left.annotate("%d samples (%.3f s)" % (rf, rf / FS),
+                         xy=(rf, i), xytext=(5, 0), textcoords="offset points",
+                         fontsize=8, va="center")
+    ax_left.axvline(SEGMENT_LEN, linestyle="--", color="#C85A5A", linewidth=1.2,
+                    label="Segment length (%d)" % SEGMENT_LEN)
+    ax_left.set_yticks(y_positions)
+    ax_left.set_yticklabels(branch_labels, fontsize=9)
+    ax_left.set_xlabel("Receptive field (samples)")
+    ax_left.set_title("Receptive Field per Branch")
+    ax_left.legend(fontsize=8)
+
+    # Right: Dilation schedule visualisation
+    for i, bname in enumerate(branch_names):
+        dils = branch_dilations[bname]
+        block_indices = list(range(1, len(dils) + 1))
+        ax_right.plot(block_indices, [i + 1] * len(dils), "-", color=bar_colors[i], linewidth=1.5)
+        ax_right.scatter(block_indices, [i + 1] * len(dils), color=bar_colors[i], s=80, zorder=5)
+        for j, d in enumerate(dils):
+            ax_right.annotate("d=%d" % d, xy=(block_indices[j], i + 1),
+                              xytext=(0, 10), textcoords="offset points",
+                              ha="center", fontsize=8, color=bar_colors[i])
+    ax_right.set_xlabel("Block index")
+    ax_right.set_ylabel("Branch")
+    ax_right.set_yticks([1, 2, 3])
+    ax_right.set_yticklabels(branch_labels, fontsize=9)
+    ax_right.set_title("Dilation Schedule per Branch")
+    plt.tight_layout()
+    plt.savefig(FIGURE_DIR / ("%s_branch_rf_diagram.png" % pfx), dpi=150, bbox_inches="tight")
+    plt.close()
+    logger.info("Saved: %s", FIGURE_DIR / ("%s_branch_rf_diagram.png" % pfx))
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+def main():
+    """Main entry point for Multi-Scale TCN training.
+
+    Mirrors TCN.py main() with MultiScaleTCN adaptations.
+    Trains for MAX_EPOCHS=100 with early stopping.
+    Does not evaluate the test set.
+    """
+    # -- Step 1: Logging and setup ---------------------------------------------
+    logger = setup_logging()
+    logger.info("=" * 65)
+    logger.info("MultiScaleTCN.py -- Multi-Scale TCN Training")
+    logger.info("Model 3 in ablation study")
+    logger.info("Architecture: three parallel CausalConvBlock branches")
+    logger.info("Timestamp: %s", datetime.datetime.now().isoformat())
+    logger.info("MAX_EPOCHS : %d", MAX_EPOCHS)
+    logger.info("ES_PATIENCE: %d", ES_PATIENCE)
+    logger.info("Test set : NOT loaded in this script")
+    logger.info("=" * 65)
+
+    set_seed(SEED)
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        logger.info("GPU : %s", torch.cuda.get_device_name(0))
+        vram = torch.cuda.get_device_properties(0).total_memory / 1e9
+        logger.info("VRAM: %.2f GB", vram)
+        logger.info("CUDA: %s", torch.version.cuda)
+    else:
+        logger.info("Device: CPU")
+    logger.info("PyTorch: %s", torch.__version__)
+
+    # -- Step 2: Load inputs ---------------------------------------------------
+    config, hp, branch_dilations = load_best_params(logger)
+    train_pairs, val_pairs = load_splits(logger)
+
+    # -- Step 3: Build model ---------------------------------------------------
+    model = build_model(hp, branch_dilations, DEVICE, logger)
+    n_params = count_parameters(model)
+
+    # -- Step 4: Build data loaders --------------------------------------------
+    # make_loader(train=True) creates a WeightedRandomSampler that oversamples
+    # the minority (ictal) class. make_loader(train=False) creates a plain
+    # sequential loader for deterministic validation evaluation.
+    batch_size = int(hp["batch_size"])
+    train_loader = make_loader(train_pairs, batch_size, True, DEVICE)
+    val_loader = make_loader(val_pairs, batch_size, False, DEVICE)
+    logger.info("Train loader: %d batches", len(train_loader))
+    logger.info("Val loader  : %d batches", len(val_loader))
+
+    # -- Step 5: Build training components -------------------------------------
+    optimiser, scheduler, criterion = build_training_components(
+        model, train_pairs, hp, DEVICE, logger)
+
+    # -- Step 6: Initialise training state -------------------------------------
+    history = {"epoch": [], "train_loss": [], "val_f1": [], "lr": []}
+    best_val_f1 = 0.0
+    epochs_no_imp = 0
+    best_state = None
+    best_epoch = 0
+    training_start = datetime.datetime.now()
+
+    # -- Step 7: Training loop -------------------------------------------------
+    logger.info("=" * 65)
+    logger.info("TRAINING STARTED")
+    logger.info("  Epochs      : %d", MAX_EPOCHS)
+    logger.info("  ES patience : %d", ES_PATIENCE)
+    logger.info("  Ckpt freq   : every %d", CHECKPOINT_FREQ)
+    logger.info("=" * 65)
+
+    final_epoch = 0
+    for epoch in range(1, MAX_EPOCHS + 1):
+        final_epoch = epoch
+
+        train_loss = train_epoch(model, train_loader, optimiser, criterion, DEVICE)
+        val_f1, _, _, _ = evaluate_model(model, val_loader, DEVICE, logger)
+
+        current_lr = scheduler.get_last_lr()[0]
+        scheduler.step()
+
+        history["epoch"].append(epoch)
+        history["train_loss"].append(train_loss)
+        history["val_f1"].append(val_f1)
+        history["lr"].append(current_lr)
+
+        logger.info(
+            "Epoch %3d/%d | loss=%.4f | val_f1=%.4f | lr=%.2e | best=%.4f | patience=%d/%d",
+            epoch, MAX_EPOCHS, train_loss, val_f1, current_lr,
+            best_val_f1, epochs_no_imp, ES_PATIENCE)
+
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
+            best_epoch = epoch
+            epochs_no_imp = 0
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            save_checkpoint(epoch, model, optimiser, scheduler, val_f1, train_loss, hp,
+                            CKPT_DIR / "multiscale_tcn_best.pt", logger)
+            logger.info("  New best val F1: %.4f at epoch %d", best_val_f1, best_epoch)
+        else:
+            epochs_no_imp += 1
+
+        if epoch % CHECKPOINT_FREQ == 0:
+            save_checkpoint(epoch, model, optimiser, scheduler, val_f1, train_loss, hp,
+                            CKPT_DIR / ("multiscale_tcn_epoch_%d.pt" % epoch), logger)
+            cleanup_checkpoints(CKPT_DIR, KEEP_CKPTS, logger)
+
+        if epochs_no_imp >= ES_PATIENCE:
+            logger.info("Early stopping at epoch %d.", epoch)
+            break
+
+    # -- Step 8: Restore best weights ------------------------------------------
+    if best_state is not None:
+        model.load_state_dict({k: v.to(DEVICE) for k, v in best_state.items()})
+    logger.info("Best weights restored from epoch %d", best_epoch)
+
+    elapsed = datetime.datetime.now() - training_start
+    logger.info("=" * 65)
+    logger.info("TRAINING COMPLETE")
+    logger.info("  Best val F1  : %.4f at epoch %d", best_val_f1, best_epoch)
+    logger.info("  Total epochs : %d", final_epoch)
+    logger.info("  Duration     : %s", str(elapsed).split(".")[0])
+    logger.info("=" * 65)
+
+    # -- Step 9: Save final weights --------------------------------------------
+    # Move to CPU before saving so the .pt file is device-agnostic -- it can
+    # be loaded on any machine regardless of GPU availability.
+    torch.save(model.cpu().state_dict(), WEIGHTS_PATH)
+    size_mb = WEIGHTS_PATH.stat().st_size / 1e6
+    logger.info("Weights saved : %s (%.2f MB)", WEIGHTS_PATH, size_mb)
+    model.to(DEVICE)  # move back to GPU for the final evaluation pass
+
+    # -- Step 10: Final evaluation on validation set ---------------------------
+    # Re-evaluate after restoring best weights. This produces the y_true and
+    # y_prob arrays needed for post-processing (Rows 1-3) and all figures.
+    logger.info("Running final validation evaluation...")
+    val_f1_final, y_true, y_pred_05, y_prob = evaluate_model(model, val_loader, DEVICE, logger)
+
+    # Consistency check: confirm F1 matches the best-epoch value. A mismatch
+    # indicates weight restoration failed. Tolerance of 1e-3 accounts for
+    # floating-point rounding in the save/load cycle.
+    tol = 1e-3
+    if abs(val_f1_final - best_val_f1) > tol:
+        logger.warning("F1 mismatch: best=%.6f final=%.6f. Weight restoration may have failed.",
+                       best_val_f1, val_f1_final)
+    else:
+        logger.info("F1 consistency check: PASS")
+
+    # -- Step 11: Post-processing evaluations ----------------------------------
+    (row1_metrics, row2_metrics, row3_metrics,
+     post_row2, post_row3, far_row2, far_row3,
+     thresh_result, optimal_threshold) = run_postprocessing_evaluations(y_true, y_prob, logger)
+
+    # -- Step 12: Save all structured results ----------------------------------
+    y_pred_row1 = (y_prob >= 0.5).astype(int)
+    y_pred_row2 = post_row2["smoothed_preds"]
+    y_pred_row3 = post_row3["smoothed_preds"]
+
+    save_all_results(
+        history, row1_metrics, row2_metrics, row3_metrics,
+        far_row2, far_row3, hp, branch_dilations,
+        best_epoch, best_val_f1, elapsed, DEVICE, n_params, y_true,
+        y_pred_row1, y_pred_row2, y_pred_row3, logger)
+
+    # -- Step 13: Plot all figures ---------------------------------------------
+    plot_all_figures(
+        history, best_epoch, best_val_f1,
+        y_true, y_prob,
+        y_pred_row1, y_pred_row2, y_pred_row3,
+        row1_metrics, row2_metrics, row3_metrics,
+        post_row2, post_row3,
+        thresh_result, optimal_threshold,
+        branch_dilations, hp, logger)
+
+    # -- Step 14: Final inventory and cleanup ----------------------------------
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        logger.info("GPU cache cleared.")
+
+    logger.info("=" * 65)
+    logger.info("ALL OUTPUTS SAVED")
+    pfx = "multiscale_tcn"
+    all_outputs = [
+        WEIGHTS_PATH,
+        CKPT_DIR / "multiscale_tcn_best.pt",
+        TRAIN_LOG_PATH,
+        EVAL_REPORT_PATH,
+        THRESH_PATH,
+        EPOCH_CSV,
+        THREE_ROW_CSV,
+        OUTPUT_ROOT / "multiscale_tcn_classification_report_row1.json",
+        OUTPUT_ROOT / "multiscale_tcn_classification_report_row2.json",
+        OUTPUT_ROOT / "multiscale_tcn_classification_report_row3.json",
+        OUTPUT_ROOT / "multiscale_tcn_event_details_row2.csv",
+        OUTPUT_ROOT / "multiscale_tcn_event_details_row3.csv",
+        FIGURE_DIR / ("%s_training_curves.png" % pfx),
+        FIGURE_DIR / ("%s_lr_schedule.png" % pfx),
+        FIGURE_DIR / ("%s_confusion_matrix_row1.png" % pfx),
+        FIGURE_DIR / ("%s_confusion_matrix_row2.png" % pfx),
+        FIGURE_DIR / ("%s_confusion_matrix_row3.png" % pfx),
+        FIGURE_DIR / ("%s_roc_curve.png" % pfx),
+        FIGURE_DIR / ("%s_threshold_curve.png" % pfx),
+        FIGURE_DIR / ("%s_metrics_comparison.png" % pfx),
+        FIGURE_DIR / ("%s_pr_curve.png" % pfx),
+        FIGURE_DIR / ("%s_calibration_curve.png" % pfx),
+        FIGURE_DIR / ("%s_far_comparison.png" % pfx),
+        FIGURE_DIR / ("%s_segment_length_analysis.png" % pfx),
+        FIGURE_DIR / ("%s_branch_rf_diagram.png" % pfx),
+    ]
+    for p in all_outputs:
+        exists = Path(p).exists()
+        status = "OK     " if exists else "MISSING"
+        logger.info("  [%s] %s", status, p)
+
+    logger.info("=" * 65)
+    logger.info("NEXT: run final_evaluation.py when test data is ready.")
+
+
+if __name__ == "__main__":
+    main()
+
+
+# ======================================================================
+# RESEARCH REPORTING GUIDE -- MultiScaleTCN.py
+# ======================================================================
+#
+# -- ARCHITECTURE (Methods) ------------------------------------------------
+# "The Multi-Scale TCN comprised three parallel branches of
+# CausalConvBlocks with dilation schedules [1,2,4], [2,4,8], and
+# [4,8,16], capturing ictal activity at fine, medium, and coarse
+# temporal scales simultaneously. Each branch contained three
+# CausalConvBlocks with the same two-convolution-per-block structure
+# as the single-branch TCN baseline (Bai et al., 2018). Branch
+# outputs were [concatenated and projected via 1x1 Conv1d / averaged]
+# before global average pooling and a linear classification head."
+#
+# Receptive fields (from multiscale_tcn_training_log.json
+# under "receptive_field_per_branch"):
+#   Branch 1 [1,2,4]  -- report RF in samples and seconds
+#   Branch 2 [2,4,8]  -- report RF in samples and seconds
+#   Branch 3 [4,8,16] -- report RF in samples and seconds
+#
+# Parameters to report (from best_multiscale_params.json):
+#   num_filters   -- branch channel width (same per branch)
+#   kernel_size   -- odd integer (3, 5, or 7)
+#   dropout       -- spatial dropout rate (Dropout1d)
+#   fusion        -- "concat" or "average"
+#   branch dilation schedules (fixed by design, not tuned)
+#   Total trainable parameters (from count_parameters)
+#
+# -- TRAINING (Methods) ----------------------------------------------------
+# "The model was trained for up to 100 epochs using AdamW (Loshchilov
+# & Hutter, 2019) with learning rate LR and weight decay WD, and a
+# cosine annealing schedule (eta_min = LR * 0.01). Early stopping
+# with patience 10 was applied, monitoring validation macro F1.
+# Gradient clipping (max_norm=1.0) was applied at every step. Class
+# imbalance was addressed by WeightedRandomSampler and BCEWithLogitsLoss
+# with pos_weight = n_non_ictal / n_ictal."
+#
+# "Hyperparameters were tuned independently for the multi-scale
+# architecture using Optuna TPE (tune_multiscale_tcn.py). No parameters
+# were transferred from the single-branch TCN study."
+#
+# WHY 100 EPOCHS:
+#   100 is a widely used upper bound in EEG deep learning literature
+#   (Acharya et al., 2018; Yildirim et al., 2020). It provides enough
+#   budget for the cosine annealing schedule to complete a full half-cycle
+#   from lr to eta_min, ensuring the learning rate explores both rapid
+#   and fine-grained optimisation phases. Early stopping (patience=10)
+#   terminates training as soon as the model converges, so the full 100
+#   epochs are rarely exhausted. Increasing to 200+ would not improve
+#   results because early stopping would still trigger at approximately
+#   the same epoch. Reducing to 50 risks cutting off the cosine cycle
+#   before the LR reaches its minimum, preventing fine-grained convergence.
+#
+# WHY AdamW (not SGD or Adam):
+#   AdamW decouples weight decay from the gradient update, so the
+#   regularisation effect remains constant as the learning rate decays
+#   under cosine annealing. Standard Adam conflates the two, causing
+#   effective regularisation to shrink towards zero as LR approaches
+#   eta_min, which can lead to overfitting in the final training phase.
+#
+# WHY COSINE ANNEALING (not step decay or constant LR):
+#   Cosine annealing provides a smooth, monotonic LR decay without
+#   abrupt drops that can destabilise training on small, noisy EEG
+#   datasets. The gradual reduction allows the model to explore broadly
+#   early in training and fine-tune late, without manually choosing
+#   step-decay milestones.
+#
+# WHY WEIGHTED-RANDOM-SAMPLER + POS_WEIGHT (dual correction):
+#   WeightedRandomSampler ensures each mini-batch contains roughly
+#   equal numbers of ictal and non-ictal segments, stabilising gradient
+#   direction. pos_weight further upweights the loss contribution of
+#   ictal segments, correcting any residual imbalance from stochastic
+#   sampling. This dual approach is more robust than either mechanism
+#   alone and is used consistently across all pipeline scripts.
+#
+# WHY INDEPENDENT TUNING (not transfer from TCN):
+#   The optimal num_filters for three parallel branches may differ from
+#   a single branch because model capacity is distributed across three
+#   branches rather than concentrated in one. Independent tuning ensures
+#   M3 is assessed at its true optimum, not at a configuration optimal
+#   for a different architecture.
+#
+# -- POST-PROCESSING (Methods) ---------------------------------------------
+# "Raw segment-level sigmoid probabilities were post-processed prior to
+# computing event-level false alarm rate:
+# (1) A 3-segment moving average was applied to suppress isolated
+#     single-segment false positives caused by transient artefacts.
+# (2) Consecutive positive segments separated by fewer than 30 seconds
+#     were merged into a single event, preventing one seizure from being
+#     counted as multiple alarms if the probability briefly dips mid-ictal.
+# (3) Events shorter than 10 seconds were discarded, as genuine rodent
+#     seizures typically last at least 10 seconds (Luttjohann et al., 2009)."
+#
+# WHY SMOOTHING_WIN = 3:
+#   A 3-segment kernel is the minimum that suppresses isolated 1-segment
+#   spikes while introducing only 1 segment of boundary uncertainty
+#   (floor(3/2) * 2.5s = 2.5s). Wider windows (5, 7) risk blurring
+#   seizure onset/offset boundaries and reducing temporal localisation.
+#
+# WHY REFRACTORY_SEC = 30:
+#   Rodent seizures can include brief inter-ictal pauses where the
+#   probability dips below threshold for a few seconds before resuming.
+#   A 30-second refractory period merges these fragmented detections into
+#   a single event. This value exceeds the longest typical inter-burst
+#   interval while remaining short enough not to merge separate seizures.
+#
+# WHY MIN_EVENT_SEC = 10:
+#   Genuine rodent seizures in the UNIQURE dataset last at least 10
+#   seconds (Luttjohann et al., 2009). Events shorter than this are
+#   overwhelmingly noise artefacts. Discarding them reduces FAR/hr
+#   without sacrificing true seizure detections.
+#
+# -- THRESHOLD SELECTION (Methods) -----------------------------------------
+# "The classification threshold was selected by maximising the Youden J
+# statistic (J = sensitivity + specificity - 1) on the validation set,
+# evaluating thresholds from 0.1 to 0.9 in steps of 0.01. The optimal
+# threshold was applied without modification to the test set."
+#
+# WHY YOUDEN J (not F1 or accuracy):
+#   Youden J = sensitivity + specificity - 1. Three advantages:
+#   (1) Symmetry: penalises missed seizures and false alarms equally,
+#       matching the clinical requirement that both under-detection and
+#       over-detection carry significant cost in continuous EEG monitoring.
+#   (2) Geometric meaning: J is the vertical distance from the ROC
+#       diagonal to the operating point, so maximising J selects the
+#       ROC point farthest from chance.
+#   (3) Prevalence independence: unlike F1, J does not depend on the
+#       positive predictive value, which is inflated/deflated by class
+#       imbalance. This makes J stable across datasets with different
+#       seizure-to-background ratios.
+#   F1 penalises false negatives more heavily than false positives
+#   through the precision term. Accuracy is dominated by the majority
+#   class in imbalanced datasets and is therefore uninformative for
+#   threshold selection in seizure detection.
+#
+# WHY SEARCH RANGE 0.1 to 0.9:
+#   Thresholds below 0.1 produce near-all-positive predictions;
+#   thresholds above 0.9 produce near-all-negative predictions. Both
+#   extremes are clinically useless and numerically degenerate. The
+#   0.01 step size provides sufficient granularity for a smooth curve.
+#
+# -- THREE-ROW TABLE (Results) ---------------------------------------------
+# Report multiscale_tcn_three_row_summary.csv as M3 block:
+#   Row 1: threshold=0.5, post-processing=No
+#     Baseline raw output at the standard threshold. Allows comparison
+#     with prior work. FAR/hr is segment-level only.
+#   Row 2: threshold=0.5, post-processing=Yes
+#     Isolates the contribution of post-processing alone.
+#     FAR/hr difference from Row 1 quantifies noise reduction.
+#   Row 3: threshold=opt, post-processing=Yes
+#     Best clinical operating point. Threshold from Youden J.
+# AUROC is identical across rows because it uses the continuous
+# probability distribution, which is threshold-invariant.
+#
+# -- ABLATION CONTEXT -------------------------------------------------------
+# M1 TCN vs M3 MultiScaleTCN:
+#   Isolates the contribution of the multi-branch parallel structure
+#   over a single-branch TCN. Same CausalConvBlock building block in
+#   both. Both tuned independently from scratch, so any performance
+#   difference is attributable to the multi-scale architecture alone.
+#
+# -- MULTI-SCALE SPECIFIC NOTES --------------------------------------------
+# WHY THREE BRANCHES:
+#   Ictal EEG has temporal structure at multiple scales simultaneously --
+#   sharp spikes (fine, Branch 1 RF), rhythmic bursts (medium, Branch 2),
+#   and sustained seizure envelopes (coarse, Branch 3). A single dilation
+#   schedule forces the network to compromise between these scales. The
+#   multi-scale architecture captures all three simultaneously, letting
+#   the fusion layer and classifier learn which scale is most informative
+#   for each segment.
+#
+# WHY BRANCH DILATIONS ARE FIXED (not tuned):
+#   The dilation schedules [1,2,4], [2,4,8], [4,8,16] were fixed by
+#   architectural design to ensure each branch covers a geometrically
+#   distinct temporal scale. Treating them as tunable would conflate
+#   architectural design decisions with hyperparameter search, making
+#   the M1-vs-M3 ablation harder to interpret. The schedules follow
+#   an exponential progression that is standard in TCN literature.
+#
+# -- FIGURES AND THEIR REVIEWER QUESTIONS ----------------------------------
+# multiscale_tcn_training_curves.png (Fig 1):
+#   Convergence and overfitting assessment. Loss declining + F1 rising
+#   then stabilising = healthy convergence. Vertical line = best epoch.
+#
+# multiscale_tcn_lr_schedule.png (Fig 2):
+#   Confirms cosine annealing behaved as described in Methods.
+#
+# multiscale_tcn_confusion_matrix_row{1,2,3}.png (Figs 3-5):
+#   TP/FP/FN/TN counts per evaluation row. Row 1 vs 2 isolates
+#   post-processing; Row 2 vs 3 isolates threshold optimisation.
+#
+# multiscale_tcn_roc_curve.png (Fig 6):
+#   Discrimination ability + three operating points on the ROC.
+#
+# multiscale_tcn_threshold_curve.png (Fig 7):
+#   Youden J vs threshold -- justifies the threshold selection.
+#
+# multiscale_tcn_metrics_comparison.png (Fig 8):
+#   At-a-glance grouped bar chart of all metrics + FAR panel.
+#
+# multiscale_tcn_pr_curve.png (Fig 9):
+#   Precision-recall for imbalanced assessment (more informative
+#   than ROC when negatives vastly outnumber positives).
+#
+# multiscale_tcn_calibration_curve.png (Fig 10):
+#   Probability calibration -- are predicted probabilities reliable?
+#
+# multiscale_tcn_far_comparison.png (Fig 11):
+#   Segment-level vs event-level FAR/hr reduction from post-processing.
+#
+# multiscale_tcn_segment_length_analysis.png (Fig 12):
+#   Event duration distribution and timeline -- justifies MIN_EVENT_SEC
+#   and REFRACTORY_SEC parameter choices.
+#
+# multiscale_tcn_branch_rf_diagram.png (Fig 13):
+#   Q: Do the three branches cover meaningfully different temporal scales?
+#      Is there excessive overlap? Does each RF fit the 5s segment?
+#   A: The RF bar chart shows each branch's temporal coverage alongside
+#      the segment length. The dilation subplot visualises how the
+#      exponential schedule expands the RF at each block depth. Include
+#      in the architecture section or supplementary material.
+# ======================================================================
