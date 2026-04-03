@@ -2027,4 +2027,434 @@ def find_optimal_threshold(
 #   Include threshold value in Table 1 of the paper.
 # ────────────────────────────────────────────────────
 
+
 # ═══════════════════════════════════════════════════
+# MULTI-SCALE TCN ARCHITECTURES
+# MultiScaleTCN        -- parallel multi-branch TCN
+# MultiScaleTCNWithAttention -- backbone + temporal
+#                              attention pooling
+# CausalConvBlock is reused from this module.
+# Tuning scripts:
+#   tune_multiscale_tcn.py
+#   tune_multiscale_attention.py
+# ═══════════════════════════════════════════════════
+
+
+# ---------------------------------------------------------------------------
+# 20. MultiScaleTCN
+# ---------------------------------------------------------------------------
+class MultiScaleTCN(nn.Module):
+    """Multi-Scale Temporal Convolutional Network for binary EEG seizure detection.
+
+    Three parallel branches of CausalConvBlocks, each using a distinct
+    dilation schedule, process the input simultaneously. Branch outputs
+    are fused and globally average-pooled before a linear classification head.
+
+    Architecture
+    ------------
+    Input: (batch, 1, SEGMENT_LEN)
+        |
+        +-- Branch 1 dilations [1, 2, 4]   -- fine scale
+        +-- Branch 2 dilations [2, 4, 8]   -- medium scale
+        +-- Branch 3 dilations [4, 8, 16]  -- coarse scale
+        |  Each branch: CausalConvBlock x len(dilations)
+        |  Each block: same two-conv structure as in TCN
+        |  Output per branch: (batch, num_filters, T)
+        |
+        v
+    Fusion -> (batch, num_filters, T)
+      "concat": cat on channel dim -> 1x1 Conv1d projection
+      "average": element-wise mean of branch outputs
+        |
+        v
+    Global average pool -> (batch, num_filters)
+        |
+        v
+    Linear head -> scalar logit (batch,)
+
+    Parameters
+    ----------
+    num_filters : int
+        Output channels per branch and in the fused representation.
+    kernel_size : int
+        Kernel width for all CausalConvBlocks. Must be odd.
+    dropout : float
+        Spatial dropout rate inside each CausalConvBlock.
+    branch1_dilations : list of int
+        Dilation schedule for Branch 1. Default [1, 2, 4].
+    branch2_dilations : list of int
+        Dilation schedule for Branch 2. Default [2, 4, 8].
+    branch3_dilations : list of int
+        Dilation schedule for Branch 3. Default [4, 8, 16].
+    fusion : str
+        Branch fusion strategy: "concat" (default) or "average".
+    return_embedding : bool
+        If True, return the globally pooled feature vector
+        (batch, num_filters) instead of the scalar logit. Default: False.
+
+    Receptive field per branch
+    --------------------------
+    RF_branch = 1 + 2 * sum((kernel_size - 1) * d for d in dilations)
+    Factor of 2 accounts for the two convolutions per CausalConvBlock.
+    """
+
+    def __init__(self,
+                 num_filters,
+                 kernel_size,
+                 dropout,
+                 branch1_dilations=None,
+                 branch2_dilations=None,
+                 branch3_dilations=None,
+                 fusion="concat",
+                 return_embedding=False):
+        super().__init__()
+
+        # Mutable default arguments handled here to avoid shared-list pitfall
+        if branch1_dilations is None:
+            branch1_dilations = [1, 2, 4]
+        if branch2_dilations is None:
+            branch2_dilations = [2, 4, 8]
+        if branch3_dilations is None:
+            branch3_dilations = [4, 8, 16]
+
+        if fusion not in ("concat", "average"):
+            raise ValueError(
+                "fusion must be 'concat' or 'average', got '%s'" % fusion)
+
+        self.fusion           = fusion
+        self.return_embedding = return_embedding
+        self.num_filters      = num_filters
+
+        def build_branch(dilations):
+            """Build one sequential branch of CausalConvBlocks.
+
+            Uses the EXACT parameter names of CausalConvBlock.__init__:
+                in_ch, out_ch, kernel_size, dilation, dropout
+            The two-conv-per-block structure is inherited -- not reimplemented.
+            """
+            blocks = []
+            in_ch = 1                                  # single-channel EEG input
+            for d in dilations:
+                blocks.append(
+                    CausalConvBlock(
+                        in_ch=in_ch,
+                        out_ch=num_filters,
+                        kernel_size=kernel_size,
+                        dilation=d,
+                        dropout=dropout))
+                in_ch = num_filters                    # subsequent blocks use num_filters input
+            return nn.Sequential(*blocks)
+
+        self.branch1 = build_branch(branch1_dilations)
+        self.branch2 = build_branch(branch2_dilations)
+        self.branch3 = build_branch(branch3_dilations)
+
+        # Fusion projection for concat mode
+        # Projects 3*num_filters -> num_filters so pooling and head always
+        # see a fixed channel dimension
+        if self.fusion == "concat":
+            self.fusion_conv = nn.Conv1d(
+                3 * num_filters, num_filters, kernel_size=1, bias=False)
+        else:
+            self.fusion_conv = None                    # register None for consistent state_dict
+
+        self.classifier = nn.Linear(num_filters, 1)    # binary classification head
+
+    def forward(self, x):
+        """Forward pass.
+
+        Parameters
+        ----------
+        x : torch.Tensor, shape (batch, 1, SEGMENT_LEN)
+
+        Returns
+        -------
+        torch.Tensor
+            return_embedding=False: shape (batch,) logit
+            return_embedding=True : shape (batch, num_filters)
+        """
+        out1 = self.branch1(x)                         # (batch, num_filters, T)
+        out2 = self.branch2(x)                         # (batch, num_filters, T)
+        out3 = self.branch3(x)                         # (batch, num_filters, T)
+
+        if self.fusion == "concat":
+            # Concat then project to preserve branch-specific features
+            fused = torch.cat([out1, out2, out3], dim=1)  # (batch, 3*num_filters, T)
+            fused = self.fusion_conv(fused)            # (batch, num_filters, T)
+        else:
+            # Equal-weight average of branch outputs
+            fused = (out1 + out2 + out3) / 3.0         # (batch, num_filters, T)
+
+        # Global average pooling collapses T to a scalar per filter
+        pooled = fused.mean(dim=-1)                    # (batch, num_filters)
+
+        if self.return_embedding:
+            return pooled
+
+        return self.classifier(pooled).squeeze(-1)     # (batch,) logit
+
+
+# -- RESEARCH REPORTING NOTE: MultiScaleTCN ------------------------------------
+# Methods description:
+#   "A Multi-Scale TCN was constructed with three parallel branches of
+#   CausalConvBlocks using dilation schedules [1,2,4], [2,4,8], [4,8,16]
+#   to capture ictal activity at fine, medium, and coarse temporal scales
+#   simultaneously. Branch outputs were fused by [concat+1x1 projection /
+#   averaging] before global average pooling and linear classification.
+#   All hyperparameters were tuned independently from scratch using Optuna TPE."
+#
+# Parameters to report:
+#   num_filters, kernel_size, dropout -- tuned
+#   fusion strategy -- tuned
+#   branch dilation schedules -- fixed by design
+#   RF per branch in samples and seconds at 500 Hz
+#   Total trainable parameters
+#
+# Justification for independent tuning:
+#   The optimal num_filters for three parallel branches differs from that
+#   for a single branch because capacity is distributed across branches.
+#   Independent tuning finds the true optimum for this architecture.
+# -----------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# 21. MultiScaleTCNWithAttention
+# ---------------------------------------------------------------------------
+class MultiScaleTCNWithAttention(nn.Module):
+    """Multi-Scale TCN with Temporal Attention for binary EEG seizure detection.
+
+    Mirrors TCNWithAttention structurally. The MultiScaleTCN backbone is
+    stored as self.backbone and frozen during attention tuning. Temporal
+    attention replaces global average pooling, learning which time steps
+    in the fused multi-scale feature map are most relevant to seizure
+    classification.
+
+    Architecture
+    ------------
+    Input: (batch, 1, SEGMENT_LEN)
+        |
+        v
+    MultiScaleTCN backbone (frozen during tuning)
+    Three parallel branches fused to (batch, num_filters, T)
+        |
+        v
+    Temporal Attention
+      e_t  = tanh(W_a h_t + b_a)  h_t in R^num_filters
+      alpha_t = softmax({e_t})     scalar weight per step
+      c    = sum_t alpha_t * h_t   (batch, num_filters)
+        |
+        v
+    Attention dropout -> (batch, num_filters)
+        |
+        v
+    Linear head -> scalar logit (batch,)
+
+    Parameters
+    ----------
+    num_filters : int
+        Branch channel width. Transferred from best_multiscale_params.json.
+    kernel_size : int
+        CausalConvBlock kernel width. Transferred from best_multiscale_params.json.
+    dropout : float
+        Spatial dropout in CausalConvBlocks. Transferred from best_multiscale_params.json.
+    fusion : str
+        "concat" or "average". Transferred from best_multiscale_params.json.
+    attention_dim : int
+        Projection dimension W_a. Tuned by Optuna.
+    attention_dropout : float
+        Dropout on context vector c. Tuned by Optuna.
+    branch1_dilations : list. Default [1, 2, 4].
+    branch2_dilations : list. Default [2, 4, 8].
+    branch3_dilations : list. Default [4, 8, 16].
+
+    Notes
+    -----
+    The backbone is stored as self.backbone. Its classification head is
+    never called. forward() accesses self.backbone.branch1/2/3 and
+    self.backbone.fusion_conv directly to obtain the pre-pooled feature map.
+    Call get_attention_weights(x) to retrieve alpha_t weights as a numpy
+    array for saliency visualisation.
+    """
+
+    def __init__(self,
+                 num_filters,
+                 kernel_size,
+                 dropout,
+                 fusion,
+                 attention_dim,
+                 attention_dropout,
+                 branch1_dilations=None,
+                 branch2_dilations=None,
+                 branch3_dilations=None):
+        super().__init__()
+
+        # Build MultiScaleTCN backbone
+        # return_embedding=False because forward() bypasses backbone.forward()
+        # entirely -- internal branch attributes are accessed directly
+        self.backbone = MultiScaleTCN(
+            num_filters=num_filters,
+            kernel_size=kernel_size,
+            dropout=dropout,
+            branch1_dilations=branch1_dilations,
+            branch2_dilations=branch2_dilations,
+            branch3_dilations=branch3_dilations,
+            fusion=fusion,
+            return_embedding=False)
+
+        self.num_filters = num_filters
+
+        # Temporal attention layers
+        # Attribute names are distinct from TCNWithAttention (which uses
+        # TemporalAttention module) -- this uses a two-layer energy function
+        # with attention_dim for richer multi-scale feature scoring
+        self.attention_fc   = nn.Linear(num_filters, attention_dim)
+        self.attention_v    = nn.Linear(attention_dim, 1, bias=False)
+        self.attention_drop = nn.Dropout(p=attention_dropout)
+        self.classifier     = nn.Linear(num_filters, 1)
+
+    def forward(self, x):
+        """Forward pass.
+
+        Parameters
+        ----------
+        x : torch.Tensor, shape (batch, 1, SEGMENT_LEN)
+
+        Returns
+        -------
+        torch.Tensor, shape (batch,) -- scalar logit.
+        """
+        # Access backbone internals directly to obtain the pre-pooled
+        # fused map (batch, num_filters, T)
+        out1 = self.backbone.branch1(x)
+        out2 = self.backbone.branch2(x)
+        out3 = self.backbone.branch3(x)
+
+        if self.backbone.fusion == "concat":
+            fused = torch.cat([out1, out2, out3], dim=1)
+            fused = self.backbone.fusion_conv(fused)
+        else:
+            fused = (out1 + out2 + out3) / 3.0
+        # fused: (batch, num_filters, T)
+
+        # Transpose so attention operates over time steps
+        feat_t = fused.transpose(1, 2)                 # (batch, T, num_filters)
+
+        # Compute per-timestep attention energy
+        # tanh bounds values to (-1,1) for stable softmax over long sequences
+        e = torch.tanh(self.attention_fc(feat_t))      # (batch, T, attention_dim)
+        e = self.attention_v(e)                        # (batch, T, 1)
+
+        # Normalise across T: weights sum to 1 per sample
+        alpha = torch.softmax(e, dim=1)                # (batch, T, 1)
+
+        # Weighted sum: each h_t scaled by its attention weight
+        context = (feat_t * alpha).sum(dim=1)          # (batch, num_filters)
+
+        context = self.attention_drop(context)
+        return self.classifier(context).squeeze(-1)    # (batch,) logit
+
+    def get_attention_weights(self, x):
+        """Return temporal attention weights for input x.
+
+        Parameters
+        ----------
+        x : torch.Tensor, shape (batch, 1, SEGMENT_LEN)
+            Must be on the same device as the model.
+
+        Returns
+        -------
+        np.ndarray, shape (batch, T)
+            alpha_t per time step. Non-negative, sums to 1 along T.
+            Use for saliency maps.
+
+        Usage
+        -----
+        model.eval()
+        with torch.no_grad():
+            weights = model.get_attention_weights(x)
+        # weights[0]: temporal saliency for sample 0
+        """
+        self.eval()
+        with torch.no_grad():
+            out1 = self.backbone.branch1(x)
+            out2 = self.backbone.branch2(x)
+            out3 = self.backbone.branch3(x)
+            if self.backbone.fusion == "concat":
+                fused = torch.cat([out1, out2, out3], dim=1)
+                fused = self.backbone.fusion_conv(fused)
+            else:
+                fused = (out1 + out2 + out3) / 3.0
+            feat_t = fused.transpose(1, 2)
+            e = torch.tanh(self.attention_fc(feat_t))
+            e = self.attention_v(e)
+            alpha = torch.softmax(e, dim=1)
+            return alpha.squeeze(-1).detach().cpu().numpy()
+
+
+# -- RESEARCH REPORTING NOTE: MultiScaleTCNWithAttention -----------------------
+# Methods description:
+#   "MultiScaleTCNWithAttention was constructed by adding temporal attention
+#   to the frozen MultiScaleTCN backbone, mirroring the design of
+#   TCNWithAttention. Backbone weights were transferred from the MultiScaleTCN
+#   tuning study and frozen. Only temporal attention parameters and the
+#   classification head received gradient updates. Energy e_t = tanh(W_a h_t
+#   + b_a) was computed per time step; weights alpha_t = softmax({e_t}) formed
+#   context c = sum_t alpha_t h_t passed to the head."
+#
+# Parameters to report:
+#   Backbone (fixed -- from best_multiscale_params.json):
+#     num_filters, kernel_size, dropout, fusion
+#     branch dilation schedules [1,2,4], [2,4,8], [4,8,16]
+#   Attention (tuned -- from best_multiscale_attn_params.json):
+#     attention_dim, attention_dropout,
+#     learning_rate, weight_decay, batch_size
+#   Frozen: all self.backbone parameters
+#   Trainable: attention_fc, attention_v, attention_drop, classifier
+#   Trainable parameter count (log from trial 0)
+#
+# Ablation framing:
+#   M3 MultiScaleTCN vs M4 MultiScaleTCNWithAttention isolates temporal
+#   attention at the multi-scale level, mirroring M1 TCN vs M2
+#   TCNWithAttention at the single-branch level.
+#
+# Attention interpretability:
+#   Call get_attention_weights() to extract alpha_t and average over ictal
+#   vs non-ictal segments to verify preferential attention to seizure-
+#   relevant time steps.
+# -----------------------------------------------------------------------------
+
+
+# ═══════════════════════════════════════════════════
+
+# -- USAGE IN TRAINING NOTEBOOKS ---------------------------------------------------
+#
+# Load tuned params:
+#   with open("outputs/best_multiscale_params.json") as f:
+#       ms = json.load(f)
+#   hp = ms["hyperparameters"]
+#
+#   with open("outputs/best_multiscale_attn_params.json") as f:
+#       ma = json.load(f)
+#   ah = ma["hyperparameters"]
+#
+# MultiScaleTCN:
+#   model = MultiScaleTCN(
+#       num_filters = hp["num_filters"],
+#       kernel_size = hp["kernel_size"],
+#       dropout     = hp["dropout"],
+#       fusion      = hp["fusion"]
+#   ).to(DEVICE)
+#
+# MultiScaleTCNWithAttention:
+#   model = MultiScaleTCNWithAttention(
+#       num_filters       = hp["num_filters"],
+#       kernel_size       = hp["kernel_size"],
+#       dropout           = hp["dropout"],
+#       fusion            = hp["fusion"],
+#       attention_dim     = ah["attention_dim"],
+#       attention_dropout = ah["attention_dropout"]
+#   ).to(DEVICE)
+#
+# Both return scalar logits for BCEWithLogitsLoss.
+# count_parameters() works on both.
+# -----------------------------------------------------------------------------
