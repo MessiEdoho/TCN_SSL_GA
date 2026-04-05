@@ -28,7 +28,8 @@ def _configure_logger():
     logger.setLevel(logging.DEBUG)
     if logger.handlers:
         return logger
-    handler = _ThreadSafeFileHandler('merge_training_data.log', encoding='utf-8')
+    DEST_ROOT.mkdir(parents=True, exist_ok=True)
+    handler = _ThreadSafeFileHandler(str(DEST_ROOT / 'merge_training_data.log'), encoding='utf-8')
     handler.setLevel(logging.DEBUG)
     fmt = logging.Formatter(
         fmt='%(asctime)s  %(levelname)-8s  %(message)s',
