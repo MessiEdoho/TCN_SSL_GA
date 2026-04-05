@@ -179,20 +179,42 @@ def compute_pos_weight(train_pairs, device):
 def make_loader(file_label_pairs, batch_size, train, device):
     """Build a DataLoader with optional WeightedRandomSampler for training.
 
+    When train=True, a WeightedRandomSampler with inverse-frequency class
+    weights oversamples the minority (ictal) class so each epoch presents
+    approximately balanced batches to the model. This is one half of the
+    dual imbalance correction strategy; the other half is pos_weight in
+    BCEWithLogitsLoss, which upweights ictal gradient contributions.
+
+    Sampling strategy
+    -----------------
+    Each sample i receives weight w_i = 1 / N_c, where N_c is the total
+    count of class c to which sample i belongs. At each epoch,
+    min(N, 2^24 - 1) samples are drawn with replacement from this
+    weighted distribution. The 2^24 - 1 cap avoids a PyTorch internal
+    limitation in torch.multinomial, which uses 32-bit indexing and
+    raises RuntimeError when the number of categories exceeds 2^24.
+    For datasets smaller than 2^24 samples, the cap has no effect and
+    every sample is drawn once in expectation per epoch.
+
     Parameters
     ----------
     file_label_pairs : list of (str or Path, int)
-        File-label pairs for the dataset.
+        File-label pairs for the dataset. Label 1 = ictal, 0 = non-ictal.
     batch_size : int
         Number of segments per batch.
     train : bool
         If True, use WeightedRandomSampler to oversample the minority class.
+        If False, load sequentially without shuffling (for val/test).
     device : torch.device
-        Used to set pin_memory (True when device is CUDA).
+        Used to set pin_memory (True when device is CUDA for faster
+        host-to-device transfer via DMA).
 
     Returns
     -------
     loader : DataLoader
+        Ready-to-iterate DataLoader. When train=True, iteration order is
+        stochastic and class-balanced. When train=False, iteration is
+        deterministic and sequential.
 
     Example
     -------
@@ -205,13 +227,21 @@ def make_loader(file_label_pairs, batch_size, train, device):
         labels = [lbl for _, lbl in file_label_pairs]      # extract all labels as a list
         n_pos = sum(labels)                                # count ictal (positive) segments
         n_neg = len(labels) - n_pos                        # count non-ictal (negative) segments
-        # Inverse-frequency weights: rarer class gets higher sampling probability
+        # Inverse-frequency weights: rarer class gets higher sampling probability.
+        # w(ictal) = 1/n_pos, w(non-ictal) = 1/n_neg. This makes the expected
+        # number of draws from each class equal per epoch.
         w_per_class = {0: 1.0 / max(n_neg, 1),
                        1: 1.0 / max(n_pos, 1)}
         sample_weights = [w_per_class[l] for l in labels]  # per-sample weight list
+        # torch.multinomial (used internally by WeightedRandomSampler) stores
+        # category indices as 32-bit integers and raises RuntimeError when the
+        # number of categories exceeds 2^24 (16,777,216). This cap ensures the
+        # sampler works for arbitrarily large EEG datasets. For datasets below
+        # the cap, min() returns len(labels) and behaviour is unchanged.
+        MAX_SAMPLES = 2**24 - 1                            # 16,777,215 -- PyTorch multinomial ceiling
         sampler = WeightedRandomSampler(
             weights=sample_weights,                        # sampling probability per segment
-            num_samples=len(labels),                       # draw this many samples per epoch
+            num_samples=min(len(labels), MAX_SAMPLES),     # draw up to MAX_SAMPLES per epoch
             replacement=True                               # allow repeated draws for minority class
         )
         return DataLoader(dataset, batch_size=batch_size,
@@ -226,19 +256,26 @@ def make_loader(file_label_pairs, batch_size, train, device):
 # -- RESEARCH REPORTING NOTE: make_loader --------------------------------------
 # Methods description:
 #   Training batches were constructed using a WeightedRandomSampler with
-#   inverse-frequency class weights, producing approximately balanced batches
-#   without discarding any samples. Validation batches were loaded sequentially
-#   without shuffling.
+#   inverse-frequency class weights (w_c = 1/N_c), producing approximately
+#   balanced batches without discarding any samples. The number of samples
+#   drawn per epoch was capped at min(N, 2^24 - 1) to comply with the
+#   PyTorch torch.multinomial 32-bit indexing limit. For datasets below
+#   16,777,215 samples, the cap has no effect. Validation batches were
+#   loaded sequentially without shuffling.
 #
 # Parameters to report in paper:
 #   batch_size : affects gradient noise and GPU memory usage
 #   WeightedRandomSampler : cite as minority oversampling strategy
 #   pin_memory : set True for CUDA devices (implementation detail, not reported)
+#   MAX_SAMPLES = 2^24 - 1 : report only if dataset exceeds this threshold
 #
 # Design choices to justify:
 #   WeightedRandomSampler + pos_weight : dual imbalance correction -- sampler
 #     balances what the model sees, pos_weight adjusts gradient contribution.
 #   num_workers=0 : cross-platform compatibility; can increase on Linux.
+#   MAX_SAMPLES cap : prevents RuntimeError from torch.multinomial when the
+#     dataset size exceeds 2^24. This is a PyTorch implementation constraint,
+#     not a methodological choice.
 # -----------------------------------------------------------------------------
 
 
