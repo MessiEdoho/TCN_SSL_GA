@@ -2,10 +2,12 @@
 tcn_utils.py -- Shared utilities for TCN-based EEG seizure detection.
 
 This module centralises all architecture definitions, dataset classes,
-training loops, and evaluation functions used across the pipeline notebooks:
+training loops, and evaluation functions used across the pipeline:
   - tcn_HPT_binary.ipynb (hyperparameter tuning)
-  - TCN training and evaluation notebooks
-  - TCN-TemporalAttention and SSL pipeline notebooks
+  - TCN.py, TCNTemporalAttention.py (single-branch models)
+  - MultiScaleTCN.py, MultiScaleTCNAttention.py (multi-branch models)
+  - tune_temporal_attention.py, tune_multiscale_tcn.py,
+    tune_multiscale_attention.py (Optuna tuning scripts)
 
 All components are parameterised -- no global variable references.
 Every class and function includes a RESEARCH REPORTING NOTE block
@@ -19,7 +21,6 @@ import random
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -242,152 +243,7 @@ def make_loader(file_label_pairs, batch_size, train, device):
 
 
 # ---------------------------------------------------------------------------
-# 6. EEGSegmentSSLDataset
-# ---------------------------------------------------------------------------
-class EEGSegmentSSLDataset(Dataset):
-    """Self-supervised EEG dataset returning two augmented views per segment.
-
-    No labels are returned. Each call to __getitem__ produces two independently
-    augmented views of the same segment for contrastive learning.
-
-    Parameters
-    ----------
-    file_paths : list of str or Path
-        Paths to .npy segment files (no labels).
-    segment_len : int, default 2500
-        Expected segment length in samples.
-
-    Example
-    -------
-    >>> ds = EEGSegmentSSLDataset(["seg_001.npy", "seg_002.npy"])
-    >>> v1, v2 = ds[0]  # both shape (1, 2500)
-    """
-
-    def __init__(self, file_paths, segment_len=2500):
-        self.file_paths = file_paths               # list of .npy file paths
-        self.segment_len = segment_len             # target segment length
-
-    def __len__(self):
-        return len(self.file_paths)                # total number of segments
-
-    def __getitem__(self, idx):
-        x = np.load(self.file_paths[idx]).astype(np.float32)  # load raw segment
-        view1 = self._augment(x.copy())            # first independently augmented view
-        view2 = self._augment(x.copy())            # second independently augmented view
-        return view1, view2
-
-    def _augment(self, x):
-        """Apply random augmentations to create one view.
-
-        Augmentations applied in order:
-        1. Temporal jitter (random crop)
-        2. Amplitude scaling
-        3. Gaussian noise injection
-        4. Z-score normalisation
-        """
-        # 1. Temporal jitter: random offset up to 125 samples
-        max_offset = min(125, max(0, len(x) - self.segment_len))  # clamp to available range
-        if max_offset > 0:
-            offset = np.random.randint(0, max_offset + 1)         # random start offset
-            x = x[offset : offset + self.segment_len]             # crop from offset
-        x = x[:self.segment_len]                                  # fallback: take first segment_len samples
-        if len(x) < self.segment_len:                             # pad if too short
-            x = np.pad(x, (0, self.segment_len - len(x)))
-
-        # 2. Amplitude scaling: uniform random in [0.5, 2.0]
-        scale = np.random.uniform(0.5, 2.0)                      # random scale factor
-        x = x * scale
-
-        # 3. Gaussian noise: sigma = uniform(0.01, 0.1) * std(x)
-        sigma = np.random.uniform(0.01, 0.1) * (x.std() + 1e-8)  # noise level proportional to signal
-        x = x + np.random.normal(0, sigma, size=x.shape).astype(np.float32)
-
-        # 4. Z-score normalisation after all augmentations
-        mu = x.mean()
-        std = x.std() + 1e-8                                     # epsilon to prevent div-by-zero
-        x = (x - mu) / std
-
-        return torch.from_numpy(x).unsqueeze(0)                  # shape: (1, segment_len)
-
-
-# -- RESEARCH REPORTING NOTE: EEGSegmentSSLDataset -----------------------------
-# Methods description:
-#   For self-supervised pre-training, two augmented views of each EEG segment
-#   were generated independently. Augmentations comprised temporal jitter
-#   (random crop up to 125 samples), random amplitude scaling (0.5--2.0x),
-#   additive Gaussian noise (sigma proportional to signal std), and per-view
-#   z-score normalisation.
-#
-# Parameters to report in paper:
-#   temporal_jitter_max : 125 samples (0.25 s at 500 Hz)
-#   amplitude_scale_range : [0.5, 2.0]
-#   noise_sigma_range : [0.01, 0.1] * std(segment)
-#   segment_len : 2500 samples (5 s at 500 Hz)
-#
-# Design choices to justify:
-#   Temporal jitter : simulates slight misalignment in seizure onset labelling
-#   Amplitude scaling : accounts for inter-subject amplitude variability
-#   Gaussian noise : improves robustness to recording noise
-#   Post-augmentation z-score : ensures views have comparable scale for
-#     contrastive loss computation
-# -----------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# 7. make_ssl_loader
-# ---------------------------------------------------------------------------
-def make_ssl_loader(file_paths, batch_size, device, segment_len=2500):
-    """Build a DataLoader for self-supervised pre-training.
-
-    Parameters
-    ----------
-    file_paths : list of str or Path
-        Paths to .npy segment files (no labels).
-    batch_size : int
-        Number of segments per batch.
-    device : torch.device
-        Used to set pin_memory.
-    segment_len : int, default 2500
-        Expected segment length in samples.
-
-    Returns
-    -------
-    loader : DataLoader
-
-    Example
-    -------
-    >>> loader = make_ssl_loader(paths, 64, torch.device("cuda"))
-    """
-    dataset = EEGSegmentSSLDataset(file_paths, segment_len=segment_len)
-    pin = (device.type == "cuda")                  # pin memory for faster GPU transfer
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=True,                              # random order for contrastive learning
-        drop_last=True,                            # drop last incomplete batch to keep batch size constant for NT-Xent
-        num_workers=0,                             # cross-platform compatibility
-        pin_memory=pin
-    )
-
-
-# -- RESEARCH REPORTING NOTE: make_ssl_loader ----------------------------------
-# Methods description:
-#   Self-supervised training batches were shuffled randomly with the last
-#   incomplete batch dropped to ensure a constant batch size, which is required
-#   for correct NT-Xent contrastive loss computation.
-#
-# Parameters to report in paper:
-#   batch_size : affects the number of negative pairs in contrastive loss
-#   drop_last=True : required for NT-Xent (report as implementation detail)
-#
-# Design choices to justify:
-#   drop_last=True : NT-Xent loss constructs a 2N x 2N similarity matrix;
-#     variable batch sizes would produce inconsistent loss magnitudes.
-# -----------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# 8. CausalConvBlock
+# 6. CausalConvBlock
 # ---------------------------------------------------------------------------
 class CausalConvBlock(nn.Module):
     """Two-convolution causal residual block following Bai et al. (2018).
@@ -658,18 +514,21 @@ class TemporalAttention(nn.Module):
 # 11. TCNWithAttention
 # ---------------------------------------------------------------------------
 class TCNWithAttention(nn.Module):
-    """TCN backbone followed by temporal attention pooling.
+    """TCN backbone followed by two-layer additive temporal attention.
 
     The TCN extracts temporal features using two-convolution residual
-    blocks (Bai et al., 2018); temporal attention (TemporalAttention) learns
-    a scalar importance weight per time step and collapses the sequence to a
-    fixed-length embedding via a weighted sum. The attention weights form an
-    interpretable saliency map over the segment window, indicating which time
-    steps were most informative for classification.
+    blocks (Bai et al., 2018). A two-layer additive attention mechanism
+    (tanh activation + linear scorer) learns a scalar importance weight
+    per time step and collapses the sequence to a fixed-length context
+    vector via a weighted sum. The attention weights form an interpretable
+    saliency map over the segment window.
 
-    Replaces multi-head self-attention (Q=K=V, O(T^2*D*H)) with additive
-    temporal attention (O(T*D)), removing the n_heads hyperparameter and
-    global average pooling in favour of a single attention pooling step.
+    This attention formulation matches MultiScaleTCNWithAttention exactly,
+    ensuring the M1-vs-M2 and M3-vs-M4 ablations test the same mechanism.
+
+    Architecture:
+      TCN stack -> transpose -> tanh(W_a h_t + b_a) -> v^T e_t ->
+      softmax over T -> weighted sum -> dropout -> classifier
 
     Receptive field: RF = 2 * (2^L - 1) * (k - 1) + 1 samples.
 
@@ -678,25 +537,34 @@ class TCNWithAttention(nn.Module):
     num_layers : int
         Number of TCN residual blocks (each with two convolutions).
     num_filters : int
-        Channels per TCN layer and attention embedding dimension.
+        Channels per TCN layer (= input dimension to attention).
     kernel_size : int
         TCN kernel size (odd).
     dropout : float
         Spatial dropout rate for TCN blocks.
+    attention_dim : int, default 64
+        Projection dimension of the attention scoring function.
+        Tuned by Optuna in tune_temporal_attention.py.
+    attention_dropout : float, default 0.0
+        Dropout rate on the attention context vector.
+        Tuned by Optuna in tune_temporal_attention.py.
     return_embedding : bool, default False
-        If True, return the attended embedding instead of classification logits.
+        If True, return the context vector instead of logits.
     fs : int, default 500
         Sampling rate for RF logging.
 
     Example
     -------
-    >>> model = TCNWithAttention(7, 64, 5, 0.2, return_embedding=True)
-    >>> emb = model(torch.randn(8, 1, 2500))  # (8, 64)
+    >>> model = TCNWithAttention(7, 64, 5, 0.2, attention_dim=64,
+    ...                          attention_dropout=0.1)
+    >>> logits = model(torch.randn(8, 1, 2500))  # (8,)
     """
 
     def __init__(self, num_layers, num_filters, kernel_size, dropout,
+                 attention_dim=64, attention_dropout=0.0,
                  return_embedding=False, fs=500):
         super().__init__()
+        # -- TCN backbone (frozen during attention tuning, unfrozen for final training)
         layers = []
         for i in range(num_layers):
             in_ch = 1 if i == 0 else num_filters
@@ -704,12 +572,16 @@ class TCNWithAttention(nn.Module):
             layers.append(CausalConvBlock(in_ch, num_filters, kernel_size, dilation, dropout))
         self.tcn = nn.Sequential(*layers)
 
-        # Temporal attention: scalar weight per time step (replaces nn.MultiheadAttention)
-        # n_heads parameter removed -- TemporalAttention has no head count
-        self.attn = TemporalAttention(embed_dim=num_filters)
-        self.attn_norm = nn.LayerNorm(num_filters)  # post-attention normalisation
+        # -- Two-layer additive temporal attention (matches MultiScaleTCNWithAttention)
+        # e_t = tanh(W_a h_t + b_a), score = v^T e_t, alpha = softmax({score})
+        # This nonlinear scoring can learn feature interactions that a single
+        # linear layer (the old TemporalAttention) cannot.
+        self.attention_fc   = nn.Linear(num_filters, attention_dim)   # project to attention space
+        self.attention_v    = nn.Linear(attention_dim, 1, bias=False) # scalar score per time step
+        self.attention_drop = nn.Dropout(p=attention_dropout)         # regularise context vector
+
         self.return_embedding = return_embedding
-        self.head = nn.Linear(num_filters, 1)       # classification head
+        self.head = nn.Linear(num_filters, 1)       # binary classification head
         # RF = 2 * (2^L - 1) * (k - 1) + 1: two convolutions per block
         self.rf = 2 * (2 ** num_layers - 1) * (kernel_size - 1) + 1
         self.num_filters = num_filters
@@ -717,249 +589,91 @@ class TCNWithAttention(nn.Module):
     def forward(self, x):
         """Forward pass. x: (batch, 1, segment_len)."""
         out = self.tcn(x)                           # (batch, num_filters, time)
-        out = out.transpose(1, 2)                   # (batch, time, num_filters) for attention
+        feat_t = out.transpose(1, 2)                # (batch, time, num_filters)
 
-        # Temporal attention pooling: replaces self-attention + global average pooling
-        # context is the attention-weighted sum; _ are the saliency weights (batch, time)
-        context, _ = self.attn(out)                 # context: (batch, num_filters)
-        out = self.attn_norm(context)               # LayerNorm on attended context vector
+        # Two-layer additive attention scoring
+        e = torch.tanh(self.attention_fc(feat_t))   # (batch, time, attention_dim)
+        e = self.attention_v(e)                     # (batch, time, 1)
+        alpha = torch.softmax(e, dim=1)             # (batch, time, 1) sums to 1 over T
+
+        # Weighted sum: context vector is the attended representation
+        context = (feat_t * alpha).sum(dim=1)       # (batch, num_filters)
+        context = self.attention_drop(context)       # dropout on context
 
         if self.return_embedding:
-            return out                              # (batch, num_filters) embedding
-        return self.head(out).squeeze(-1)           # (batch,) logits
+            return context                          # (batch, num_filters) embedding
+        return self.head(context).squeeze(-1)       # (batch,) logits
+
+    def get_attention_weights(self, x):
+        """Return temporal attention weights for input x.
+
+        Mirrors get_attention_weights() in MultiScaleTCNWithAttention
+        so both attention-bearing models expose the same interface for
+        saliency visualisation and interpretability analysis.
+
+        Parameters
+        ----------
+        x : torch.Tensor, shape (batch, 1, segment_len)
+            Must be on the same device as the model.
+
+        Returns
+        -------
+        np.ndarray, shape (batch, T)
+            alpha_t per time step. Non-negative, sums to 1 along T.
+            Use for temporal saliency maps over raw EEG.
+
+        Usage
+        -----
+        model.eval()
+        with torch.no_grad():
+            weights = model.get_attention_weights(x)
+        # weights[0]: temporal saliency for sample 0
+        """
+        self.eval()
+        with torch.no_grad():
+            out = self.tcn(x)                       # (batch, num_filters, time)
+            feat_t = out.transpose(1, 2)            # (batch, time, num_filters)
+            e = torch.tanh(self.attention_fc(feat_t))
+            e = self.attention_v(e)                 # (batch, time, 1)
+            alpha = torch.softmax(e, dim=1)         # (batch, time, 1)
+            return alpha.squeeze(-1).detach().cpu().numpy()
 
 
 # -- RESEARCH REPORTING NOTE: TCNWithAttention ---------------------------------
 # Methods description:
-#   An additive temporal attention layer (TemporalAttention) was appended after
-#   the TCN stack, replacing both multi-head self-attention and global average
-#   pooling. A single linear projection scored each time step; softmax over the
-#   temporal axis produced importance weights. The attended context vector
-#   (weighted sum of TCN features) was layer-normalised before the
-#   classification head.
+#   A two-layer additive temporal attention mechanism was appended after
+#   the TCN stack, replacing global average pooling. Per-timestep energy
+#   e_t = tanh(W_a h_t + b_a) was computed via a learned projection
+#   W_a in R^(attention_dim x num_filters); scalar scores v^T e_t were
+#   normalised with softmax to produce attention weights alpha_t. The
+#   context vector c = sum_t alpha_t h_t was regularised with dropout
+#   before the classification head. This formulation matches
+#   MultiScaleTCNWithAttention exactly, ensuring consistent ablation
+#   comparison between M1/M2 (single-branch) and M3/M4 (multi-branch).
 #
 # Parameters to report in paper:
-#   num_filters : embedding dimension (= TCN channel width = attention embed_dim)
-#   All TCN parameters (num_layers, kernel_size, dropout)
-#   total trainable parameters
-#   attention parameters: num_filters + 1 (score layer weight + bias)
-#   Note: n_heads removed -- temporal attention has no head count hyperparameter
+#   Backbone: num_layers, kernel_size, num_filters, dropout
+#   Attention: attention_dim, attention_dropout
+#   Total trainable parameters (backbone + attention + head)
+#   Attention parameter count (attention_fc + attention_v + attention_drop + head)
+#   RF = 2 * (2^L - 1) * (k - 1) + 1 samples
 #
 # Design choices to justify:
-#   Temporal attention replacing MHA : O(T*D) vs O(T^2*D*H); removes n_heads
-#     as a hyperparameter; critical for 2,500-sample segments at 500 Hz.
-#   Attention replaces global average pooling : the weighted sum is a strict
-#     generalisation of uniform pooling -- it can learn to replicate GAP or
-#     focus on seizure onset regions.
-#   LayerNorm after attention : stabilises the context vector before the
-#     linear classification head.
-#   return_embedding mode : enables reuse as encoder in SSL pipelines.
+#   Two-layer scoring (tanh + linear) : can learn nonlinear feature
+#     interactions when deciding which time steps matter. A single linear
+#     layer can only learn a fixed linear combination of features.
+#   attention_dim as tunable HP : controls the capacity of the scoring
+#     function independently of num_filters.
+#   attention_dropout : regularises the context vector, preventing the
+#     model from over-relying on a few dominant time steps.
+#   Matches MultiScaleTCNWithAttention : ensures M1-vs-M2 and M3-vs-M4
+#     ablations test identical attention mechanisms.
+#   return_embedding mode : enables reuse as encoder in downstream pipelines.
 # -----------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
-# 11. SSLModel
-# ---------------------------------------------------------------------------
-class SSLModel(nn.Module):
-    """Self-supervised learning model with encoder and projection head.
-
-    The encoder is a TCNWithAttention (with temporal attention) in embedding
-    mode. The projector maps embeddings to a lower-dimensional space for
-    contrastive loss. Outputs are L2-normalised to the unit hypersphere.
-
-    Parameters
-    ----------
-    num_layers : int
-        Number of TCN blocks in the encoder.
-    num_filters : int
-        TCN channel width and encoder embedding dimension.
-    kernel_size : int
-        TCN kernel size.
-    dropout : float
-        Spatial dropout rate.
-    projection_dim : int, default 128
-        Output dimension of the projection head.
-    Note: n_heads removed -- TCNWithAttention now uses TemporalAttention
-        which has no head count hyperparameter.
-
-    Example
-    -------
-    >>> ssl = SSLModel(7, 64, 5, 0.2, projection_dim=128)
-    >>> z = ssl(torch.randn(8, 1, 2500))  # (8, 128), L2-normalised
-    """
-
-    def __init__(self, num_layers, num_filters, kernel_size, dropout,
-                 projection_dim=128):
-        super().__init__()
-        # n_heads removed: TCNWithAttention uses TemporalAttention (no head count)
-        self.encoder = TCNWithAttention(
-            num_layers, num_filters, kernel_size, dropout,
-            return_embedding=True
-        )
-        self.projector = nn.Sequential(
-            nn.Linear(num_filters, num_filters),    # first linear layer
-            nn.GELU(),                              # non-linear activation
-            nn.Linear(num_filters, projection_dim)  # project to contrastive space
-        )
-
-    def forward(self, x):
-        """Forward pass. Returns L2-normalised projection."""
-        emb = self.encoder(x)                       # (batch, num_filters)
-        proj = self.projector(emb)                  # (batch, projection_dim)
-        return F.normalize(proj, dim=-1)            # L2 normalise to unit hypersphere
-
-
-# -- RESEARCH REPORTING NOTE: SSLModel -----------------------------------------
-# Methods description:
-#   The self-supervised model comprised a TCN-TemporalAttention encoder followed
-#   by a two-layer projection head (Linear-GELU-Linear) mapping to a
-#   projection_dim-dimensional space. Outputs were L2-normalised to the
-#   unit hypersphere for NT-Xent contrastive loss computation. The encoder
-#   uses additive temporal attention (TemporalAttention) in place of the
-#   previous multi-head self-attention layer; n_heads is no longer a parameter.
-#
-# Parameters to report in paper:
-#   projection_dim : output dimension of the projection head
-#   All encoder parameters (num_layers, num_filters, kernel_size, dropout)
-#   Note: n_heads removed -- temporal attention has no head count hyperparameter
-#
-# Design choices to justify:
-#   Two-layer projector with GELU : standard SimCLR-style projection head;
-#     non-linear projector empirically outperforms linear for contrastive learning.
-#   L2 normalisation : required for cosine-similarity-based NT-Xent loss.
-#   Temporal attention in encoder : attention weights produced during SSL
-#     pre-training are available for post-hoc visualisation and auxiliary
-#     regularisation without additional architectural cost.
-# -----------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# 12. nt_xent_loss
-# ---------------------------------------------------------------------------
-def nt_xent_loss(z1, z2, temperature=0.5):
-    """Normalised Temperature-scaled Cross-Entropy (NT-Xent) contrastive loss.
-
-    Parameters
-    ----------
-    z1 : torch.Tensor, shape (batch, dim)
-        L2-normalised projections from view 1.
-    z2 : torch.Tensor, shape (batch, dim)
-        L2-normalised projections from view 2.
-    temperature : float, default 0.5
-        Temperature scaling factor for the similarity matrix.
-
-    Returns
-    -------
-    loss : torch.Tensor, scalar
-        Mean NT-Xent loss over all positive pairs.
-
-    Example
-    -------
-    >>> loss = nt_xent_loss(z1, z2, temperature=0.5)
-    """
-    batch_size = z1.size(0)
-    z = torch.cat([z1, z2], dim=0)                 # (2*batch, dim) -- concatenate both views
-    sim = torch.mm(z, z.t()) / temperature         # (2N, 2N) cosine similarity / temperature
-
-    # Mask diagonal (self-similarity) with -inf to exclude from softmax
-    mask = torch.eye(2 * batch_size, device=z.device).bool()
-    sim.masked_fill_(mask, float('-inf'))
-
-    # Positive pair labels: view1[i] <-> view2[i] at index i+batch; view2[i] <-> view1[i] at index i
-    labels = torch.cat([
-        torch.arange(batch_size, 2 * batch_size, device=z.device),  # view1[i] -> view2[i]
-        torch.arange(0, batch_size, device=z.device)                # view2[i] -> view1[i]
-    ])
-
-    return F.cross_entropy(sim, labels)            # NT-Xent loss
-
-
-# -- RESEARCH REPORTING NOTE: nt_xent_loss -------------------------------------
-# Methods description:
-#   Contrastive pre-training used the NT-Xent loss (Chen et al., 2020).
-#   Cosine similarity between all pairs in a batch of 2N projections was
-#   computed and scaled by a temperature parameter. Each sample's positive
-#   pair was its corresponding augmented view; all other samples served as
-#   negatives.
-#
-# Parameters to report in paper:
-#   temperature : controls the sharpness of the similarity distribution
-#   batch_size : determines the number of negative pairs (2N-2 per sample)
-#
-# Design choices to justify:
-#   temperature=0.5 : standard default; lower values sharpen the distribution
-#     but may cause training instability.
-#   Cosine similarity (via L2-normalised inputs) : standard for NT-Xent.
-# -----------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# 13. FineTunedModel
-# ---------------------------------------------------------------------------
-class FineTunedModel(nn.Module):
-    """Fine-tuned model: pre-trained TCN-TemporalAttention encoder + linear classifier.
-
-    The encoder can be frozen during initial fine-tuning epochs, then unfrozen
-    for end-to-end training with a lower learning rate.
-
-    Parameters
-    ----------
-    encoder : TCNWithAttention
-        Pre-trained encoder (with temporal attention) in return_embedding=True mode.
-    num_filters : int
-        Encoder embedding dimension (must match encoder output).
-    freeze_encoder : bool, default True
-        If True, freeze encoder parameters (requires_grad=False).
-
-    Example
-    -------
-    >>> encoder = ssl_model.encoder
-    >>> ft = FineTunedModel(encoder, 64, freeze_encoder=True)
-    >>> logits = ft(torch.randn(8, 1, 2500))  # (8,)
-    """
-
-    def __init__(self, encoder, num_filters, freeze_encoder=True):
-        super().__init__()
-        self.encoder = encoder                     # pre-trained TCN-TemporalAttention encoder
-        self.classifier = nn.Linear(num_filters, 1)  # binary classification head
-
-        if freeze_encoder:
-            for p in self.encoder.parameters():
-                p.requires_grad = False            # freeze encoder weights
-
-    def forward(self, x):
-        """Forward pass. Returns logits: (batch,)."""
-        emb = self.encoder(x)                      # (batch, num_filters) -- encoder embedding
-        return self.classifier(emb).squeeze(-1)    # (batch,) raw logits
-
-
-# -- RESEARCH REPORTING NOTE: FineTunedModel -----------------------------------
-# Methods description:
-#   For fine-tuning, a linear classification head was appended to the
-#   pre-trained TCN-TemporalAttention encoder. During the initial phase, the
-#   encoder was frozen and only the classification head was trained. In the
-#   second phase, the encoder was unfrozen and trained end-to-end with a
-#   reduced learning rate. The temporal attention weights of the encoder can
-#   be extracted post-hoc for seizure onset localisation analysis.
-#
-# Parameters to report in paper:
-#   freeze_epochs : number of epochs with frozen encoder
-#   encoder_lr : learning rate for encoder during unfrozen phase
-#   classifier_lr : learning rate for classification head
-#
-# Design choices to justify:
-#   Two-phase training : prevents catastrophic forgetting of pre-trained
-#     representations by allowing the classifier to converge before updating
-#     encoder weights.
-#   Lower encoder LR : standard transfer learning practice to preserve
-#     pre-trained features while allowing task-specific adaptation.
-#   Temporal attention weights : post-hoc temporal saliency maps available
-#     from the encoder at inference time with no additional architectural cost.
-# -----------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# 14. count_parameters
+# 11. count_parameters
 # ---------------------------------------------------------------------------
 def count_parameters(model):
     """Count total trainable parameters in a model.
@@ -1235,216 +949,10 @@ def run_training(model, train_loader, val_loader, lr, weight_decay,
 # -----------------------------------------------------------------------------
 
 
-# ---------------------------------------------------------------------------
-# 18. run_ssl_pretraining
-# ---------------------------------------------------------------------------
-def run_ssl_pretraining(model, loader, lr, temperature, max_epochs, device,
-                        max_grad_norm=1.0):
-    """Self-supervised pre-training loop using NT-Xent contrastive loss.
-
-    Parameters
-    ----------
-    model : SSLModel
-        Self-supervised model with encoder and projector.
-    loader : DataLoader
-        SSL data loader returning (view1, view2) pairs.
-    lr : float
-        Learning rate for AdamW.
-    temperature : float
-        NT-Xent temperature parameter.
-    max_epochs : int
-        Number of pre-training epochs (no early stopping).
-    device : torch.device
-        Target device.
-    max_grad_norm : float, default 1.0
-        Gradient clipping threshold.
-
-    Returns
-    -------
-    losses : list of float
-        Average contrastive loss per epoch.
-
-    Example
-    -------
-    >>> losses = run_ssl_pretraining(ssl_model, loader, 1e-3, 0.5, 100, device)
-    """
-    optimiser = AdamW(model.parameters(), lr=lr)
-    scheduler = CosineAnnealingLR(optimiser, T_max=max_epochs, eta_min=lr * 0.01)
-    losses = []
-
-    for epoch in range(max_epochs):
-        model.train()
-        epoch_loss = 0.0
-        n_batches = 0
-
-        for v1, v2 in loader:
-            v1, v2 = v1.to(device), v2.to(device)  # transfer views to device
-            optimiser.zero_grad()
-            z1 = model(v1)                          # project view 1
-            z2 = model(v2)                          # project view 2
-            loss = nt_xent_loss(z1, z2, temperature)  # contrastive loss
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-            optimiser.step()
-            epoch_loss += loss.item()
-            n_batches += 1
-
-        scheduler.step()
-        avg_loss = epoch_loss / max(n_batches, 1)
-        losses.append(avg_loss)
-
-        if (epoch + 1) % 10 == 0:                   # log every 10 epochs
-            print(f"  SSL epoch {epoch+1}/{max_epochs}: avg loss = {avg_loss:.4f}")
-
-    return losses
-
-
-# -- RESEARCH REPORTING NOTE: run_ssl_pretraining ------------------------------
-# Methods description:
-#   Self-supervised pre-training optimised the NT-Xent contrastive loss over
-#   pairs of augmented EEG segment views for a fixed number of epochs using
-#   AdamW with cosine annealing.
-#
-# Parameters to report in paper:
-#   lr : pre-training learning rate
-#   temperature : NT-Xent temperature
-#   max_epochs : total pre-training epochs
-#   batch_size : determines number of negative pairs in contrastive loss
-#
-# Design choices to justify:
-#   No early stopping : standard for SSL pre-training; validation signal
-#     is not available without labels.
-#   Fixed epochs : pre-training budget is set a priori based on dataset size.
-# -----------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# 19. run_finetuning
-# ---------------------------------------------------------------------------
-def run_finetuning(model, train_loader, val_loader, lr, weight_decay,
-                   warmup_epochs, freeze_epochs, max_epochs, patience,
-                   device, train_pairs=None, max_grad_norm=1.0):
-    """Two-phase fine-tuning: frozen encoder then end-to-end.
-
-    Phase 1 (epochs 0 to freeze_epochs-1): encoder frozen, only classifier trained.
-    Phase 2 (epochs freeze_epochs onward): encoder unfrozen with lower LR.
-
-    Parameters
-    ----------
-    model : FineTunedModel
-        Fine-tuning model with encoder and classifier.
-    train_loader : DataLoader
-        Training data loader.
-    val_loader : DataLoader
-        Validation data loader.
-    lr : float
-        Learning rate for the classifier head.
-    weight_decay : float
-        L2 regularisation coefficient.
-    warmup_epochs : int
-        (Reserved for future use; currently unused.)
-    freeze_epochs : int
-        Number of epochs to keep the encoder frozen.
-    max_epochs : int
-        Total maximum epochs (both phases combined).
-    patience : int
-        Early stopping patience on val macro F1.
-    device : torch.device
-        Target device.
-    train_pairs : list, optional
-        For pos_weight computation.
-    max_grad_norm : float, default 1.0
-        Gradient clipping threshold.
-
-    Returns
-    -------
-    best_val_f1 : float
-        Best validation macro F1 achieved.
-
-    Example
-    -------
-    >>> f1 = run_finetuning(ft_model, train_ld, val_ld, 1e-3, 1e-4, 0, 10, 100, 10, device)
-    """
-    # Compute pos_weight for class imbalance
-    if train_pairs is not None:
-        pw = compute_pos_weight(train_pairs, device)
-    else:
-        pw = torch.tensor([1.0], dtype=torch.float32).to(device)
-
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pw)
-
-    # Phase 1 optimiser: only classifier parameters (encoder is frozen)
-    optimiser = AdamW(model.classifier.parameters(), lr=lr, weight_decay=weight_decay)
-    scheduler = CosineAnnealingLR(optimiser, T_max=max_epochs, eta_min=lr * 0.01)
-
-    best_val_f1 = 0.0
-    epochs_no_improve = 0
-    best_state = None
-
-    for epoch in range(max_epochs):
-
-        # Phase 2 switch: unfreeze encoder and create two-param-group optimiser
-        if epoch == freeze_epochs:
-            for p in model.encoder.parameters():
-                p.requires_grad = True             # unfreeze encoder weights
-            # Two param groups: encoder at lr*0.1, classifier at lr
-            optimiser = AdamW([
-                {"params": model.encoder.parameters(), "lr": lr * 0.1},
-                {"params": model.classifier.parameters(), "lr": lr}
-            ], weight_decay=weight_decay)
-            scheduler = CosineAnnealingLR(optimiser, T_max=max_epochs - freeze_epochs,
-                                          eta_min=lr * 0.01)
-
-        train_loss = train_one_epoch(model, train_loader, optimiser, criterion,
-                                     device, max_grad_norm)
-        val_f1, _, _ = evaluate(model, val_loader, device)
-        scheduler.step()
-
-        if val_f1 > best_val_f1:
-            best_val_f1 = val_f1
-            epochs_no_improve = 0
-            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-        else:
-            epochs_no_improve += 1
-
-        if epochs_no_improve >= patience:
-            break
-
-    if best_state is not None:
-        model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
-
-    return best_val_f1
-
-
-# -- RESEARCH REPORTING NOTE: run_finetuning -----------------------------------
-# Methods description:
-#   Fine-tuning followed a two-phase strategy. In Phase 1, the pre-trained
-#   encoder was frozen and only the linear classification head was trained.
-#   In Phase 2, the encoder was unfrozen and trained end-to-end with a
-#   10x lower learning rate to preserve pre-trained features. Early stopping
-#   on validation macro F1 was applied throughout.
-#
-# Parameters to report in paper:
-#   freeze_epochs : duration of frozen-encoder phase
-#   lr : classifier learning rate
-#   lr * 0.1 : encoder learning rate during unfrozen phase
-#   weight_decay, max_epochs, patience : same as run_training
-#   pos_weight : class imbalance correction
-#
-# Design choices to justify:
-#   Two-phase training : prevents catastrophic forgetting by stabilising the
-#     classifier before updating encoder weights.
-#   Encoder LR = classifier LR * 0.1 : standard discriminative fine-tuning
-#     practice; preserves pre-trained representations.
-#   Separate optimiser after unfreeze : ensures correct momentum statistics
-#     for the newly trainable encoder parameters.
-# -----------------------------------------------------------------------------
-
-
 # ═══════════════════════════════════════════════════
 # POST-PROCESSING AND THRESHOLD OPTIMISATION
-# Called by all four model training notebooks and by
-# final_evaluation.ipynb
+# Called by all four model training scripts and by
+# final_evaluation.py
 # ═══════════════════════════════════════════════════
 
 # ── HOW TO REPORT THESE METHODS IN YOUR PAPER ──────

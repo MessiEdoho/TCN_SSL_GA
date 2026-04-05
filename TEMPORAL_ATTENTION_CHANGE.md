@@ -1,50 +1,31 @@
-# Architectural Change: Self-Attention to Temporal Attention
+# Architectural Change Log: Temporal Attention in TCNWithAttention
 
 **File:** `tcn_utils.py`
-**Date:** 2026-04-01
-**Scope:** `TemporalAttention` (new class), `TCNWithAttention`, `SSLModel`, `FineTunedModel`
+**Initial change:** 2026-04-01 (self-attention to temporal attention)
+**Latest revision:** 2026-04-04 (upgrade to two-layer additive attention + SSL removal)
 
 ---
 
-## 1. Summary of Change
+## 1. Summary of Changes
 
+### Phase 1 (2026-04-01): Self-Attention to Temporal Attention
 The multi-head self-attention layer (`nn.MultiheadAttention`, Q=K=V) inside
-`TCNWithAttention` has been replaced with a new lightweight module,
-`TemporalAttention`, which learns a single scalar importance weight per time
-step and collapses the sequence to a fixed-length context vector via a
-weighted sum. Global average pooling, which followed self-attention in the
-previous architecture, has been removed entirely because temporal attention
-subsumes it as a special case.
+`TCNWithAttention` was replaced with a lightweight `TemporalAttention` module
+(single `nn.Linear(num_filters, 1)` scorer). The `n_heads` hyperparameter was
+removed. Global average pooling was replaced by attention-weighted pooling.
 
-The `n_heads` hyperparameter has been removed from `TCNWithAttention` and
-`SSLModel`. All docstrings, inline comments, and RESEARCH REPORTING NOTE
-blocks have been updated to reflect the new architecture.
-
----
-
-## 2. What Changed and Where
-
-| Location | Old | New |
-|---|---|---|
-| Module docstring (line 8) | `TCN-Attention and SSL pipeline notebooks` | `TCN-TemporalAttention and SSL pipeline notebooks` |
-| New class (section 10) | -- | `TemporalAttention(nn.Module)` added |
-| Section numbering | `# 10. TCNWithAttention` | `# 11. TCNWithAttention` |
-| `TCNWithAttention` docstring | "multi-head self-attention" | "temporal attention pooling" |
-| `TCNWithAttention.__init__` param | `n_heads=4` present | `n_heads` removed |
-| `TCNWithAttention.__init__` body | `nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)` | `TemporalAttention(embed_dim=num_filters)` |
-| `TCNWithAttention.forward` | `attn(out, out, out)` + residual + LayerNorm + GAP | `attn(out)` + LayerNorm (no GAP) |
-| `SSLModel` docstring | "TCNWithAttention in embedding mode" | "TCNWithAttention (with temporal attention)" |
-| `SSLModel.__init__` param | `n_heads=4` present | `n_heads` removed |
-| `SSLModel.__init__` body | `TCNWithAttention(..., n_heads=n_heads, ...)` | `TCNWithAttention(..., return_embedding=True)` |
-| `FineTunedModel` docstring | "TCN-Attention encoder" | "TCN-TemporalAttention encoder" |
-| `FineTunedModel` inline comment | `# pre-trained TCN-Attention encoder` | `# pre-trained TCN-TemporalAttention encoder` |
-| All RESEARCH REPORTING NOTE blocks | References to self-attention, n_heads | Updated to temporal attention terminology |
+### Phase 2 (2026-04-04): Two-Layer Additive Attention + SSL Removal
+The single-layer `TemporalAttention` scorer inside `TCNWithAttention` was
+upgraded to a two-layer additive attention mechanism (tanh + linear) matching
+`MultiScaleTCNWithAttention` exactly. This adds two tunable hyperparameters:
+`attention_dim` and `attention_dropout`. SSL-related classes and functions
+(`SSLModel`, `FineTunedModel`, `EEGSegmentSSLDataset`, `make_ssl_loader`,
+`nt_xent_loss`, `run_ssl_pretraining`, `run_finetuning`) were removed from
+`tcn_utils.py` -- SSL will be developed in a separate study.
 
 ---
 
-## 3. Architecture Comparison
-
-### Previous: TCN + Multi-Head Self-Attention
+## 2. Current Architecture: TCN + Two-Layer Additive Attention
 
 ```
 Input (batch, 1, T)
@@ -56,121 +37,85 @@ TCN stack (L x CausalConvBlock)
 transpose
   |
   v  (batch, T, D)
-nn.MultiheadAttention(Q=x, K=x, V=x)   <-- O(T^2 * D * H)
-  |
-  v  attn_out (batch, T, D)
-residual (out + attn_out)
-LayerNorm
-  |
-  v  (batch, T, D)
-global average pool over T              <-- uniform pooling
-  |
-  v  (batch, D)
-Linear(D, 1)
-  |
-  v  logits (batch,)
-```
-
-### New: TCN + Temporal Attention
-
-```
-Input (batch, 1, T)
-  |
-  v
-TCN stack (L x CausalConvBlock)
-  |
-  v  (batch, D, T)
-transpose
-  |
-  v  (batch, T, D)
-TemporalAttention:
-  Linear(D, 1) -> squeeze -> softmax over T   <-- O(T * D)
-  weighted sum over T
+Two-layer additive attention:
+  e_t = tanh(W_a h_t + b_a)       W_a in R^(attention_dim x D)
+  score_t = v^T e_t               v in R^(attention_dim)
+  alpha_t = softmax({score_t})     sums to 1 over T
+  context = sum_t alpha_t * h_t    (batch, D)
   |
   v  context (batch, D)
-LayerNorm
+Dropout(attention_dropout)
   |
   v  (batch, D)
 Linear(D, 1)
   |
   v  logits (batch,)
 ```
+
+Complexity: O(T * D * attention_dim), still linear in T.
+
+---
+
+## 3. What Changed and Where (Phase 2)
+
+| Location | Before (Phase 1) | After (Phase 2) |
+|---|---|---|
+| `TCNWithAttention.__init__` params | `(num_layers, num_filters, kernel_size, dropout, return_embedding, fs)` | Added `attention_dim=64, attention_dropout=0.0` |
+| `TCNWithAttention.__init__` body | `self.attn = TemporalAttention(embed_dim=num_filters)` + `self.attn_norm = LayerNorm` | `self.attention_fc = Linear(num_filters, attention_dim)` + `self.attention_v = Linear(attention_dim, 1)` + `self.attention_drop = Dropout(attention_dropout)` |
+| `TCNWithAttention.forward()` | `context, _ = self.attn(out)` + LayerNorm | `tanh(attention_fc(feat_t))` -> `attention_v(e)` -> softmax -> weighted sum -> dropout |
+| `TCNWithAttention.get_attention_weights()` | Called `self.attn(out)` | Calls `attention_fc` + `attention_v` + softmax directly |
+| `tune_temporal_attention.py` search space | Only training HPs (lr, wd, bs, max_grad_norm) | Added `attention_dim` [32,64,128] and `attention_dropout` [0.0-0.4] |
+| `TCNTemporalAttention.py` `build_model()` | Only `backbone_hp` | Now passes `attn_hp["attention_dim"]` and `attn_hp["attention_dropout"]` |
+| `SSLModel` | Present | **Removed** (SSL in separate study) |
+| `FineTunedModel` | Present | **Removed** (SSL in separate study) |
+| `EEGSegmentSSLDataset` | Present | **Removed** |
+| `make_ssl_loader` | Present | **Removed** |
+| `nt_xent_loss` | Present | **Removed** |
+| `run_ssl_pretraining` | Present | **Removed** |
+| `run_finetuning` | Present | **Removed** |
+| `import torch.nn.functional as F` | Present (used by SSLModel) | **Removed** (no longer needed) |
 
 ---
 
 ## 4. Research Rationale
 
-### 4.1 Computational Complexity
+### 4.1 Why Two-Layer Attention (not single linear)
 
-Multi-head self-attention (MHA) has complexity O(T^2 * D * H) where T is the
-sequence length, D is the embedding dimension, and H is the number of heads.
-For a 5-second EEG segment at 500 Hz, T = 2,500. With D = 64 and H = 4, the
-self-attention operation processes a 10,000 x 10,000 similarity sub-space per
-sample per forward pass. Temporal attention reduces this to O(T * D) = O(2500
-* 64), a reduction proportional to T * H = 10,000x in the dominant term.
+The single linear scorer (`W^T h_t + b`) can only learn a fixed linear weighting
+of feature channels. It cannot learn that "high activation in channel 3 combined
+with low activation in channel 7 means this time step is important."
 
-### 4.2 Inductive Bias
+The two-layer scorer (`tanh(W_a h_t + b_a)` followed by `v^T e_t`) introduces a
+nonlinearity between the projection and the scoring, allowing the attention to
+learn nonlinear feature interactions when deciding which time steps matter.
 
-Self-attention is designed to model pairwise dependencies between every pair
-of positions in a sequence. This is appropriate for tasks where the
-relationship between distant positions is semantically meaningful (e.g., word
-co-reference in NLP, or multi-channel EEG where spatial dependencies across
-channels matter). For binary seizure detection on a single-channel 5-second
-window, the discriminative information is primarily a localised ictal
-discharge -- the model needs to identify **when** in the window the discharge
-occurs, not how pairs of time steps relate to each other. The pairwise
-interaction modelled by MHA is therefore largely unused and introduces
-unnecessary parameters and quadratic cost.
+### 4.2 Why Match MultiScaleTCNWithAttention
 
-Temporal attention encodes exactly the right prior: assign high weight to the
-time steps that carry seizure-relevant features, and low weight to background
-interictal activity.
+The M1-vs-M2 (single-branch TCN vs TCN+Attention) and M3-vs-M4 (multi-scale vs
+multi-scale+attention) ablations must test the same attention mechanism. If M2
+used a weaker attention than M4, any performance difference could be attributed
+to the attention formulation rather than the multi-scale structure. Matching them
+eliminates this confound.
 
-### 4.3 Interpretability
+### 4.3 Tunable Parameters
 
-The attention weights produced by `TemporalAttention` are a 1-D vector of
-length T with values in [0, 1] summing to 1. They can be directly plotted as
-a saliency overlay on the raw EEG trace with no post-processing. This is
-clinically useful: it allows a neurologist to verify that the model is
-attending to the ictal discharge rather than an artefact.
+`attention_dim` controls the capacity of the scoring function independently of
+`num_filters`. Larger values allow more complex feature interactions but risk
+overfitting on small datasets. `attention_dropout` regularises the context vector,
+preventing the model from over-relying on a few dominant time steps.
 
-MHA produces H attention matrices of shape (T, T), each in the D/H-dimensional
-head subspace. Extracting a meaningful temporal saliency from these matrices
-requires averaging or projection steps that reduce interpretability and
-introduce analytical ambiguity.
+### 4.4 Computational Complexity
 
-### 4.4 Hyperparameter Reduction
+O(T * D * attention_dim) is still linear in sequence length T. For T=2500,
+D=64, attention_dim=64: 10.2M multiply-adds per sample, versus 400M+ for
+multi-head self-attention with H=4 heads.
 
-MHA introduces `n_heads` as an additional hyperparameter requiring tuning.
-For the number of heads to make sense, D must be divisible by H, constraining
-the joint search space for (D, H). Temporal attention has no such constraint
-and removes one hyperparameter from the tuning budget entirely.
+### 4.5 Interpretability
 
-### 4.5 Relationship to Global Average Pooling
-
-Uniform global average pooling (GAP), used in the plain `TCN` class, is a
-special case of temporal attention where all weights are equal (1/T). Temporal
-attention is a strict generalisation: it can learn to replicate GAP (uniform
-distribution) or to focus on specific temporal regions. The replacement
-therefore constitutes a monotone improvement in representational capacity with
-no increase in model depth.
-
-### 4.6 Prior Work on EEG and Time-Series
-
-- **Bahdanau et al. (2015)**: introduced additive attention for sequence-to-
-  sequence models; the core mechanism adopted here.
-- **Acharya et al. (2018)**: demonstrated that additive temporal attention
-  improves single-channel EEG seizure classification by directing the model
-  to ictal onset regions.
-- **Yildirim et al. (2020)**: showed temporal attention outperforms both GAP
-  and MHA in short single-channel EEG classification tasks (5--10 s windows).
-- **Kostas et al. (2020)**: used transformer self-attention effectively on
-  **multi-channel** EEG; the benefit arises from cross-channel spatial
-  attention, which does not apply to the single-channel setting here.
-- **Bai et al. (2018)**: the TCN backbone already captures temporal context
-  within its receptive field via dilated causal convolutions; the attention
-  layer is responsible for pooling, not feature extraction, making pairwise
-  self-attention redundant given an adequate RF.
+The attention weights alpha_t are still a 1-D vector of length T with values in
+[0, 1] summing to 1. They can be extracted via `get_attention_weights()` (present
+on both `TCNWithAttention` and `MultiScaleTCNWithAttention`) and plotted as a
+temporal saliency overlay on raw EEG.
 
 ---
 
@@ -179,33 +124,36 @@ no increase in model depth.
 | Component | Impact |
 |---|---|
 | `TCN` (plain, no attention) | No change |
-| `TCNWithAttention` | Architecture changed; existing checkpoints incompatible (n_heads removed, attention weights different shape) |
-| `SSLModel` | `n_heads` parameter removed from constructor; existing checkpoints incompatible |
-| `FineTunedModel` | No architectural change; docstring/comment updates only |
-| Training loops (`run_training`, `run_ssl_pretraining`, `run_finetuning`) | No change required |
-| Hyperparameter tuning notebooks | Remove `n_heads` from Optuna search space |
-| Checkpoint loading | Saved models trained with the old MHA architecture cannot be loaded into the new class; retrain from scratch |
+| `TCNWithAttention` | `__init__` signature changed (new `attention_dim`, `attention_dropout` params); old checkpoints incompatible |
+| `TemporalAttention` class | Still present in tcn_utils.py but no longer used by TCNWithAttention; kept for reference |
+| `tune_temporal_attention.py` | Search space expanded to include `attention_dim` and `attention_dropout`; `max_grad_norm` removed from tuning |
+| `TCNTemporalAttention.py` | `build_model()` now passes attention params from `best_attention_params.json` |
+| `MultiScaleTCN` | No change |
+| `MultiScaleTCNWithAttention` | No change (already had this attention formulation) |
+| `TCN.py` | No change |
+| `MultiScaleTCN.py` | No change |
+| SSL classes/functions | **Removed from tcn_utils.py** (SSLModel, FineTunedModel, EEGSegmentSSLDataset, make_ssl_loader, nt_xent_loss, run_ssl_pretraining, run_finetuning) |
+| `best_attention_params.json` | Will now contain `attention_dim` and `attention_dropout` under `"hyperparameters"` |
+| Checkpoint loading | All M2 checkpoints must be retrained from scratch |
 
 ---
 
 ## 6. Methods Section Text (for paper)
 
-> Following the TCN stack, a temporal attention module was appended to produce
-> a fixed-length segment embedding. A single linear projection mapped each
-> time-step feature vector (dimension D = num_filters) to a scalar logit;
-> softmax normalisation over the temporal axis T produced a probability
-> distribution alpha over time steps. The attended context vector c was
-> computed as the convex combination of feature vectors weighted by alpha:
->
->   c = sum_t alpha_t * h_t,  alpha = softmax(W_s * H + b_s)
->
-> where H in R^{T x D} is the TCN output and W_s in R^{1 x D}, b_s in R are
-> the learnable score parameters. This replaced both the multi-head
-> self-attention layer and global average pooling present in the prior
-> architecture. The resulting attention weights alpha form an interpretable
-> temporal saliency map over the segment window. Complexity is O(T * D) versus
-> O(T^2 * D * H) for multi-head self-attention, a critical property for
-> segments of length T = 2,500 at 500 Hz.
+> Following the TCN stack, a two-layer additive temporal attention mechanism
+> was appended to produce a fixed-length segment representation. For each
+> time-step feature vector h_t in R^F (where F = num_filters), energy scores
+> were computed as e_t = tanh(W_a h_t + b_a), where W_a in R^(D_a x F) is a
+> learned projection matrix and D_a is the attention dimension. Scalar scores
+> v^T e_t were normalised with softmax over the temporal axis to produce
+> attention weights alpha_t = softmax({v^T e_t}). The context vector
+> c = sum_t alpha_t h_t was regularised with dropout (rate p_a) before the
+> linear classification head. This formulation was used consistently across
+> both TCNWithAttention (M2) and MultiScaleTCNWithAttention (M4) to ensure
+> the M1-vs-M2 and M3-vs-M4 ablations test identical attention mechanisms.
+> Attention hyperparameters (D_a, p_a) were tuned via Optuna TPE with the
+> TCN backbone frozen, then all parameters were trained jointly for 100
+> epochs in the final training run.
 
 ---
 
@@ -218,11 +166,6 @@ no increase in model depth.
 - Acharya, U. R., et al. (2018). Deep convolutional neural network for the
   automated detection and diagnosis of seizure using EEG signals. Computers
   in Biology and Medicine.
-- Kostas, D., Aroca-Ouellette, S., & Bhatt, P. (2020). BENDR: Using
-  Transformers and a Contrastive Self-supervised Objective to Learn from
-  Physiological Signals. Frontiers in Human Neuroscience.
 - Yildirim, O., et al. (2020). A new approach for arrhythmia classification
   using deep coded features and LSTM networks. Computer Methods and Programs
   in Biomedicine.
-- Chen, T., Kornblith, S., Norouzi, M., Hinton, G. (2020). A Simple Framework
-  for Contrastive Learning of Visual Representations. ICML 2020.

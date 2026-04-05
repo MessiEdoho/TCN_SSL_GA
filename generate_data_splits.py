@@ -52,9 +52,9 @@ from pathlib import Path
 # Constants
 # ---------------------------------------------------------------------------
 TRAIN_DIR   = Path("TRAIN_DATA")        # training partition root
-VAL_DIR     = Path("VALIDATION_DATA")   # validation partition root
-TEST_DIR    = Path("TEST_DATA")         # test partition root (--include-test only)
-OUTPUT_DIR  = Path("data_splits_outputs")           # all pipeline outputs live here
+VAL_DIR     = Path("/scratch/22206468/VAL_DATA")   # validation partition root
+TEST_DIR    = Path("/scratch/22206468/TEST_DATA")         # test partition root (--include-test only)
+OUTPUT_DIR  = Path("/scratch/22206468/INPUT_DATA/data_splits_outputs")           # all pipeline outputs live here
 OUTPUT_FILE = OUTPUT_DIR / "data_splits.json"
 LOG_FILE    = OUTPUT_DIR / "splits_generation.log"
 

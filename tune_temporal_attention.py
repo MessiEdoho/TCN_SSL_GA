@@ -25,10 +25,11 @@ configurable architectural attention hyperparameters
 (no attention_dim, no num_heads, no attention_dropout).
 
 The Optuna search space therefore consists of:
+  - attention_dim   : projection dimension of scoring function
+  - attention_dropout : dropout on context vector
   - learning_rate   : AdamW lr for attention params
   - weight_decay    : L2 regularisation coefficient
   - batch_size      : segments per gradient step
-  - max_grad_norm   : gradient clipping threshold
 
 Pipeline position
 -----------------
@@ -110,16 +111,19 @@ LOG_FILE        = LOG_DIR    / "tune_temporal_attention.log"
 FIG_F1          = FIGURE_DIR / "attention_f1_history.png"
 FIG_IMP         = FIGURE_DIR / "attention_importance.png"
 
-# Temporal attention training search ranges
-# TemporalAttention has no architectural hyperparameters (embed_dim = num_filters, fixed).
-# Tunable parameters are optimiser and training settings for the attention + head weights.
+# Temporal attention search ranges
+# TCNWithAttention now uses a two-layer additive attention (tanh + linear)
+# with attention_dim and attention_dropout as tunable architectural params,
+# matching MultiScaleTCNWithAttention for consistent ablation design.
+ATTN_DIM_CHOICES  = [32, 64, 128]                      # attention projection dimension
+ATTN_DROP_MIN     = 0.0                                # attention dropout lower bound
+ATTN_DROP_MAX     = 0.4                                # attention dropout upper bound
+ATTN_DROP_STEP    = 0.05                               # attention dropout step size
 LR_MIN            = 1e-4                               # AdamW learning rate lower bound
 LR_MAX            = 1e-2                               # AdamW learning rate upper bound
 WD_MIN            = 1e-5                               # weight decay lower bound
 WD_MAX            = 1e-3                               # weight decay upper bound
 BATCH_CHOICES     = [16, 32, 64]                       # batch size candidates (powers of 2)
-GRAD_NORM_MIN     = 0.5                                # max gradient norm lower bound
-GRAD_NORM_MAX     = 5.0                                # max gradient norm upper bound
 
 # TCN backbone attribute prefix in TCNWithAttention (confirmed from tcn_utils.py)
 # TCNWithAttention stores its backbone as self.tcn = nn.Sequential(...)
@@ -285,21 +289,20 @@ def optuna_objective(trial, train_pairs, val_pairs, tcn_hp, device, logger):
 
     The TCN backbone is instantiated with fixed parameters from tcn_hp
     and its weights are frozen immediately after the model is moved to
-    device. Only the temporal attention parameters (TemporalAttention
-    scorer, LayerNorm, classification head) receive gradient updates.
+    device. Only the temporal attention parameters (attention_fc,
+    attention_v, attention_drop, classifier head) receive gradient updates.
 
-    Sampled hyperparameters (training settings for attention params):
-        learning_rate   : float [1e-4, 1e-2] log scale
-        weight_decay    : float [1e-5, 1e-3] log scale
-        batch_size      : categorical [16, 32, 64]
-        max_grad_norm   : float [0.5, 5.0]
+    Sampled hyperparameters:
+      Architecture (attention-specific):
+        attention_dim     : categorical [32, 64, 128]
+        attention_dropout : float [0.0, 0.4] step 0.05
+      Training (for attention + head params only):
+        learning_rate     : float [1e-4, 1e-2] log scale
+        weight_decay      : float [1e-5, 1e-3] log scale
+        batch_size        : categorical [16, 32, 64]
 
     Fixed parameters (TCN backbone -- not sampled):
         num_layers, num_filters, kernel_size, dropout
-
-    Note: TemporalAttention has no architectural hyperparameters to
-    tune (no attention_dim, no num_heads, no attention_dropout). Its
-    structure is fully determined by embed_dim = num_filters.
 
     Parameters
     ----------
@@ -314,27 +317,33 @@ def optuna_objective(trial, train_pairs, val_pairs, tcn_hp, device, logger):
     -------
     float -- best validation macro F1 achieved in this trial
     """
-    # -- a. Sample training hyperparameters for attention params ---------------
+    # -- a. Sample attention architecture + training hyperparameters -----------
+    attention_dim = trial.suggest_categorical(
+        "attention_dim", ATTN_DIM_CHOICES)              # projection dimension in scoring function
+    attention_dropout = trial.suggest_float(
+        "attention_dropout",
+        ATTN_DROP_MIN, ATTN_DROP_MAX,
+        step=ATTN_DROP_STEP)                            # dropout on context vector
     learning_rate = trial.suggest_float(
         "learning_rate", LR_MIN, LR_MAX, log=True)     # log scale spans orders of magnitude
     weight_decay = trial.suggest_float(
         "weight_decay", WD_MIN, WD_MAX, log=True)      # L2 regularisation on attention params
     batch_size = trial.suggest_categorical(
         "batch_size", BATCH_CHOICES)                    # powers of 2 for GPU efficiency
-    max_grad_norm = trial.suggest_float(
-        "max_grad_norm", GRAD_NORM_MIN, GRAD_NORM_MAX)  # gradient clipping threshold
 
     # -- b. Set seed for reproducible weight initialisation --------------------
     set_seed(SEED)
 
-    # -- c. Instantiate model with fixed TCN backbone params -------------------
+    # -- c. Instantiate model with fixed backbone + sampled attention params ---
     # TCNWithAttention.__init__(num_layers, num_filters, kernel_size, dropout,
-    #                           return_embedding=False, fs=500)
+    #   attention_dim=64, attention_dropout=0.0, return_embedding=False, fs=500)
     model = TCNWithAttention(
         num_layers=int(tcn_hp["num_layers"]),
         num_filters=int(tcn_hp["num_filters"]),
         kernel_size=int(tcn_hp["kernel_size"]),
         dropout=float(tcn_hp["dropout"]),
+        attention_dim=attention_dim,                     # sampled attention architecture param
+        attention_dropout=attention_dropout,             # sampled attention architecture param
         return_embedding=False,                         # classification mode (returns logits)
         fs=FS,
     )
@@ -391,8 +400,7 @@ def optuna_objective(trial, train_pairs, val_pairs, tcn_hp, device, logger):
     for epoch in range(1, MAX_EPOCHS + 1):
 
         train_loss = train_one_epoch(
-            model, train_loader, optimiser, criterion,
-            device, max_grad_norm=max_grad_norm)
+            model, train_loader, optimiser, criterion, device)
 
         # evaluate() returns (macro_f1, y_true, y_pred)
         val_f1, _, _ = evaluate(model, val_loader, device)
@@ -418,9 +426,10 @@ def optuna_objective(trial, train_pairs, val_pairs, tcn_hp, device, logger):
 
     # -- i. One-line trial summary ---------------------------------------------
     logger.info(
-        "Trial %3d | val_F1=%.4f | lr=%.2e | wd=%.2e | bs=%d | grad_norm=%.2f",
-        trial.number, best_val_f1, learning_rate,
-        weight_decay, batch_size, max_grad_norm)
+        "Trial %3d | val_F1=%.4f | attn_dim=%d | attn_drop=%.2f | "
+        "lr=%.2e | wd=%.2e | bs=%d",
+        trial.number, best_val_f1, attention_dim, attention_dropout,
+        learning_rate, weight_decay, batch_size)
 
     # -- j. Return best validation F1 ------------------------------------------
     return best_val_f1
@@ -556,18 +565,19 @@ def save_study_results(study, tcn_hp, tcn_config, device, logger):
         "segment_len_samples": SEGMENT_LEN,
         "segment_len_seconds": SEGMENT_SEC,
         "search_ranges": {
+            "attention_dim":     ATTN_DIM_CHOICES,
+            "attention_dropout":
+                "%s to %s step %s" % (ATTN_DROP_MIN, ATTN_DROP_MAX, ATTN_DROP_STEP),
             "learning_rate":
                 "%s to %s (log scale)" % (LR_MIN, LR_MAX),
             "weight_decay":
                 "%s to %s (log scale)" % (WD_MIN, WD_MAX),
             "batch_size":       BATCH_CHOICES,
-            "max_grad_norm":
-                "%s to %s" % (GRAD_NORM_MIN, GRAD_NORM_MAX),
         },
         "architecture_note": (
-            "TemporalAttention has no architectural hyperparameters. "
-            "embed_dim = num_filters (fixed from TCN backbone). "
-            "Search space covers training settings only."),
+            "TCNWithAttention uses two-layer additive attention "
+            "(tanh + linear scorer) with tunable attention_dim and "
+            "attention_dropout, matching MultiScaleTCNWithAttention."),
         "fixed_tcn_params": tcn_hp,
     }
 
@@ -797,10 +807,11 @@ if __name__ == "__main__":
 # Parameters to report in Methods table
 # --------------------------------------
 # All parameters from best_attention_params.json under "hyperparameters":
+#   attention_dim     : projection dimension of scoring function
+#   attention_dropout : dropout on context vector
 #   learning_rate     : AdamW lr (attention + head params only)
 #   weight_decay      : L2 coefficient
 #   batch_size        : segments per gradient step
-#   max_grad_norm     : gradient clipping threshold
 #
 # Also report:
 #   N_TRIALS    = 40  (Optuna trials)
@@ -811,12 +822,10 @@ if __name__ == "__main__":
 #   Backbone status: frozen during attention tuning
 #
 # Note on search space:
-#   TemporalAttention has NO architectural hyperparameters to tune.
-#   embed_dim is fixed to num_filters from the TCN backbone. The
-#   search space covers only training settings (lr, weight_decay,
-#   batch_size, max_grad_norm). This is reported as: "The temporal
-#   attention architecture is parameter-free given the TCN channel
-#   width; only optimiser settings were tuned via Optuna."
+#   TCNWithAttention uses two-layer additive attention (tanh + linear)
+#   with attention_dim and attention_dropout as tunable architectural
+#   parameters. This matches MultiScaleTCNWithAttention, ensuring
+#   consistent ablation comparison between M1/M2 and M3/M4.
 #
 # Freezing rationale (Methods)
 # ----------------------------
