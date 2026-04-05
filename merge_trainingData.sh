@@ -1,5 +1,5 @@
 #!/bin/bash -l
-#SBATCH --job-name=batch_execution_preprocessing_test
+#SBATCH --job-name=batch_merging_TrainingData
 # speficity number of nodes 
 #SBATCH -N 1
 
