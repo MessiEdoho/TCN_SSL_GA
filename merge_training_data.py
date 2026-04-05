@@ -45,11 +45,11 @@ def _configure_logger():
 # ---------------------------------------------------------------------------
 
 SOURCE_ROOTS = [
-    '/home/people/22206468/scratch/TRAIN_DATA',
-    '/home/people/22206468/scratch/TRAIN_DATA_2',
-    '/home/people/22206468/scratch/TRAIN_DATA_3',
-    '/home/people/22206468/scratch/TRAIN_DATA_4',
-    '/home/people/22206468/scratch/TRAIN_DATA_5',
+    '/scratch/22206468/TRAIN_DATA',
+    '/scratch/22206468/TRAIN_DATA_2',
+    '/scratch/22206468/TRAIN_DATA_3',
+    '/scratch/22206468/TRAIN_DATA_4',
+    '/scratch/22206468/TRAIN_DATA_5',
 ]
 
 DEST_ROOT = Path('/scratch/22206468/TRAIN_DATA_MERGED')
