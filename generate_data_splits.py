@@ -1,23 +1,48 @@
 """
 generate_data_splits.py
 =======================
-Builds outputs/data_splits.json -- the single source of
-truth for all pipeline notebooks (tuning, training,
-and evaluation).
+Builds data_splits.json -- the single source of truth
+for all pipeline scripts (tuning, training, evaluation).
 
 Run this script ONCE before any tuning or training.
 Re-run it (with --include-test) when test data is ready.
 
-Expected folder structure:
-    TRAIN_DATA/
-        seizure/         .npy files -- ictal segments
-        non_seizure/     .npy files -- non-ictal segments
-    VALIDATION_DATA/
+Expected folder structure
+-------------------------
+Training data is distributed across five roots from
+parallel preprocessing. Each root has the same layout:
+
+    /scratch/22206468/TRAIN_DATA/
+        seizure/             .npy ictal segments
+        non_seizure/         .npy non-ictal segments
+    /scratch/22206468/TRAIN_DATA_2/
         seizure/
         non_seizure/
-    TEST_DATA/           (only used with --include-test)
+    /scratch/22206468/TRAIN_DATA_3/
         seizure/
         non_seizure/
+    /scratch/22206468/TRAIN_DATA_4/
+        seizure/
+        non_seizure/
+    /scratch/22206468/TRAIN_DATA_5/
+        seizure/
+        non_seizure/
+
+    /scratch/22206468/VAL_DATA/
+        seizure/
+        non_seizure/
+
+    /scratch/22206468/TEST_DATA/     (only with --include-test)
+        seizure/
+        non_seizure/
+
+All five training roots are scanned and concatenated
+into one train partition. No file copying is needed --
+data_splits.json stores absolute paths to originals.
+
+Filename convention: {mouse_id}_{ictal|nonictal}_{index:05d}.npy
+  e.g. m1_ictal_00001.npy, m1_nonictal_00003.npy
+Mouse ID is extracted by splitting on the first underscore.
 
 Usage
 -----
@@ -34,8 +59,8 @@ test files from contaminating the split.
 
 Outputs
 -------
-outputs/data_splits.json       -- partition records
-outputs/splits_generation.log  -- run log
+/scratch/22206468/INPUT_DATA/data_splits_outputs/data_splits.json
+/scratch/22206468/INPUT_DATA/data_splits_outputs/splits_generation.log
 """
 
 # ---------------------------------------------------------------------------
@@ -615,15 +640,19 @@ if __name__ == "__main__":
 
 
 # =====================================================
-# HOW TO LOAD data_splits.json IN PIPELINE NOTEBOOKS
+# HOW TO LOAD data_splits.json IN PIPELINE SCRIPTS
 # =====================================================
 #
-# Standard loading pattern used by ALL notebooks:
+# Standard loading pattern used by ALL scripts and
+# tcn_HPT_binary.ipynb:
 #
 #   import json
 #   from pathlib import Path
 #
-#   with open("outputs/data_splits.json") as f:
+#   SPLITS_PATH = Path("/scratch/22206468/INPUT_DATA/"
+#                      "data_splits_outputs/data_splits.json")
+#
+#   with open(SPLITS_PATH, "r", encoding="utf-8") as f:
 #       splits = json.load(f)
 #
 #   # Convert to (filepath, label) tuples for
@@ -633,14 +662,9 @@ if __name__ == "__main__":
 #   val_pairs   = [(d["filepath"], d["label"])
 #                  for d in splits["val"]]
 #
-# Test pairs -- load ONLY in final_evaluation.ipynb:
+# Test pairs -- load ONLY in final_evaluation.py:
 #
 #   if splits["metadata"]["test_status"] != "complete":
-#       logger.error(
-#           "Test data not ready. Re-run "
-#           "generate_data_splits.py with "
-#           "--include-test before running "
-#           "final_evaluation.ipynb.")
 #       raise RuntimeError("Test split not available.")
 #
 #   test_pairs = [(d["filepath"], d["label"])
