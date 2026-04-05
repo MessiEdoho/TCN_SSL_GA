@@ -239,6 +239,7 @@ def make_loader(file_label_pairs, batch_size, train, device):
         # sampler works for arbitrarily large EEG datasets. For datasets below
         # the cap, min() returns len(labels) and behaviour is unchanged.
         MAX_SAMPLES = 2**24 - 1                            # 16,777,215 -- PyTorch multinomial ceiling
+        print(f"[DEBUG] len(labels)={len(labels)}, MAX_SAMPLES={MAX_SAMPLES}, num_samples={min(len(labels), MAX_SAMPLES)}", flush=True)
         sampler = WeightedRandomSampler(
             weights=sample_weights,                        # sampling probability per segment
             num_samples=min(len(labels), MAX_SAMPLES),     # draw up to MAX_SAMPLES per epoch
