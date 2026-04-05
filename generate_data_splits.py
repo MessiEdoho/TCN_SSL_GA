@@ -51,9 +51,18 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-TRAIN_DIR   = Path("TRAIN_DATA")        # training partition root
+# Training data is distributed across five roots from parallel preprocessing.
+# generate_data_splits.py scans all five and concatenates the records.
+# No file copying is needed -- data_splits.json stores absolute paths.
+TRAIN_DIRS  = [
+    Path("/scratch/22206468/TRAIN_DATA"),
+    Path("/scratch/22206468/TRAIN_DATA_2"),
+    Path("/scratch/22206468/TRAIN_DATA_3"),
+    Path("/scratch/22206468/TRAIN_DATA_4"),
+    Path("/scratch/22206468/TRAIN_DATA_5"),
+]
 VAL_DIR     = Path("/scratch/22206468/VAL_DATA")   # validation partition root
-TEST_DIR    = Path("/scratch/22206468/TEST_DATA")         # test partition root (--include-test only)
+TEST_DIR    = Path("/scratch/22206468/TEST_DATA")  # test partition root (--include-test only)
 OUTPUT_DIR  = Path("/scratch/22206468/INPUT_DATA/data_splits_outputs")           # all pipeline outputs live here
 OUTPUT_FILE = OUTPUT_DIR / "data_splits.json"
 LOG_FILE    = OUTPUT_DIR / "splits_generation.log"
@@ -250,9 +259,13 @@ def build_pairs(root_dir, logger):
 
     Mouse ID parsing
     ----------------
-    Mouse ID is extracted using stem.rsplit('_', 1)[0].
-    Assumes filenames follow: <mouseID>_<segment_index>.npy
-    Example: 'mouse03_0045.npy' -> mouse_id = 'mouse03'
+    Mouse ID is extracted using stem.split('_', 1)[0].
+    Splits on the FIRST underscore from the left.
+    Assumes filenames follow: <mouseID>_<ictal|nonictal>_<index>.npy
+    Examples:
+        'm1_ictal_00001.npy'    -> mouse_id = 'm1'
+        'm1_nonictal_00001.npy' -> mouse_id = 'm1'
+        'm330_ictal_00042.npy'  -> mouse_id = 'm330'
 
     If no underscore is present in the stem, the full stem
     is used as mouse_id and a WARNING is logged. This allows
@@ -280,10 +293,10 @@ def build_pairs(root_dir, logger):
             stem = fp.stem
 
             if "_" in stem:
-                # rsplit from right so compound mouse IDs like
-                # 'm330_ictal' split correctly: mouse_id='m330_ictal'
-                # only the last _<index> part is dropped
-                mouse_id = stem.rsplit("_", 1)[0]
+                # Split on the FIRST underscore from the left.
+                # 'm1_ictal_00001' -> ['m1', 'ictal_00001'] -> mouse_id = 'm1'
+                # 'm1_nonictal_00001' -> ['m1', 'nonictal_00001'] -> mouse_id = 'm1'
+                mouse_id = stem.split("_", 1)[0]
             else:
                 mouse_id = stem
                 logger.warning(
@@ -379,7 +392,7 @@ def run_leakage_check(train_records, val_records, test_records, logger):
 
     Parameters
     ----------
-    train_records : list -- records from build_pairs(TRAIN_DIR)
+    train_records : list -- records from build_pairs() across all TRAIN_DIRS
     val_records   : list -- records from build_pairs(VAL_DIR)
     test_records  : list -- records from build_pairs(TEST_DIR),
                            pass [] if test not included
@@ -468,10 +481,14 @@ def main():
             "Re-run with --include-test when ready.")
 
     # -- Step 2: validate required partitions ----------------------------------
-    train_ok = validate_folder(TRAIN_DIR, "TRAIN_DATA", logger)
-    val_ok = validate_folder(VAL_DIR, "VALIDATION_DATA", logger)
+    # Validate all five training roots and the single validation root.
+    all_train_ok = True
+    for td in TRAIN_DIRS:
+        if not validate_folder(td, td.name, logger):
+            all_train_ok = False
+    val_ok = validate_folder(VAL_DIR, "VAL_DATA", logger)
 
-    if not train_ok or not val_ok:
+    if not all_train_ok or not val_ok:
         logger.error(
             "One or more required partitions failed "
             "validation. Fix the folder structure and "
@@ -489,8 +506,13 @@ def main():
             sys.exit(1)
 
     # -- Step 4: build records -------------------------------------------------
+    # Scan all five training roots and concatenate into one train partition.
+    # Each root has the same seizure/ and non_seizure/ structure.
     logger.info("Building segment records...")
-    train_records = build_pairs(TRAIN_DIR, logger)
+    train_records = []
+    for td in TRAIN_DIRS:
+        train_records.extend(build_pairs(td, logger))
+    logger.info("  Total train records across %d roots: %d", len(TRAIN_DIRS), len(train_records))
     val_records = build_pairs(VAL_DIR, logger)
 
     if include_test:
@@ -538,7 +560,7 @@ def main():
                 "0": "non_seizure (non-ictal)"
             },
             "folder_paths": {
-                "train": str(TRAIN_DIR.resolve()),
+                "train": [str(td.resolve()) for td in TRAIN_DIRS],
                 "val":   str(VAL_DIR.resolve()),
                 "test":  (str(TEST_DIR.resolve())
                           if include_test else "not included")
