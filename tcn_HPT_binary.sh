@@ -6,12 +6,12 @@
 #SBATCH --ntasks-per-node 10
 
 #SBATCH --partition=csgpu
-# Request 2 gpus
+# Request 1 gpus
 #SBATCH --gres=gpu:1
 
 # 60 Optuna trials x up to 100 epochs each (early stopping typically fires ~30-50).
 # 3-day walltime is generous but safe for large non_seizure partitions.
-#SBATCH -t 10-00:00:00
+#SBATCH -t 13-00:00:00
 
 # Email notifications at start, end, and failure
 #SBATCH --mail-type=ALL
