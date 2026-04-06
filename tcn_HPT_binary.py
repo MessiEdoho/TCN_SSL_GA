@@ -80,7 +80,7 @@ STUDY_NAME    = "tcn_HPT_binary_optuna"  # Optuna study name
 
 # -- Output --------------------------------------------------------------------
 OUTPUT_DIR    = Path("/home/people/22206468/scratch/OUTPUT/MODEL1_OUTPUT/TCNtuning_outputs")       # directory for all saved outputs
-OUTPUT_DIR.mkdir(exist_ok=True)       # create if it does not exist
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)  # create full path if absent
 
 # -- Logging setup -------------------------------------------------------------
 log = logging.getLogger("tcn_hpt")    # named logger for this notebook
@@ -127,8 +127,7 @@ if not val_pairs:
 train_pairs = filter_unpaired_subjects(train_pairs, logger=log)
 # Step 2: downsample non-ictal to 1:4 ratio, stratified by recording.
 train_pairs = downsample_non_ictal(train_pairs, ratio=4, seed=42)
-# Step 3: pos_weight = 1.0 (downsampling is the sole imbalance correction).
-POS_WEIGHT_VAL = 1.0
+# pos_weight = 1.0 is set inside run_training() (downsampling is sole correction).
 log.info(f"Post-downsampling corpus: {len(train_pairs)} segments")
 # -- End corpus preparation ----------------------------------------------------
 
@@ -142,7 +141,7 @@ log.info(f"Train: {n_train_ictal} ictal + {n_train_non_ictal} non-ictal "
          f"= {len(train_pairs)} total ({100*n_train_ictal/max(len(train_pairs),1):.1f}% ictal)")
 log.info(f"Val:   {n_val_ictal} ictal + {n_val_non_ictal} non-ictal "
          f"= {len(val_pairs)} total ({100*n_val_ictal/max(len(val_pairs),1):.1f}% ictal)")
-log.info(f"pos_weight = {POS_WEIGHT_VAL:.4f}")
+log.info("pos_weight = 1.0 (set inside run_training)")
 # -- Section 8: Optuna Objective Function --------------------------------------
 
 def optuna_objective(trial):
@@ -185,7 +184,7 @@ def optuna_objective(trial):
     train_loader = make_loader(train_pairs, batch_size, train=True, device=DEVICE)
     val_loader = make_loader(val_pairs, batch_size, train=False, device=DEVICE)
 
-    # -- Train and evaluate (pass train_pairs for pos_weight, trial for Optuna) -
+    # -- Train and evaluate (pos_weight=1.0 set inside run_training) -------------
     best_val_f1 = run_training(
         model, train_loader, val_loader,
         lr=lr, weight_decay=wd,
@@ -337,10 +336,7 @@ try:
 except Exception as e:
     log.warning(f"Could not create parallel coordinate plot: {e}")
 # -- Section 11a: Save best hyperparameters ------------------------------------
-
-bp = study.best_trial.params
-# RF = 2*(2^L - 1)*(k - 1) + 1: two convolutions per block (Bai et al., 2018)
-best_rf = 2 * (2 ** bp["num_layers"] - 1) * (bp["kernel_size"] - 1) + 1
+# bp and best_rf already computed above after study.optimize()
 
 best_params = {
     "best_trial_number": study.best_trial.number,
@@ -424,4 +420,4 @@ log.info(f"  2. {csv_path.resolve()}")
 log.info(f"  3. {summary_path.resolve()}")
 log.info("Tuning notebook complete.")
 # -- End of notebook -----------------------------------------------------------
-log.info("Notebook execution finished.")
+log.info("TCN hyperparameter tuning execution finished.")
