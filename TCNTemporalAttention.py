@@ -1252,10 +1252,12 @@ def main():
         history["val_f1"].append(val_f1)
         history["lr"].append(current_lr)
 
-        logger.info(
-            "Epoch %3d/%d | loss=%.4f | val_f1=%.4f | lr=%.2e | best=%.4f | patience=%d/%d",
-            epoch, MAX_EPOCHS, train_loss, val_f1, current_lr,
-            best_val_f1, epochs_no_imp, ES_PATIENCE)
+        # Lightweight logging: first, every 10th, early-stop, and new-best epochs
+        if epoch == start_epoch or epoch % 10 == 0 or epochs_no_imp >= ES_PATIENCE or val_f1 > best_val_f1:
+            logger.info(
+                "Epoch %3d/%d | loss=%.4f | val_f1=%.4f | lr=%.2e | best=%.4f | patience=%d/%d",
+                epoch, MAX_EPOCHS, train_loss, val_f1, current_lr,
+                best_val_f1, epochs_no_imp, ES_PATIENCE)
 
         if val_f1 > best_val_f1:                        # new best model found
             best_val_f1 = val_f1                       # update best F1 tracker
