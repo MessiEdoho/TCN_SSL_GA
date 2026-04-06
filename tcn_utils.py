@@ -1091,16 +1091,20 @@ def evaluate(model, loader, device):
 # 17. run_training
 # ---------------------------------------------------------------------------
 def run_training(model, train_loader, val_loader, lr, weight_decay,
-                 max_epochs, patience, device, train_pairs=None,
+                 max_epochs, patience, device,
                  max_grad_norm=1.0, trial=None):
     """Full training loop with early stopping, cosine annealing, and optional Optuna pruning.
+
+    pos_weight is fixed at 1.0 because class imbalance is handled by
+    offline stratified downsampling (filter_unpaired_subjects +
+    downsample_non_ictal) before DataLoader construction.
 
     Parameters
     ----------
     model : nn.Module
         Model to train (must already be on device).
     train_loader : DataLoader
-        Training data loader.
+        Training data loader (downsampled corpus).
     val_loader : DataLoader
         Validation data loader.
     lr : float
@@ -1113,9 +1117,6 @@ def run_training(model, train_loader, val_loader, lr, weight_decay,
         Early stopping patience (epochs without val F1 improvement).
     device : torch.device
         Target device.
-    train_pairs : list of (str or Path, int), optional
-        Training file-label pairs for computing pos_weight. If None,
-        pos_weight defaults to 1.0 (no class weighting).
     max_grad_norm : float, default 1.0
         Gradient clipping threshold.
     trial : optuna.trial.Trial or None, default None
@@ -1129,13 +1130,11 @@ def run_training(model, train_loader, val_loader, lr, weight_decay,
     Example
     -------
     >>> f1 = run_training(model, train_ld, val_ld, 1e-3, 1e-4, 100, 10, device,
-    ...                   train_pairs=pairs, trial=trial)
+    ...                   trial=trial)
     """
-    # Compute pos_weight from training data if provided
-    if train_pairs is not None:
-        pw = compute_pos_weight(train_pairs, device)  # move to device for loss
-    else:
-        pw = torch.tensor([1.0], dtype=torch.float32).to(device)  # default: no weighting
+    # pos_weight = 1.0: the 1:4 offline downsampling is the sole imbalance
+    # correction. No additional upweighting is applied.
+    pw = torch.tensor([1.0], dtype=torch.float32).to(device)
 
     criterion = nn.BCEWithLogitsLoss(pos_weight=pw)
 

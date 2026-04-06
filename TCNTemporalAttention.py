@@ -1205,23 +1205,42 @@ def main():
         model, pos_weight, attn_hp, DEVICE, logger)
 
     # -- Step 7: Initialise training state -------------------------------------
-    history = {"epoch": [], "train_loss": [], "val_f1": [], "lr": []}  # per-epoch tracking
-    best_val_f1 = 0.0                                  # best validation F1 seen so far
-    epochs_no_imp = 0                                  # counter for early stopping patience
-    best_state = None                                  # will hold best model weights on CPU
-    best_epoch = 0                                     # epoch number of best weights
-    training_start = datetime.datetime.now()           # wall-clock start for duration logging
+    history = {"epoch": [], "train_loss": [], "val_f1": [], "lr": []}
+    best_val_f1 = 0.0
+    epochs_no_imp = 0
+    best_state = None
+    best_epoch = 0
+    start_epoch = 1
+    training_start = datetime.datetime.now()
+
+    # -- Resume from checkpoint if available -----------------------------------
+    resume_ckpt = CKPT_DIR / "tcn_attention_best.pt"
+    if resume_ckpt.exists():
+        ckpt = torch.load(resume_ckpt, map_location=DEVICE)
+        model.load_state_dict(ckpt["model_state"])
+        optimiser.load_state_dict(ckpt["optimiser_state"])
+        scheduler.load_state_dict(ckpt["scheduler_state"])
+        best_val_f1 = ckpt.get("val_f1", 0.0)
+        best_epoch = ckpt.get("epoch", 0)
+        start_epoch = best_epoch + 1
+        epochs_no_imp = 0
+        best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+        logger.info("RESUMED from checkpoint: epoch %d, val_f1=%.4f",
+                    best_epoch, best_val_f1)
+    else:
+        logger.info("No checkpoint found. Starting from epoch 1.")
 
     # -- Step 8: Training loop -------------------------------------------------
     logger.info("=" * 65)
     logger.info("TRAINING STARTED")
-    logger.info("  Epochs      : %d", MAX_EPOCHS)
+    logger.info("  Start epoch : %d", start_epoch)
+    logger.info("  Max epochs  : %d", MAX_EPOCHS)
     logger.info("  ES patience : %d", ES_PATIENCE)
     logger.info("  Ckpt freq   : every %d", CHECKPOINT_FREQ)
     logger.info("=" * 65)
 
-    final_epoch = 0                                    # tracks last completed epoch for logging
-    for epoch in range(1, MAX_EPOCHS + 1):             # 1-indexed epoch loop up to MAX_EPOCHS
+    final_epoch = 0
+    for epoch in range(start_epoch, MAX_EPOCHS + 1):
         final_epoch = epoch                            # update on each iteration for post-loop logging
         train_loss = train_epoch(model, train_loader, optimiser, criterion, DEVICE)  # one epoch of training
         val_f1, _, _, _ = evaluate_model(model, val_loader, DEVICE, logger)  # evaluate on val set

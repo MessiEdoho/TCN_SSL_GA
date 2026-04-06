@@ -154,7 +154,7 @@ def setup_logging():
         "%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S")
 
-    fh = logging.FileHandler(LOG_FILE, mode="w", encoding="utf-8")
+    fh = logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8")
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(fmt)
 
@@ -736,24 +736,26 @@ def main():
     train_pairs = filter_unpaired_subjects(train_pairs, logger=logger)
     # Step 2: downsample non-ictal to 1:4 ratio, stratified by recording.
     train_pairs = downsample_non_ictal(train_pairs, ratio=4, seed=42)
-    # Step 3: pos_weight = 1.0 (downsampling is the sole imbalance correction).
-    pos_weight = torch.tensor([1.0], dtype=torch.float32)
+    # pos_weight = 1.0 is set inside optuna_objective() per trial (on device).
     logger.info("Post-downsampling corpus: %d segments", len(train_pairs))
     # -- End corpus preparation ------------------------------------------------
 
     # -- Step 3: configure and run Optuna study --------------------------------
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
+    # SQLite storage enables resume after crash. load_if_exists=True loads
+    # the existing study so completed trials are not re-run.
+    study_db = OUTPUT_DIR / "tune_temporal_attention.db"
     study = optuna.create_study(
         study_name="temporal_attention_tuning",
-        direction="maximize",                           # maximise validation macro F1
-        sampler=TPESampler(
-            seed=SEED,
-            n_startup_trials=N_STARTUP),
-        pruner=MedianPruner(
-            n_startup_trials=N_STARTUP,
-            n_warmup_steps=10),                         # allow 10 epochs before pruning
+        direction="maximize",
+        sampler=TPESampler(seed=SEED, n_startup_trials=N_STARTUP),
+        pruner=MedianPruner(n_startup_trials=N_STARTUP, n_warmup_steps=10),
+        storage="sqlite:///" + str(study_db.resolve()),
+        load_if_exists=True,
     )
+    logger.info("Optuna storage: %s | completed trials so far: %d",
+                study_db, len(study.trials))
 
     logger.info(
         "Starting Optuna study | %d trials | %d random startup",

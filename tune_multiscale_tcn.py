@@ -27,12 +27,13 @@ batch_size    : segments per gradient step
 
 Outputs (no model weights saved)
 ---------------------------------
-outputs/best_multiscale_params.json
-outputs/multiscale_study_results.csv
-outputs/multiscale_tuning_summary.json
-outputs/logs/tune_multiscale_tcn.log
-outputs/figures/multiscale_f1_history.png
-outputs/figures/multiscale_importance.png
+{OUTPUT_DIR}/best_multiscale_params.json
+{OUTPUT_DIR}/multiscale_study_results.csv
+{OUTPUT_DIR}/multiscale_tuning_summary.json
+{OUTPUT_DIR}/logs/tune_multiscale_tcn.log
+{OUTPUT_DIR}/figures/multiscale_f1_history.png
+{OUTPUT_DIR}/figures/multiscale_importance.png
+{OUTPUT_DIR}/tune_multiscale_tcn.db  (Optuna SQLite for resume)
 
 Usage
 -----
@@ -93,10 +94,10 @@ FS                = 500                                # EEG sampling rate (Hz)
 SEGMENT_LEN       = 2500                               # samples per segment (5 s at 500 Hz)
 SEGMENT_SEC       = 5.0                                # segment duration in seconds
 
-OUTPUT_DIR        = Path("outputs")
+OUTPUT_DIR        = Path("/home/people/22206468/scratch/OUTPUT/MODEL3_OUTPUT/MultiScaleTCNtuning_outputs")
 LOG_DIR           = OUTPUT_DIR / "logs"
 FIGURE_DIR        = OUTPUT_DIR / "figures"
-SPLITS_PATH       = Path("data_splits_outputs") / "data_splits.json"
+SPLITS_PATH       = Path("/scratch/22206468/INPUT_DATA/data_splits_outputs/data_splits.json")
 BEST_MS_PATH      = OUTPUT_DIR / "best_multiscale_params.json"
 STUDY_CSV         = OUTPUT_DIR / "multiscale_study_results.csv"
 SUMMARY_PATH      = OUTPUT_DIR / "multiscale_tuning_summary.json"
@@ -129,7 +130,7 @@ BRANCH3_DILATIONS   = [4, 8, 16]                       # coarse scale
 def setup_logging():
     """Create output directories and configure the module logger.
 
-    FileHandler: LOG_FILE mode='w' level DEBUG.
+    FileHandler: LOG_FILE mode='a' level DEBUG (append for resume).
     StreamHandler: sys.stdout level INFO.
 
     Returns
@@ -142,12 +143,13 @@ def setup_logging():
 
     logger = logging.getLogger("multiscale_tcn_tuning")
     logger.setLevel(logging.DEBUG)
+    logger.handlers.clear()                # prevent duplicate handlers on re-import or re-run
 
     fmt = logging.Formatter(
         "%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S")
 
-    fh = logging.FileHandler(LOG_FILE, mode="w", encoding="utf-8")
+    fh = logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8")
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(fmt)
 
@@ -317,9 +319,9 @@ def save_results(study, device, logger):
     """Save all tuning outputs. No model weights saved.
 
     Saves:
-        outputs/best_multiscale_params.json
-        outputs/multiscale_study_results.csv
-        outputs/multiscale_tuning_summary.json
+        {OUTPUT_DIR}/best_multiscale_params.json
+        {OUTPUT_DIR}/multiscale_study_results.csv
+        {OUTPUT_DIR}/multiscale_tuning_summary.json
 
     Parameters
     ----------
@@ -558,20 +560,26 @@ def main():
     train_pairs = filter_unpaired_subjects(train_pairs, logger=logger)
     # Step 2: downsample non-ictal to 1:4 ratio, stratified by recording.
     train_pairs = downsample_non_ictal(train_pairs, ratio=4, seed=42)
-    # Step 3: pos_weight = 1.0 (downsampling is the sole imbalance correction).
-    pos_weight = torch.tensor([1.0], dtype=torch.float32)
+    # pos_weight = 1.0 is set inside optuna_objective() per trial (on device).
     logger.info("Post-downsampling corpus: %d segments", len(train_pairs))
     # -- End corpus preparation ------------------------------------------------
 
     # -- Step 3: create and run Optuna study -----------------------------------
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
+    # SQLite storage enables resume after crash. load_if_exists=True loads
+    # the existing study so completed trials are not re-run.
+    study_db = OUTPUT_DIR / "tune_multiscale_tcn.db"
     study = optuna.create_study(
         study_name="multiscale_tcn_tuning",
         direction="maximize",
         sampler=TPESampler(seed=SEED, n_startup_trials=N_STARTUP),
         pruner=MedianPruner(n_startup_trials=N_STARTUP, n_warmup_steps=10),
+        storage="sqlite:///" + str(study_db.resolve()),
+        load_if_exists=True,
     )
+    logger.info("Optuna storage: %s | completed trials so far: %d",
+                study_db, len(study.trials))
 
     logger.info("Starting Optuna study | %d trials | %d random startup", N_TRIALS, N_STARTUP)
 

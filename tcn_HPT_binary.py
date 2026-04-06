@@ -190,7 +190,7 @@ def optuna_objective(trial):
         model, train_loader, val_loader,
         lr=lr, weight_decay=wd,
         max_epochs=MAX_EPOCHS, patience=ES_PATIENCE,
-        device=DEVICE, train_pairs=train_pairs,
+        device=DEVICE,
         trial=trial
     )
 
@@ -214,12 +214,19 @@ def trial_callback(study, trial):
 sampler = TPESampler(seed=SEED, n_startup_trials=N_STARTUP)  # TPE with 15 random starts
 pruner  = MedianPruner(n_startup_trials=N_STARTUP, n_warmup_steps=15)  # prune below median
 
+# SQLite storage enables resume after crash: re-running the script picks up
+# from the last completed trial. load_if_exists=True loads the existing study
+# if the database already contains one with the same study_name.
+STUDY_DB = OUTPUT_DIR / "tcn_hpt.db"
 study = optuna.create_study(
     study_name=STUDY_NAME,
     direction="maximize",        # maximise validation macro F1
     sampler=sampler,
-    pruner=pruner
+    pruner=pruner,
+    storage="sqlite:///" + str(STUDY_DB.resolve()),
+    load_if_exists=True,
 )
+log.info(f"Optuna storage: {STUDY_DB} | completed trials so far: {len(study.trials)}")
 
 log.info(f"Starting Optuna study: {N_TRIALS} trials, TPE sampler, MedianPruner")
 log.info(f"Training device: {DEVICE.type}")
