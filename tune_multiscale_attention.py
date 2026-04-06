@@ -390,14 +390,18 @@ def optuna_objective(trial, train_pairs, val_pairs,
         else:
             epochs_no_imp += 1
 
+        # Lightweight progress: first, every 10th, and early-stop epoch
+        if epoch == 1 or epoch % 10 == 0 or epochs_no_imp >= ES_PATIENCE:
+            logger.info(
+                "  T%d ep %3d/%d | loss=%.4f | f1=%.4f | best=%.4f | pat=%d/%d",
+                trial.number, epoch, MAX_EPOCHS, train_loss, val_f1,
+                best_val_f1, epochs_no_imp, ES_PATIENCE)
+
         trial.report(val_f1, epoch)
         if trial.should_prune():
             raise optuna.exceptions.TrialPruned()
 
         if epochs_no_imp >= ES_PATIENCE:
-            logger.debug(
-                "Trial %d: early stop at epoch %d | best_f1=%.4f",
-                trial.number, epoch, best_val_f1)
             break
 
     # -- i. One-line trial summary ---------------------------------------------

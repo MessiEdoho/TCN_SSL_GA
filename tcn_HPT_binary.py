@@ -190,7 +190,7 @@ def optuna_objective(trial):
         lr=lr, weight_decay=wd,
         max_epochs=MAX_EPOCHS, patience=ES_PATIENCE,
         device=DEVICE,
-        trial=trial
+        trial=trial, logger=log
     )
 
     # -- Save checkpoint for this trial ----------------------------------------

@@ -1092,7 +1092,7 @@ def evaluate(model, loader, device):
 # ---------------------------------------------------------------------------
 def run_training(model, train_loader, val_loader, lr, weight_decay,
                  max_epochs, patience, device,
-                 max_grad_norm=1.0, trial=None):
+                 max_grad_norm=1.0, trial=None, logger=None):
     """Full training loop with early stopping, cosine annealing, and optional Optuna pruning.
 
     pos_weight is fixed at 1.0 because class imbalance is handled by
@@ -1121,6 +1121,9 @@ def run_training(model, train_loader, val_loader, lr, weight_decay,
         Gradient clipping threshold.
     trial : optuna.trial.Trial or None, default None
         Optuna trial for pruning. If None, Optuna calls are skipped.
+    logger : logging.Logger or None, default None
+        If provided, logs progress every 10 epochs, plus the first
+        and last epoch, to keep log files small (~12 lines per trial).
 
     Returns
     -------
@@ -1130,7 +1133,7 @@ def run_training(model, train_loader, val_loader, lr, weight_decay,
     Example
     -------
     >>> f1 = run_training(model, train_ld, val_ld, 1e-3, 1e-4, 100, 10, device,
-    ...                   trial=trial)
+    ...                   trial=trial, logger=logger)
     """
     # pos_weight = 1.0: the 1:4 offline downsampling is the sole imbalance
     # correction. No additional upweighting is applied.
@@ -1159,6 +1162,16 @@ def run_training(model, train_loader, val_loader, lr, weight_decay,
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
         else:
             epochs_no_improve += 1
+
+        # Lightweight progress logging: first epoch, every 10th, and last epoch.
+        # ~12 lines per trial keeps log files small enough for WinSCP.
+        if logger is not None:
+            ep = epoch + 1  # 1-indexed for display
+            if ep == 1 or ep % 10 == 0 or epochs_no_improve >= patience:
+                logger.info(
+                    "  ep %3d/%d | loss=%.4f | f1=%.4f | best=%.4f | pat=%d/%d",
+                    ep, max_epochs, train_loss, val_f1,
+                    best_val_f1, epochs_no_improve, patience)
 
         # Optuna integration (guarded: only runs if trial is provided)
         if trial is not None:
