@@ -82,7 +82,8 @@ from tcn_utils import (
     set_seed,
     MultiScaleTCN,
     make_loader,
-    compute_pos_weight,
+    filter_unpaired_subjects,
+    downsample_non_ictal,
     train_one_epoch,
     evaluate,
     count_parameters,
@@ -348,10 +349,11 @@ def build_model(hp, branch_dilations, device, logger):
 # ---------------------------------------------------------------------------
 # build_training_components
 # ---------------------------------------------------------------------------
-def build_training_components(model, train_pairs, hp, device, logger):
+def build_training_components(model, pos_weight, hp, device, logger):
     """Build optimiser, scheduler, and loss function.
 
-    Mirror of TCN.py build_training_components() -- no differences.
+    Imbalance strategy: offline stratified downsampling to 1:4 ratio with
+    pos_weight=1.0.
 
     Returns (optimiser, scheduler, criterion).
     """
@@ -367,11 +369,8 @@ def build_training_components(model, train_pairs, hp, device, logger):
         optimiser,
         T_max=MAX_EPOCHS,
         eta_min=float(hp["learning_rate"]) * 0.01)        # floor at 1% of initial LR
-    # pos_weight = n_non_ictal / n_ictal upweights ictal gradient contribution.
-    # Combined with WeightedRandomSampler in make_loader(train=True), this
-    # provides dual imbalance correction: balanced batches + weighted loss.
-    pos_weight = compute_pos_weight(train_pairs, device)
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)  # built-in sigmoid + BCE
+    # Imbalance handled by offline stratified downsampling to 1:4 ratio; pos_weight=1.0
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight.to(device))  # built-in sigmoid + BCE
     logger.info("Optimiser: AdamW (lr=%.2e, wd=%.2e)", hp["learning_rate"], hp["weight_decay"])
     logger.info("Scheduler: CosineAnnealingLR (T_max=%d)", MAX_EPOCHS)
     logger.info("pos_weight: %.4f", pos_weight.item())
@@ -1200,14 +1199,21 @@ def main():
     config, hp, branch_dilations = load_best_params(logger)
     train_pairs, val_pairs = load_splits(logger)
 
+    # -- Corpus preparation ----------------------------------------------------
+    # Step 1: remove subjects with no ictal segments.
+    train_pairs = filter_unpaired_subjects(train_pairs, logger=logger)
+    # Step 2: downsample non-ictal to 1:4 ratio, stratified by recording.
+    train_pairs = downsample_non_ictal(train_pairs, ratio=4, seed=42)
+    # Step 3: pos_weight = 1.0 (downsampling is the sole imbalance correction).
+    pos_weight = torch.tensor([1.0], dtype=torch.float32)
+    logger.info("Post-downsampling corpus: %d segments", len(train_pairs))
+    # -- End corpus preparation ------------------------------------------------
+
     # -- Step 3: Build model ---------------------------------------------------
     model = build_model(hp, branch_dilations, DEVICE, logger)
     n_params = count_parameters(model)
 
     # -- Step 4: Build data loaders --------------------------------------------
-    # make_loader(train=True) creates a WeightedRandomSampler that oversamples
-    # the minority (ictal) class. make_loader(train=False) creates a plain
-    # sequential loader for deterministic validation evaluation.
     batch_size = int(hp["batch_size"])
     train_loader = make_loader(train_pairs, batch_size, True, DEVICE)
     val_loader = make_loader(val_pairs, batch_size, False, DEVICE)
@@ -1216,7 +1222,7 @@ def main():
 
     # -- Step 5: Build training components -------------------------------------
     optimiser, scheduler, criterion = build_training_components(
-        model, train_pairs, hp, DEVICE, logger)
+        model, pos_weight, hp, DEVICE, logger)
 
     # -- Step 6: Initialise training state -------------------------------------
     history = {"epoch": [], "train_loss": [], "val_f1": [], "lr": []}
@@ -1419,8 +1425,8 @@ if __name__ == "__main__":
 # cosine annealing schedule (eta_min = LR * 0.01). Early stopping
 # with patience 10 was applied, monitoring validation macro F1.
 # Gradient clipping (max_norm=1.0) was applied at every step. Class
-# imbalance was addressed by WeightedRandomSampler and BCEWithLogitsLoss
-# with pos_weight = n_non_ictal / n_ictal."
+# imbalance was addressed by offline stratified downsampling to 1:4 ratio
+# with pos_weight=1.0."
 #
 # "Hyperparameters were tuned independently for the multi-scale
 # architecture using Optuna TPE (tune_multiscale_tcn.py). No parameters
@@ -1452,13 +1458,12 @@ if __name__ == "__main__":
 #   early in training and fine-tune late, without manually choosing
 #   step-decay milestones.
 #
-# WHY WEIGHTED-RANDOM-SAMPLER + POS_WEIGHT (dual correction):
-#   WeightedRandomSampler ensures each mini-batch contains roughly
-#   equal numbers of ictal and non-ictal segments, stabilising gradient
-#   direction. pos_weight further upweights the loss contribution of
-#   ictal segments, correcting any residual imbalance from stochastic
-#   sampling. This dual approach is more robust than either mechanism
-#   alone and is used consistently across all pipeline scripts.
+# WHY OFFLINE DOWNSAMPLING + POS_WEIGHT=1.0:
+#   Offline stratified downsampling to 1:4 ratio (non-ictal:ictal)
+#   is the sole imbalance correction mechanism. pos_weight=1.0 means
+#   the loss treats both classes equally after downsampling. This
+#   single-mechanism approach is simpler and more reproducible than
+#   dual correction, and is used consistently across all pipeline scripts.
 #
 # WHY INDEPENDENT TUNING (not transfer from TCN):
 #   The optimal num_filters for three parallel branches may differ from

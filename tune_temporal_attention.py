@@ -79,7 +79,8 @@ from optuna.pruners import MedianPruner
 from tcn_utils import (
     set_seed,
     make_loader,
-    compute_pos_weight,
+    filter_unpaired_subjects,
+    downsample_non_ictal,
     TCNWithAttention,
     count_parameters,
     train_one_epoch,
@@ -389,8 +390,8 @@ def optuna_objective(trial, train_pairs, val_pairs, tcn_hp, device, logger):
         T_max=MAX_EPOCHS,
         eta_min=learning_rate * 0.01)                   # decay to 1% of initial lr
 
-    # -- g. Build loss with pos_weight for class imbalance ---------------------
-    pos_weight = compute_pos_weight(train_pairs, device)
+    # -- g. Build loss -- imbalance handled by offline downsampling; pos_weight=1.0
+    pos_weight = torch.tensor([1.0], dtype=torch.float32).to(device)
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
     # -- h. Training loop with early stopping ----------------------------------
@@ -729,6 +730,16 @@ def main():
     # -- Step 2: load inputs ---------------------------------------------------
     tcn_config, tcn_hp = load_best_tcn_params(logger)
     train_pairs, val_pairs = load_splits(logger)
+
+    # -- Corpus preparation ----------------------------------------------------
+    # Step 1: remove subjects with no ictal segments.
+    train_pairs = filter_unpaired_subjects(train_pairs, logger=logger)
+    # Step 2: downsample non-ictal to 1:4 ratio, stratified by recording.
+    train_pairs = downsample_non_ictal(train_pairs, ratio=4, seed=42)
+    # Step 3: pos_weight = 1.0 (downsampling is the sole imbalance correction).
+    pos_weight = torch.tensor([1.0], dtype=torch.float32)
+    logger.info("Post-downsampling corpus: %d segments", len(train_pairs))
+    # -- End corpus preparation ------------------------------------------------
 
     # -- Step 3: configure and run Optuna study --------------------------------
     optuna.logging.set_verbosity(optuna.logging.WARNING)

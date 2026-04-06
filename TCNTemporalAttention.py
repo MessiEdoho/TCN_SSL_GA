@@ -96,8 +96,9 @@ from sklearn.metrics import (        # scikit-learn metrics for comprehensive ev
 from tcn_utils import (
     set_seed,                        # fix Python/NumPy/PyTorch seeds for reproducibility
     TCNWithAttention,                # M2 architecture: TCN backbone + two-layer additive attention
-    make_loader,                     # build DataLoader with WeightedRandomSampler (train) or sequential (val)
-    compute_pos_weight,              # n_non_ictal / n_ictal ratio for BCEWithLogitsLoss
+    make_loader,                     # build DataLoader (sequential for val, shuffled for train)
+    filter_unpaired_subjects,        # remove subjects with no ictal segments
+    downsample_non_ictal,            # offline stratified downsampling to 1:4 ratio
     train_one_epoch,                 # one epoch: forward + loss + backward + gradient clip + step
     evaluate,                        # inference pass returning (macro_f1, y_true, y_pred)
     count_parameters,                # sum of requires_grad=True parameter elements
@@ -399,12 +400,15 @@ def build_model(backbone_hp, attn_hp, device, logger):
 # ---------------------------------------------------------------------------
 # build_training_components
 # ---------------------------------------------------------------------------
-def build_training_components(model, train_pairs, attn_hp, device, logger):
+def build_training_components(model, pos_weight, attn_hp, device, logger):
     """Build optimiser, scheduler, and loss function.
 
     DIFFERENCE FROM TCN.py: learning_rate, weight_decay come from attn_hp
     (best_attention_params.json) because these were optimised during attention
     tuning. Optimiser covers ALL parameters (backbone + attention jointly).
+
+    Imbalance strategy: offline stratified downsampling to 1:4 ratio with
+    pos_weight=1.0.
 
     Returns (optimiser, scheduler, criterion).
     """
@@ -418,9 +422,8 @@ def build_training_components(model, train_pairs, attn_hp, device, logger):
         optimiser,
         T_max=MAX_EPOCHS,
         eta_min=float(attn_hp["learning_rate"]) * 0.01)   # floor at 1% of initial LR
-    # Dual imbalance correction: WeightedRandomSampler + pos_weight
-    pos_weight = compute_pos_weight(train_pairs, device)
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    # Imbalance handled by offline stratified downsampling to 1:4 ratio; pos_weight=1.0
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight.to(device))
     logger.info("Optimiser: AdamW (lr=%.2e, wd=%.2e) -- from attention tuning",
                 attn_hp["learning_rate"], attn_hp["weight_decay"])
     logger.info("Scheduler: CosineAnnealingLR (T_max=%d)", MAX_EPOCHS)
@@ -1174,6 +1177,16 @@ def main():
     # -- Step 3: Load data splits ----------------------------------------------
     train_pairs, val_pairs = load_splits(logger)
 
+    # -- Corpus preparation ----------------------------------------------------
+    # Step 1: remove subjects with no ictal segments.
+    train_pairs = filter_unpaired_subjects(train_pairs, logger=logger)
+    # Step 2: downsample non-ictal to 1:4 ratio, stratified by recording.
+    train_pairs = downsample_non_ictal(train_pairs, ratio=4, seed=42)
+    # Step 3: pos_weight = 1.0 (downsampling is the sole imbalance correction).
+    pos_weight = torch.tensor([1.0], dtype=torch.float32)
+    logger.info("Post-downsampling corpus: %d segments", len(train_pairs))
+    # -- End corpus preparation ------------------------------------------------
+
     # -- Step 4: Build model ---------------------------------------------------
     model = build_model(backbone_hp, attn_hp, DEVICE, logger)
     n_params = count_parameters(model)
@@ -1189,7 +1202,7 @@ def main():
     # -- Step 6: Build training components -------------------------------------
     # lr, wd come from attn_hp (optimised during attention tuning)
     optimiser, scheduler, criterion = build_training_components(
-        model, train_pairs, attn_hp, DEVICE, logger)
+        model, pos_weight, attn_hp, DEVICE, logger)
 
     # -- Step 7: Initialise training state -------------------------------------
     history = {"epoch": [], "train_loss": [], "val_f1": [], "lr": []}  # per-epoch tracking

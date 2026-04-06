@@ -68,7 +68,8 @@ from tcn_utils import (
     set_seed,
     TCN,
     make_loader,
-    compute_pos_weight,
+    filter_unpaired_subjects,
+    downsample_non_ictal,
     train_one_epoch,
     evaluate,
     count_parameters,
@@ -305,29 +306,24 @@ def build_model(hp, device, logger):
 # ---------------------------------------------------------------------------
 # build_training_components
 # ---------------------------------------------------------------------------
-def build_training_components(model, train_pairs, hp, device, logger):
+def build_training_components(model, hp, pos_weight, device, logger):
     """Build optimiser, scheduler, and loss function.
+
+    pos_weight is passed in (set to 1.0 after offline downsampling).
 
     Returns (optimiser, scheduler, criterion).
     """
-    # AdamW decouples weight decay from the gradient update (Loshchilov & Hutter,
-    # 2019), preventing regularisation strength from shrinking as LR decays.
     optimiser = torch.optim.AdamW(
         model.parameters(),
-        lr=float(hp["learning_rate"]),        # initial LR from Optuna best trial
-        weight_decay=float(hp["weight_decay"]))  # L2 regularisation coefficient
-    # Cosine annealing smoothly decays LR from initial value to eta_min over
-    # T_max epochs, avoiding abrupt drops that can destabilise training.
-    # T_max = MAX_EPOCHS so one full cosine half-cycle spans the training budget.
+        lr=float(hp["learning_rate"]),
+        weight_decay=float(hp["weight_decay"]))
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimiser,
         T_max=MAX_EPOCHS,
-        eta_min=float(hp["learning_rate"]) * 0.01)  # floor at 1% of initial LR
-    # pos_weight = n_non_ictal / n_ictal upweights ictal gradient contribution.
-    # Combined with WeightedRandomSampler in make_loader(train=True), this
-    # provides dual imbalance correction: balanced batches + weighted loss.
-    pos_weight = compute_pos_weight(train_pairs, device)
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)  # built-in sigmoid + BCE
+        eta_min=float(hp["learning_rate"]) * 0.01)
+    # pos_weight = 1.0: the 1:4 offline downsampling is the sole imbalance
+    # correction. No additional pos_weight upweighting is applied.
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight.to(device))
     logger.info("Optimiser: AdamW (lr=%.2e, wd=%.2e)", hp["learning_rate"], hp["weight_decay"])
     logger.info("Scheduler: CosineAnnealingLR (T_max=%d)", MAX_EPOCHS)
     logger.info("pos_weight: %.4f", pos_weight.item())
@@ -1101,14 +1097,21 @@ def main():
     config, hp = load_best_params(logger)
     train_pairs, val_pairs = load_splits(logger)
 
+    # -- Corpus preparation ----------------------------------------------------
+    # Step 1: remove subjects with no ictal segments.
+    train_pairs = filter_unpaired_subjects(train_pairs, logger=logger)
+    # Step 2: downsample non-ictal to 1:4 ratio, stratified by recording.
+    train_pairs = downsample_non_ictal(train_pairs, ratio=4, seed=42)
+    # Step 3: pos_weight = 1.0 (downsampling is the sole imbalance correction).
+    pos_weight = torch.tensor([1.0], dtype=torch.float32)
+    logger.info("Post-downsampling corpus: %d segments", len(train_pairs))
+    # -- End corpus preparation ------------------------------------------------
+
     # -- Step 3: Build model ---------------------------------------------------
     model = build_model(hp, DEVICE, logger)
     n_params = count_parameters(model)
 
     # -- Step 4: Build data loaders --------------------------------------------
-    # make_loader(train=True) creates a WeightedRandomSampler that oversamples
-    # the minority (ictal) class. make_loader(train=False) creates a plain
-    # sequential loader for deterministic validation evaluation.
     batch_size = int(hp["batch_size"])
     train_loader = make_loader(train_pairs, batch_size, True, DEVICE)
     val_loader = make_loader(val_pairs, batch_size, False, DEVICE)
@@ -1117,7 +1120,7 @@ def main():
 
     # -- Step 5: Build training components -------------------------------------
     optimiser, scheduler, criterion = build_training_components(
-        model, train_pairs, hp, DEVICE, logger)
+        model, hp, pos_weight, DEVICE, logger)
 
     # -- Step 6: Initialise training state -------------------------------------
     history = {"epoch": [], "train_loss": [], "val_f1": [], "lr": []}
@@ -1311,8 +1314,8 @@ if __name__ == "__main__":
 # annealing schedule (eta_min = LR * 0.01). Early stopping with patience
 # 10 was applied, monitoring validation macro F1. Gradient clipping
 # (max_norm=1.0) was applied at every step. Class imbalance was addressed
-# by WeightedRandomSampler and BCEWithLogitsLoss with pos_weight =
-# n_non_ictal / n_ictal."
+# by offline stratified downsampling of the non-ictal class to a 1:4
+# ictal:non-ictal ratio, with pos_weight = 1.0 in BCEWithLogitsLoss."
 #
 # WHY 100 EPOCHS:
 #   100 is a widely used upper bound in EEG deep learning literature
@@ -1340,13 +1343,11 @@ if __name__ == "__main__":
 #   early in training and fine-tune late, without the need to manually
 #   choose step-decay milestones.
 #
-# WHY WEIGHTED-RANDOM-SAMPLER + POS_WEIGHT (dual correction):
-#   WeightedRandomSampler ensures each mini-batch contains roughly
-#   equal numbers of ictal and non-ictal segments, stabilising gradient
-#   direction. pos_weight further upweights the loss contribution of
-#   ictal segments, correcting any residual imbalance from stochastic
-#   sampling. This dual approach is more robust than either mechanism
-#   alone and is used consistently across all pipeline scripts.
+# WHY OFFLINE DOWNSAMPLING + POS_WEIGHT=1.0:
+#   The non-ictal class is downsampled offline to a 1:4 ratio, stratified
+#   by recording. pos_weight is set to 1.0 because the downsampling is the
+#   sole imbalance correction. See downsample_non_ictal() in tcn_utils.py
+#   for full methodological justification.
 #
 # -- POST-PROCESSING (Methods) ---------------------------------------------
 # "Raw segment-level sigmoid probabilities were post-processed prior to

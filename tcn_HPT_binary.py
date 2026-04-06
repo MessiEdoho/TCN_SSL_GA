@@ -24,18 +24,15 @@ import matplotlib.pyplot as plt      # plotting API
 optuna.logging.set_verbosity(optuna.logging.WARNING)  # suppress Optuna's verbose output
 
 # -- Import shared utilities from tcn_utils.py ---------------------------------
-# Only import components that are directly called in this notebook.
-# run_training internally uses train_one_epoch, compute_pos_weight, and
-# CausalConvBlock via TCN.
-# make_loader builds a DataLoader with WeightedRandomSampler for training
-# (train=True) or a plain sequential loader for validation (train=False).
 from tcn_utils import (
-    set_seed,              # called in optuna_objective to reset seeds per trial
-    make_loader,           # called in optuna_objective to build train and val loaders
-    TCN,                   # called in optuna_objective to build the model
-    count_parameters,      # called in optuna_objective to log parameter count
-    evaluate,              # called in study results section to evaluate best model
-    run_training           # called in optuna_objective as the training loop
+    set_seed,
+    make_loader,
+    filter_unpaired_subjects,
+    downsample_non_ictal,
+    TCN,
+    count_parameters,
+    evaluate,
+    run_training,
 )
 
 set_seed(42)  # set global seed immediately
@@ -125,13 +122,21 @@ if not train_pairs:
 if not val_pairs:
     raise RuntimeError("Val partition is empty in data_splits.json.")
 
-# -- Class statistics ----------------------------------------------------------
+# -- Corpus preparation --------------------------------------------------------
+# Step 1: remove subjects with no ictal segments.
+train_pairs = filter_unpaired_subjects(train_pairs, logger=log)
+# Step 2: downsample non-ictal to 1:4 ratio, stratified by recording.
+train_pairs = downsample_non_ictal(train_pairs, ratio=4, seed=42)
+# Step 3: pos_weight = 1.0 (downsampling is the sole imbalance correction).
+POS_WEIGHT_VAL = 1.0
+log.info(f"Post-downsampling corpus: {len(train_pairs)} segments")
+# -- End corpus preparation ----------------------------------------------------
+
+# -- Class statistics (post-downsampling) --------------------------------------
 n_train_ictal     = sum(1 for _, l in train_pairs if l == 1)
 n_train_non_ictal = sum(1 for _, l in train_pairs if l == 0)
 n_val_ictal       = sum(1 for _, l in val_pairs if l == 1)
 n_val_non_ictal   = sum(1 for _, l in val_pairs if l == 0)
-
-POS_WEIGHT_VAL = n_train_non_ictal / max(n_train_ictal, 1)
 
 log.info(f"Train: {n_train_ictal} ictal + {n_train_non_ictal} non-ictal "
          f"= {len(train_pairs)} total ({100*n_train_ictal/max(len(train_pairs),1):.1f}% ictal)")
@@ -175,11 +180,8 @@ def optuna_objective(trial):
              f"RF={rf} params={count_parameters(model)}")
 
     # -- Build data loaders ----------------------------------------------------
-    # Training loader: WeightedRandomSampler oversamples the minority (ictal)
-    # class so the model sees approximately balanced batches. Combined with
-    # pos_weight in the loss, this provides dual imbalance correction:
-    # the sampler balances what the model sees, pos_weight adjusts gradient
-    # contribution. This matches make_loader() in tcn_utils.py.
+    # Class imbalance handled by offline downsampling (applied once before
+    # Optuna loop). make_loader(train=True) shuffles the downsampled corpus.
     train_loader = make_loader(train_pairs, batch_size, train=True, device=DEVICE)
     val_loader = make_loader(val_pairs, batch_size, train=False, device=DEVICE)
 

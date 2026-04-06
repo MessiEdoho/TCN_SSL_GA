@@ -21,7 +21,7 @@ import random
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from sklearn.metrics import f1_score
@@ -168,53 +168,299 @@ def compute_pos_weight(train_pairs, device):
 #   n_ictal, n_non_ictal : segment counts in the training partition
 #
 # Design choices to justify:
-#   pos_weight = n_neg / n_pos : standard inverse-frequency weighting;
-#     combined with WeightedRandomSampler for dual imbalance correction.
+#   pos_weight = 1.0 after offline stratified downsampling to 1:4 ratio.
+#     The downsampling is the sole imbalance correction mechanism.
 # -----------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
-# 5. make_loader
+# 5. filter_unpaired_subjects
+# ---------------------------------------------------------------------------
+def filter_unpaired_subjects(pairs, logger=None):
+    """Remove segments from subjects with no ictal representation.
+
+    Subjects with zero ictal segments cannot participate in stratified
+    downsampling because the non-ictal quota is computed as
+    len(ictal) * ratio. A subject with no ictal segments contributes
+    a quota of zero, meaning their non-ictal segments cannot be
+    allocated proportionally. Retaining such segments introduces an
+    asymmetry: the subject contributes non-ictal EEG without any
+    ictal counterpart, which may cause the model to learn
+    subject-specific background morphology as a discriminative feature
+    rather than a generalisable interictal characteristic.
+
+    Subject m254 was identified as having no ictal segments in the
+    training partition of this dataset. All non-ictal segments from
+    m254 are removed before downsampling is applied. This exclusion
+    is applied identically across all four models to ensure that
+    every model trains on the same eligible corpus and that
+    cross-model performance differences reflect architectural
+    differences rather than corpus composition differences. The
+    exclusion is logged explicitly for the experiment record and
+    the Methods section.
+
+    Parameters
+    ----------
+    pairs : list of (str or Path, int) tuples
+        File-label pairs for the training partition as loaded from
+        data_splits.json. Each tuple is (filepath, label) where
+        label in {0, 1}.
+    logger : logging.Logger or None, optional
+        If provided, logs subjects removed and segment counts
+        before and after filtering.
+
+    Returns
+    -------
+    list of (str or Path, int) tuples
+        Pairs with all segments from ictal-free subjects removed.
+
+    Raises
+    ------
+    ValueError
+        If filtering removes all pairs, leaving an empty corpus.
+
+    Notes
+    -----
+    Call this function as Step 1 of the mandatory three-step corpus
+    preparation sequence:
+
+        train_pairs = filter_unpaired_subjects(
+            train_pairs, logger=logger)
+        train_pairs = downsample_non_ictal(
+            train_pairs, ratio=4, seed=42)
+        pos_weight = torch.tensor(
+            [1.0], dtype=torch.float32)
+
+    The subject identifier is extracted from the filename stem as
+    stem.split('_', 1)[0], matching the mouse_id convention used
+    by generate_data_splits.py.
+    """
+    from collections import defaultdict
+
+    subject_has_ictal = defaultdict(bool)
+    for f, l in pairs:
+        subject_id = Path(f).stem.split("_", 1)[0]
+        if l == 1:
+            subject_has_ictal[subject_id] = True
+
+    all_subjects = {Path(f).stem.split("_", 1)[0] for f, _ in pairs}
+    ictal_free = sorted(s for s in all_subjects if not subject_has_ictal[s])
+
+    if not ictal_free:
+        if logger:
+            logger.info(
+                "filter_unpaired_subjects: no ictal-free "
+                "subjects found. All subjects retained.")
+        return pairs
+
+    if logger:
+        for s in ictal_free:
+            n_segs = sum(
+                1 for f, _ in pairs
+                if Path(f).stem.split("_", 1)[0] == s)
+            logger.warning(
+                "EXCLUDING subject %s: 0 ictal segments, "
+                "%d non-ictal segments removed. Reason: "
+                "ictal-free subjects cannot participate in "
+                "stratified downsampling.", s, n_segs)
+
+    ictal_free_set = set(ictal_free)
+    filtered = [
+        (f, l) for f, l in pairs
+        if Path(f).stem.split("_", 1)[0] not in ictal_free_set]
+
+    if len(filtered) == 0:
+        raise ValueError(
+            "filter_unpaired_subjects removed all pairs. "
+            "Training corpus is empty.")
+
+    if logger:
+        logger.info(
+            "filter_unpaired_subjects: removed %d segments "
+            "from %d ictal-free subject(s): %s. "
+            "%d segments remain.",
+            len(pairs) - len(filtered),
+            len(ictal_free), ictal_free, len(filtered))
+
+    return filtered
+
+
+# -- RESEARCH REPORTING NOTE: filter_unpaired_subjects -------------------------
+# Methods description:
+#   Subjects with no ictal segments in the training partition were excluded
+#   prior to downsampling. Subject m254 contributed 0 ictal and N non-ictal
+#   segments and was removed to prevent asymmetric corpus composition.
+#   This exclusion was applied identically across all four models.
+#
+# Parameters to report:
+#   Excluded subjects and their segment counts (logged at runtime).
+# -----------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# 6. downsample_non_ictal
+# ---------------------------------------------------------------------------
+def downsample_non_ictal(pairs, ratio=4, seed=42):
+    """Stratified offline downsampling of the non-ictal majority class.
+
+    Why offline downsampling instead of WeightedRandomSampler
+    ---------------------------------------------------------
+    The training corpus contains approximately 28.7 million segments
+    (65,510 ictal and 28,686,710 non-ictal), a 437:1 class imbalance.
+    WeightedRandomSampler cannot be used because torch.multinomial,
+    which it calls internally, imposes a hard ceiling of 2^24
+    (16,777,216) on len(weights). The training corpus exceeds this
+    limit. Offline downsampling eliminates the PyTorch constraint,
+    produces a deterministic and reproducible corpus, and reduces
+    per-epoch I/O by approximately 88x.
+
+    Why the 1:4 ratio
+    ---------------------------------------------------------
+    A 1:1 ratio discards 99.77% of non-ictal data, risking
+    underfitting of the interictal class. Ratios beyond 1:10
+    approach the original imbalance. A ratio of 1:4 is a principled
+    compromise consistent with prior work (Acharya et al., 2018;
+    Roy et al., 2019), yielding 65,510 ictal + 262,040 non-ictal
+    = 327,550 total segments.
+
+    Why pos_weight is set to 1.0
+    ---------------------------------------------------------
+    After downsampling to 1:4, the per-sample gradient contribution
+    of ictal segments is already implicitly upweighted by 4x. Adding
+    pos_weight = n_neg/n_pos would compound to ~16x effective
+    upweighting, degrading precision. pos_weight = 1.0 ensures the
+    1:4 ratio is the sole imbalance correction.
+
+    Why stratification by recording
+    ---------------------------------------------------------
+    Naive random downsampling risks drawing disproportionately from
+    recordings with large non-ictal counts. Stratification by
+    recording (using the filename stem prefix as the recording ID)
+    allocates the non-ictal quota proportionally, preserving
+    interictal EEG diversity across subjects.
+
+    Parameters
+    ----------
+    pairs : list of (str or Path, int) tuples
+        File-label pairs after filter_unpaired_subjects().
+    ratio : int, optional (default 4)
+        Target non-ictal to ictal ratio. Non-ictal pool is
+        downsampled to len(ictal) * ratio segments.
+    seed : int, optional (default 42)
+        Random seed for reproducibility. Must be identical
+        across all four models.
+
+    Returns
+    -------
+    list of (str or Path, int) tuples
+        Balanced and shuffled pairs containing all ictal segments
+        and a stratified subsample of non-ictal segments.
+
+    Raises
+    ------
+    ValueError
+        If pairs contains no ictal segments or ratio < 1.
+
+    Notes
+    -----
+    Call as Step 2 of the mandatory three-step sequence:
+
+        train_pairs = filter_unpaired_subjects(
+            train_pairs, logger=logger)
+        train_pairs = downsample_non_ictal(
+            train_pairs, ratio=4, seed=42)
+        pos_weight = torch.tensor(
+            [1.0], dtype=torch.float32)
+
+    References
+    ----------
+    Acharya et al. (2018). Computers in Biology and Medicine, 100.
+    Roy et al. (2019). Artificial Intelligence in Medicine, 99.
+    """
+    import random as _random
+    from collections import defaultdict
+
+    if ratio < 1:
+        raise ValueError("ratio must be >= 1, got %d" % ratio)
+
+    ictal = [(f, l) for f, l in pairs if l == 1]
+    non_ictal = [(f, l) for f, l in pairs if l == 0]
+
+    if len(ictal) == 0:
+        raise ValueError(
+            "No ictal segments found in pairs. "
+            "Ensure filter_unpaired_subjects() has been "
+            "called before downsample_non_ictal().")
+
+    target = len(ictal) * ratio
+
+    # Stratify by recording: group non-ictal by subject ID from filename stem
+    by_recording = defaultdict(list)
+    for f, l in non_ictal:
+        recording_id = Path(f).stem.split("_", 1)[0]
+        by_recording[recording_id].append((f, l))
+
+    total_non_ictal = len(non_ictal)
+    sampled = []
+    rng = _random.Random(seed)
+    for recording_id, segments in by_recording.items():
+        proportion = len(segments) / total_non_ictal
+        n = max(1, round(target * proportion))
+        sampled.extend(rng.sample(segments, min(n, len(segments))))
+
+    rng.shuffle(sampled)
+    sampled = sampled[:target]
+
+    balanced = ictal + sampled
+    rng.shuffle(balanced)
+    return balanced
+
+
+# -- RESEARCH REPORTING NOTE: downsample_non_ictal -----------------------------
+# Methods description:
+#   "The non-ictal majority class was downsampled offline to a 1:4
+#   ictal:non-ictal ratio, stratified by recording to preserve
+#   interictal EEG diversity across subjects. The post-downsampling
+#   corpus contained 65,510 ictal and 262,040 non-ictal segments
+#   (327,550 total). pos_weight was set to 1.0 in BCEWithLogitsLoss
+#   because the 1:4 downsampling is the sole imbalance correction.
+#   Seed=42 was fixed across all four models for identical corpus
+#   composition."
+#
+# Parameters to report:
+#   ratio=4, seed=42, post-downsampling counts
+#   Cite: Acharya et al. (2018), Roy et al. (2019)
+# -----------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# 7. make_loader
 # ---------------------------------------------------------------------------
 def make_loader(file_label_pairs, batch_size, train, device):
-    """Build a DataLoader with optional WeightedRandomSampler for training.
+    """Build a DataLoader for training or evaluation.
 
-    When train=True, a WeightedRandomSampler with inverse-frequency class
-    weights oversamples the minority (ictal) class so each epoch presents
-    approximately balanced batches to the model. This is one half of the
-    dual imbalance correction strategy; the other half is pos_weight in
-    BCEWithLogitsLoss, which upweights ictal gradient contributions.
-
-    Sampling strategy
-    -----------------
-    Each sample i receives weight w_i = 1 / N_c, where N_c is the total
-    count of class c to which sample i belongs. At each epoch,
-    min(N, 2^24 - 1) samples are drawn with replacement from this
-    weighted distribution. The 2^24 - 1 cap avoids a PyTorch internal
-    limitation in torch.multinomial, which uses 32-bit indexing and
-    raises RuntimeError when the number of categories exceeds 2^24.
-    For datasets smaller than 2^24 samples, the cap has no effect and
-    every sample is drawn once in expectation per epoch.
+    Class imbalance is addressed by filter_unpaired_subjects() and
+    downsample_non_ictal() prior to DataLoader construction, with
+    pos_weight = 1.0 in BCEWithLogitsLoss. The DataLoader itself
+    uses simple shuffle=True for training (no weighted sampler).
 
     Parameters
     ----------
     file_label_pairs : list of (str or Path, int)
         File-label pairs for the dataset. Label 1 = ictal, 0 = non-ictal.
+        For training, these should already be downsampled via the
+        three-step corpus preparation sequence.
     batch_size : int
         Number of segments per batch.
     train : bool
-        If True, use WeightedRandomSampler to oversample the minority class.
+        If True, shuffle the dataset each epoch.
         If False, load sequentially without shuffling (for val/test).
     device : torch.device
-        Used to set pin_memory (True when device is CUDA for faster
-        host-to-device transfer via DMA).
+        Used to set pin_memory (True when device is CUDA).
 
     Returns
     -------
     loader : DataLoader
-        Ready-to-iterate DataLoader. When train=True, iteration order is
-        stochastic and class-balanced. When train=False, iteration is
-        deterministic and sequential.
 
     Example
     -------
@@ -224,29 +470,8 @@ def make_loader(file_label_pairs, batch_size, train, device):
     pin = (device.type == "cuda")                          # pin memory for faster GPU transfer
 
     if train:
-        labels = [lbl for _, lbl in file_label_pairs]      # extract all labels as a list
-        n_pos = sum(labels)                                # count ictal (positive) segments
-        n_neg = len(labels) - n_pos                        # count non-ictal (negative) segments
-        # Inverse-frequency weights: rarer class gets higher sampling probability.
-        # w(ictal) = 1/n_pos, w(non-ictal) = 1/n_neg. This makes the expected
-        # number of draws from each class equal per epoch.
-        w_per_class = {0: 1.0 / max(n_neg, 1),
-                       1: 1.0 / max(n_pos, 1)}
-        sample_weights = [w_per_class[l] for l in labels]  # per-sample weight list
-        # torch.multinomial (used internally by WeightedRandomSampler) stores
-        # category indices as 32-bit integers and raises RuntimeError when the
-        # number of categories exceeds 2^24 (16,777,216). This cap ensures the
-        # sampler works for arbitrarily large EEG datasets. For datasets below
-        # the cap, min() returns len(labels) and behaviour is unchanged.
-        MAX_SAMPLES = 2**24 - 1                            # 16,777,215 -- PyTorch multinomial ceiling
-        print(f"[DEBUG] len(labels)={len(labels)}, MAX_SAMPLES={MAX_SAMPLES}, num_samples={min(len(labels), MAX_SAMPLES)}", flush=True)
-        sampler = WeightedRandomSampler(
-            weights=sample_weights,                        # sampling probability per segment
-            num_samples=min(len(labels), MAX_SAMPLES),     # draw up to MAX_SAMPLES per epoch
-            replacement=True                               # allow repeated draws for minority class
-        )
         return DataLoader(dataset, batch_size=batch_size,
-                          sampler=sampler, num_workers=0,
+                          shuffle=True, num_workers=0,
                           pin_memory=pin, drop_last=False)
     else:
         return DataLoader(dataset, batch_size=batch_size,
@@ -256,27 +481,18 @@ def make_loader(file_label_pairs, batch_size, train, device):
 
 # -- RESEARCH REPORTING NOTE: make_loader --------------------------------------
 # Methods description:
-#   Training batches were constructed using a WeightedRandomSampler with
-#   inverse-frequency class weights (w_c = 1/N_c), producing approximately
-#   balanced batches without discarding any samples. The number of samples
-#   drawn per epoch was capped at min(N, 2^24 - 1) to comply with the
-#   PyTorch torch.multinomial 32-bit indexing limit. For datasets below
-#   16,777,215 samples, the cap has no effect. Validation batches were
-#   loaded sequentially without shuffling.
+#   Class imbalance is addressed by offline stratified downsampling of the
+#   non-ictal class to a 1:4 ictal:non-ictal ratio, yielding a training
+#   corpus of 65,510 ictal and 262,040 non-ictal segments (327,550 total).
+#   Subjects with no ictal representation (m254) are excluded prior to
+#   downsampling. pos_weight is set to 1.0 in BCEWithLogitsLoss because
+#   the 1:4 downsampling is the sole imbalance correction mechanism. Both
+#   operations are implemented in tcn_utils.py. See downsample_non_ictal()
+#   for full methodological justification.
 #
 # Parameters to report in paper:
 #   batch_size : affects gradient noise and GPU memory usage
-#   WeightedRandomSampler : cite as minority oversampling strategy
-#   pin_memory : set True for CUDA devices (implementation detail, not reported)
-#   MAX_SAMPLES = 2^24 - 1 : report only if dataset exceeds this threshold
-#
-# Design choices to justify:
-#   WeightedRandomSampler + pos_weight : dual imbalance correction -- sampler
-#     balances what the model sees, pos_weight adjusts gradient contribution.
 #   num_workers=0 : cross-platform compatibility; can increase on Linux.
-#   MAX_SAMPLES cap : prevents RuntimeError from torch.multinomial when the
-#     dataset size exceeds 2^24. This is a PyTorch implementation constraint,
-#     not a methodological choice.
 # -----------------------------------------------------------------------------
 
 
@@ -983,7 +1199,7 @@ def run_training(model, train_loader, val_loader, lr, weight_decay,
 #   AdamW : decouples weight decay from gradient update
 #   Cosine annealing : smooth LR decay without abrupt drops
 #   Best-state on CPU : saves VRAM by storing only one model copy on GPU
-#   Dual imbalance handling : WeightedRandomSampler (in loader) + pos_weight
+#   Imbalance handling : offline stratified downsampling (1:4) + pos_weight=1.0
 # -----------------------------------------------------------------------------
 
 
