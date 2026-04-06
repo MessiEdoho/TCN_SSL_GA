@@ -447,8 +447,8 @@ def plot_figures(study, best_val_f1, logger):
     """Generate and save two tuning visualisation figures.
 
     Saves:
-        outputs/figures/multiscale_f1_history.png
-        outputs/figures/multiscale_importance.png
+        {FIGURE_DIR}/multiscale_f1_history.png
+        {FIGURE_DIR}/multiscale_importance.png
 
     Parameters
     ----------
