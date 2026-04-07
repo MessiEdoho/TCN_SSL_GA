@@ -4,6 +4,8 @@ tune_multiscale_attention.py
 Tunes temporal attention hyperparameters of
 MultiScaleTCNWithAttention using Optuna TPE.
 
+Tuning protocol: N_TRIALS=40, MAX_EPOCHS=20, ES_PATIENCE=5.
+
 The MultiScaleTCN backbone parameters are transferred
 from outputs/best_multiscale_params.json and frozen.
 Only the temporal attention module and classification
@@ -95,8 +97,8 @@ from tcn_utils import (
 # Constants
 # ---------------------------------------------------------------------------
 SEED              = 42                                 # global reproducibility seed
-MAX_EPOCHS        = 100                                # max training epochs per trial
-ES_PATIENCE       = 10                                 # early stopping patience (epochs)
+MAX_EPOCHS        = 20                                 # max epochs per trial (ES fires before 20)
+ES_PATIENCE       = 5                                  # early stopping patience (epochs)
 N_TRIALS          = 40                                 # total Optuna trials
 N_STARTUP         = 12                                 # random startup before TPE
 FS                = 500                                # EEG sampling rate (Hz)

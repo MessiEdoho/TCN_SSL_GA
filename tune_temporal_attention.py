@@ -4,6 +4,8 @@ tune_temporal_attention.py
 Tunes the temporal attention hyperparameters of
 TCNWithAttention from tcn_utils.py using Optuna.
 
+Tuning protocol: N_TRIALS=40, MAX_EPOCHS=20, ES_PATIENCE=5.
+
 The TCN backbone is frozen. Only temporal attention
 parameters (TemporalAttention scorer, LayerNorm, and
 classification head) receive gradient updates during
@@ -92,8 +94,8 @@ from tcn_utils import (
 # Constants
 # ---------------------------------------------------------------------------
 SEED            = 42                                   # global reproducibility seed
-MAX_EPOCHS      = 100                                  # max training epochs per trial
-ES_PATIENCE     = 10                                   # early stopping patience (epochs)
+MAX_EPOCHS      = 20                                   # max epochs per trial (ES fires before 20)
+ES_PATIENCE     = 5                                    # early stopping patience (epochs)
 N_TRIALS        = 40                                   # total Optuna trials
 N_STARTUP       = 12                                   # random startup trials before TPE kicks in
 FS              = 500                                  # EEG sampling rate (Hz)

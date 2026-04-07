@@ -4,6 +4,8 @@ tune_multiscale_tcn.py
 Tunes all hyperparameters of MultiScaleTCN from
 scratch using Optuna TPE.
 
+Tuning protocol: N_TRIALS=40, MAX_EPOCHS=20, ES_PATIENCE=5.
+
 No parameters are transferred from the single-branch
 TCN tuning (best_params.json is not loaded here).
 Independent tuning ensures MultiScaleTCN is assessed
@@ -86,9 +88,9 @@ from tcn_utils import (
 # Constants
 # ---------------------------------------------------------------------------
 SEED              = 42                                 # global reproducibility seed
-MAX_EPOCHS        = 100                                # max training epochs per trial
-ES_PATIENCE       = 10                                 # early stopping patience (epochs)
-N_TRIALS          = 50                                 # total Optuna trials
+MAX_EPOCHS        = 20                                 # max epochs per trial (ES fires before 20)
+ES_PATIENCE       = 5                                  # early stopping patience (epochs)
+N_TRIALS          = 40                                 # total Optuna trials
 N_STARTUP         = 15                                 # random startup before TPE
 FS                = 500                                # EEG sampling rate (Hz)
 SEGMENT_LEN       = 2500                               # samples per segment (5 s at 500 Hz)

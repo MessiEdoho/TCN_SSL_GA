@@ -1,3 +1,18 @@
+"""
+tcn_HPT_binary.py -- TCN hyperparameter tuning via Optuna TPE.
+
+Tuning protocol
+---------------
+N_TRIALS    = 40   total Optuna trials
+MAX_EPOCHS  = 20   max epochs per trial (cosine annealing half-cycle)
+ES_PATIENCE = 5    early stopping patience (epochs without val F1 improvement)
+
+Early stopping at patience=5 within a 20-epoch budget means most trials
+terminate between epochs 8-15. The reduced budget accelerates the search
+while retaining enough epochs for the cosine schedule to differentiate
+good from bad hyperparameter configurations.
+"""
+
 # -- Section 2: Install dependencies (skip if already installed) ---------------
 # !pip install torch optuna numpy scikit-learn matplotlib seaborn  # uncomment if needed
 # -*- coding: utf-8 -*-
@@ -68,13 +83,13 @@ FS            = 500    # sampling rate in Hz
 SEGMENT_LEN   = 2500   # samples per segment: 5 s * 500 Hz
 
 # -- Training protocol ---------------------------------------------------------
-MAX_EPOCHS    = 100    # maximum epochs per trial before early stopping
-ES_PATIENCE   = 10     # early stopping patience: epochs without val F1 improvement
+MAX_EPOCHS    = 20     # maximum epochs per trial (early stopping typically fires before 20)
+ES_PATIENCE   = 5      # early stopping patience: epochs without val F1 improvement
 GRAD_CLIP     = 1.0    # maximum gradient norm for gradient clipping
 SEED          = 42     # random seed for reproducibility
 
 # -- Optuna configuration ------------------------------------------------------
-N_TRIALS      = 60     # total number of Optuna trials
+N_TRIALS      = 40     # total number of Optuna trials
 N_STARTUP     = 15     # random exploration trials before TPE kicks in
 STUDY_NAME    = "tcn_HPT_binary_optuna"  # Optuna study name
 
