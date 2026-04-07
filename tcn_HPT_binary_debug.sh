@@ -17,7 +17,7 @@ echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || ec
 
 module purge
 module load anaconda3
-conda activate uniqureSSLGA
+conda activate torch_v100_py310
 
 cd ~/TCN_SSL_GA
 
