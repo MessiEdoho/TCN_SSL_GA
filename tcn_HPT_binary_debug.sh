@@ -2,7 +2,7 @@
 #SBATCH --job-name=tcn_debug
 #SBATCH -N 1
 #SBATCH --ntasks-per-node 10
-#SBATCH --partition=gpu
+#SBATCH --partition=csgpu
 #SBATCH --gres=gpu:1
 # One trial only -- 3 hours should be more than enough
 #SBATCH -t 5-00:00:00
