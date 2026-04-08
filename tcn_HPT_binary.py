@@ -104,8 +104,17 @@ ch.setFormatter(logging.Formatter("%(asctime)s | %(message)s"))  # same format
 log.addHandler(fh)                    # attach file handler
 log.addHandler(ch)                    # attach console handler
 
-log.info(f"Configuration loaded. Device: {DEVICE}")
-log.info(f"Output directory: {OUTPUT_DIR.resolve()}")
+log.info("=" * 60)
+log.info("tcn_HPT_binary.py")
+log.info("Timestamp       : %s", datetime.now().isoformat())
+log.info("Ablation role   : M1 -- TCN baseline")
+log.info("Params source   : Optuna TPE search (this script)")
+log.info("Purpose         : Hyperparameter tuning (no final model)")
+log.info("N_TRIALS        : %d", N_TRIALS)
+log.info("MAX_EPOCHS      : %d", MAX_EPOCHS)
+log.info("ES_PATIENCE     : %d", ES_PATIENCE)
+log.info("Test set        : NOT loaded")
+log.info("=" * 60)
 if torch.cuda.is_available():
     log.info("GPU  : %s", torch.cuda.get_device_name(0))
     log.info("VRAM : %.2f GB", torch.cuda.get_device_properties(0).total_memory / 1e9)
@@ -114,6 +123,7 @@ else:
     log.info("Device: CPU")
 log.info("PyTorch: %s", torch.__version__)
 log.info("Optuna : %s", optuna.__version__)
+log.info("Output directory: %s", OUTPUT_DIR.resolve())
 # -- Section 5: Dataset and DataLoader -----------------------------------------
 # Load train/val file-label pairs from data_splits.json (single source of truth).
 # All pipeline scripts and this notebook use the same JSON to guarantee consistent

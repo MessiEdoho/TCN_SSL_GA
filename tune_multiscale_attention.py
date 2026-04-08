@@ -688,9 +688,14 @@ def main():
     logger = setup_logging()
     logger.info("=" * 60)
     logger.info("tune_multiscale_attention.py")
-    logger.info("Timestamp: %s", datetime.datetime.now().isoformat())
-    logger.info("Tuning: temporal attention only (backbone FROZEN)")
-    logger.info("No final model trained in this script")
+    logger.info("Timestamp       : %s", datetime.datetime.now().isoformat())
+    logger.info("Ablation role   : M4 -- Multi-Scale TCN + Temporal Attention")
+    logger.info("Params source   : best_multiscale_params.json (backbone, frozen)")
+    logger.info("Purpose         : Tune attention HPs (no final model)")
+    logger.info("N_TRIALS        : %d", N_TRIALS)
+    logger.info("MAX_EPOCHS      : %d", MAX_EPOCHS)
+    logger.info("ES_PATIENCE     : %d", ES_PATIENCE)
+    logger.info("Test set        : NOT loaded")
     logger.info("=" * 60)
 
     set_seed(SEED)
@@ -698,8 +703,7 @@ def main():
 
     if torch.cuda.is_available():
         logger.info("GPU  : %s", torch.cuda.get_device_name(0))
-        vram = torch.cuda.get_device_properties(0).total_memory / 1e9
-        logger.info("VRAM : %.2f GB", vram)
+        logger.info("VRAM : %.2f GB", torch.cuda.get_device_properties(0).total_memory / 1e9)
         logger.info("CUDA : %s", torch.version.cuda)
     else:
         logger.info("Device: CPU")

@@ -1174,23 +1174,23 @@ def main():
     """
     # -- Step 1: Logging and setup ---------------------------------------------
     logger = setup_logging()
-    logger.info("=" * 65)
-    logger.info("MultiScaleTCN.py -- Multi-Scale TCN Training")
-    logger.info("Model 3 in ablation study")
-    logger.info("Architecture: three parallel CausalConvBlock branches")
-    logger.info("Timestamp: %s", datetime.datetime.now().isoformat())
-    logger.info("MAX_EPOCHS : %d", MAX_EPOCHS)
-    logger.info("ES_PATIENCE: %d", ES_PATIENCE)
-    logger.info("Test set : NOT loaded in this script")
-    logger.info("=" * 65)
+    logger.info("=" * 60)
+    logger.info("MultiScaleTCN.py")
+    logger.info("Timestamp       : %s", datetime.datetime.now().isoformat())
+    logger.info("Ablation role   : M3 -- Multi-Scale TCN")
+    logger.info("Params source   : best_multiscale_params.json")
+    logger.info("Purpose         : Final model training")
+    logger.info("MAX_EPOCHS      : %d", MAX_EPOCHS)
+    logger.info("ES_PATIENCE     : %d", ES_PATIENCE)
+    logger.info("Test set        : NOT loaded")
+    logger.info("=" * 60)
 
     set_seed(SEED)
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if torch.cuda.is_available():
-        logger.info("GPU : %s", torch.cuda.get_device_name(0))
-        vram = torch.cuda.get_device_properties(0).total_memory / 1e9
-        logger.info("VRAM: %.2f GB", vram)
-        logger.info("CUDA: %s", torch.version.cuda)
+        logger.info("GPU  : %s", torch.cuda.get_device_name(0))
+        logger.info("VRAM : %.2f GB", torch.cuda.get_device_properties(0).total_memory / 1e9)
+        logger.info("CUDA : %s", torch.version.cuda)
     else:
         logger.info("Device: CPU")
     logger.info("PyTorch: %s", torch.__version__)

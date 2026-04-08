@@ -1154,28 +1154,26 @@ def main():
     """
     # -- Step 1: Logging and setup ---------------------------------------------
     logger = setup_logging()
-    logger.info("=" * 65)
-    logger.info("TCNTemporalAttention.py -- TCN with Temporal Attention Training")
-    logger.info("Timestamp: %s", datetime.datetime.now().isoformat())
-    logger.info("MAX_EPOCHS  : %d", MAX_EPOCHS)
-    logger.info("ES_PATIENCE : %d", ES_PATIENCE)
-    logger.info("Backbone params : best_params.json")
-    logger.info("Attention params: best_attention_params.json")
-    logger.info("Training mode   : ALL params joint (backbone + attention unfrozen)")
+    logger.info("=" * 60)
+    logger.info("TCNTemporalAttention.py")
+    logger.info("Timestamp       : %s", datetime.datetime.now().isoformat())
     logger.info("Ablation role   : M2 -- TCN + Temporal Attention")
-    logger.info("Test set        : NOT loaded in this script")
-    logger.info("=" * 65)
+    logger.info("Params source   : best_params.json + best_attention_params.json")
+    logger.info("Purpose         : Final model training (all params joint)")
+    logger.info("MAX_EPOCHS      : %d", MAX_EPOCHS)
+    logger.info("ES_PATIENCE     : %d", ES_PATIENCE)
+    logger.info("Test set        : NOT loaded")
+    logger.info("=" * 60)
 
-    set_seed(SEED)                                     # fix all RNG seeds for reproducibility
-    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # auto-detect GPU
-    if torch.cuda.is_available():                      # log GPU details for reproducibility audit
-        logger.info("GPU : %s", torch.cuda.get_device_name(0))
-        vram = torch.cuda.get_device_properties(0).total_memory / 1e9  # total VRAM in GB
-        logger.info("VRAM: %.2f GB", vram)
-        logger.info("CUDA: %s", torch.version.cuda)
+    set_seed(SEED)
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        logger.info("GPU  : %s", torch.cuda.get_device_name(0))
+        logger.info("VRAM : %.2f GB", torch.cuda.get_device_properties(0).total_memory / 1e9)
+        logger.info("CUDA : %s", torch.version.cuda)
     else:
-        logger.info("Device: CPU")                     # warn: training on CPU will be slow
-    logger.info("PyTorch: %s", torch.__version__)      # log framework version for reproducibility
+        logger.info("Device: CPU")
+    logger.info("PyTorch: %s", torch.__version__)
 
     # -- Step 2: Load both parameter files -------------------------------------
     backbone_config, backbone_hp, attn_config, attn_hp = load_best_params(logger)
