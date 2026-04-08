@@ -1218,7 +1218,7 @@ def train_one_epoch(model, loader, optimiser, criterion, device,
     use_amp = scaler is not None                   # True when GradScaler was created (CUDA only)
 
     for x, y in loader:
-        x, y = x.to(device), y.to(device)
+        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         optimiser.zero_grad()
 
         # autocast: forward pass and loss in FP16 on CUDA (FP32 fallback on CPU
@@ -1304,7 +1304,7 @@ def evaluate(model, loader, device, use_amp=False):
     all_pred = []
 
     for x, y in loader:
-        x = x.to(device)
+        x = x.to(device, non_blocking=True)
         # autocast during inference: FP16 forward for speed, no GradScaler
         # needed because no backward pass occurs under @torch.no_grad().
         with torch.amp.autocast("cuda", enabled=use_amp):

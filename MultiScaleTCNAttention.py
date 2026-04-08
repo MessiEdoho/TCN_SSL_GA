@@ -1,28 +1,33 @@
 """
-TCNTemporalAttention.py
-=======================
-Training script for Model 2: TCN with Temporal Attention.
+MultiScaleTCNAttention.py
+=========================
+Training script for Model 4: Multi-Scale TCN with Temporal Attention.
 
-Mirrors TCN.py in structure. Adapted for the
-TCNWithAttention architecture from tcn_utils.py.
+Mirrors TCNTemporalAttention.py in structure. Adapted for the
+MultiScaleTCNWithAttention architecture from tcn_utils.py.
 
 Trains for exactly 100 epochs with early stopping
 on validation macro F1 (patience 10). ALL parameters
 (backbone and attention) are trained jointly.
 
 Hyperparameters loaded from TWO sources:
-  outputs/best_params.json
-    -> TCN backbone: num_layers, kernel_size,
-                    num_filters, dropout
-  outputs/best_attention_params.json
+  best_multiscale_params.json
+    -> MultiScaleTCN backbone: num_filters, kernel_size,
+                               dropout, fusion
+    -> Branch dilations: branch1, branch2, branch3
+  best_multiscale_attn_params.json
     -> Attention : attention_dim, attention_dropout
     -> Training  : learning_rate, weight_decay, batch_size
-    -> Also contains tcn_hyperparameters for validation
+    -> Also contains backbone_hyperparameters for validation
 
-Architecture note: TCNWithAttention uses a two-layer additive
-temporal attention (tanh + linear scorer) with tunable
-attention_dim and attention_dropout, matching
-MultiScaleTCNWithAttention for consistent ablation.
+Architecture: MultiScaleTCNWithAttention (tcn_utils.py)
+  Backbone: three parallel CausalConvBlock branches
+    Branch 1: dilations [1, 2, 4]   -- fine scale
+    Branch 2: dilations [2, 4, 8]   -- medium scale
+    Branch 3: dilations [4, 8, 16]  -- coarse scale
+  Attention: two-layer additive temporal attention
+    (tanh + linear scorer) with tunable attention_dim
+    and attention_dropout.
 
 Three evaluation rows:
   Row 1: raw predictions at threshold 0.5
@@ -34,159 +39,146 @@ It is reserved for final_evaluation.py.
 
 Ablation position
 -----------------
-M1 (TCN.py) vs M2 (this script):
+M3 (MultiScaleTCN.py) vs M4 (this script):
   Isolates the contribution of temporal attention
-  over the single-branch TCN baseline.
+  over the multi-scale TCN baseline.
   Both models share identical backbone architecture.
 
 Pipeline position
 -----------------
-After  : tune_temporal_attention.py
+After  : tune_multiscale_attention.py
 Before : final_evaluation.py
 
 Usage
 -----
-python TCNTemporalAttention.py
+python MultiScaleTCNAttention.py
 
 Key outputs
 -----------
-outputs/TCNAttention/tcn_attention_final_weights.pt
-outputs/TCNAttention/tcn_attention_evaluation_report.json
-outputs/TCNAttention/tcn_attention_three_row_summary.csv
-outputs/TCNAttention/figures/  (13 figures)
+{OUTPUT_ROOT}/ms_attn_final_weights.pt
+{OUTPUT_ROOT}/ms_attn_evaluation_report.json
+{OUTPUT_ROOT}/ms_attn_three_row_summary.csv
+{OUTPUT_ROOT}/figures/  (13 figures)
 """
 
 # ---------------------------------------------------------------------------
 # Imports
 # ---------------------------------------------------------------------------
-import json                          # read/write JSON config and result files
-import logging                       # structured logging to file and stdout
-import sys                           # stdout handle for StreamHandler
-import csv                           # write epoch metrics and three-row summary CSVs
-import time                          # per-epoch train/val timing
-import datetime                      # ISO timestamps for JSON records and elapsed time
-import shutil                        # reserved for potential file copy operations
-from pathlib import Path             # cross-platform path handling throughout the script
+import json
+import logging
+import sys
+import csv
+import time
+import datetime
+import shutil
+from pathlib import Path
 
-import numpy as np                   # array operations for metrics, predictions, attention weights
-import torch                         # deep learning framework (model, tensors, GPU)
-import torch.nn as nn                # neural network modules (BCEWithLogitsLoss)
+import numpy as np
+import torch
+import torch.nn as nn
 
-import matplotlib                    # plotting backend configuration
-matplotlib.use("Agg")               # non-interactive backend -- must be set before importing pyplot
-import matplotlib.pyplot as plt      # figure creation and saving for all 13 plots
-import seaborn as sns                # heatmap rendering for confusion matrix figures
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import seaborn as sns
 
-from sklearn.metrics import (        # scikit-learn metrics for comprehensive evaluation
-    accuracy_score,                  # (TP+TN) / total
-    precision_score,                 # TP / (TP+FP) -- positive predictive value
-    recall_score,                    # TP / (TP+FN) -- sensitivity
-    f1_score,                        # harmonic mean of precision and recall
-    roc_auc_score,                   # area under ROC curve (threshold-invariant)
-    confusion_matrix,                # 2x2 matrix: TN, FP, FN, TP
-    roc_curve,                       # FPR vs TPR arrays for ROC plot
-    precision_recall_curve,          # precision vs recall arrays for PR plot
-    average_precision_score,         # area under PR curve (summary statistic)
-    classification_report,           # per-class precision, recall, F1 as dict
-    calibration_curve,               # reliability diagram: predicted prob vs true fraction
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score,
+    f1_score, roc_auc_score, confusion_matrix,
+    roc_curve, precision_recall_curve,
+    average_precision_score,
+    classification_report, calibration_curve,
 )
 
-# tcn_utils imports -- exact names confirmed from reading tcn_utils.py.
-# run_training() exists but is not used here; an explicit training loop
-# provides full control over checkpointing, logging, and per-epoch CSV output.
 from tcn_utils import (
-    set_seed,                        # fix Python/NumPy/PyTorch seeds for reproducibility
-    TCNWithAttention,                # M2 architecture: TCN backbone + two-layer additive attention
-    make_loader,                     # build DataLoader (sequential for val, shuffled for train)
-    filter_unpaired_subjects,        # remove subjects with no ictal segments
-    downsample_non_ictal,            # offline stratified downsampling to 1:4 ratio
-    filter_extreme_segments,         # remove segments with catastrophic amplitudes
-    train_one_epoch,                 # one epoch: forward + loss + backward + gradient clip + step
-    count_parameters,                # sum of requires_grad=True parameter elements
-    segment_predictions_to_events,   # post-processing: smooth -> merge -> min-duration filter
-    compute_event_level_far,         # event-level false alarm rate per hour
-    find_optimal_threshold,          # sweep thresholds 0.1-0.9 maximising Youden J
+    set_seed,
+    MultiScaleTCNWithAttention,
+    make_loader,
+    filter_unpaired_subjects,
+    downsample_non_ictal,
+    filter_extreme_segments,
+    train_one_epoch,
+    count_parameters,
+    segment_predictions_to_events,
+    compute_event_level_far,
+    find_optimal_threshold,
 )
 
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-SEED              = 42                                 # global seed (Python, NumPy, PyTorch CPU+CUDA)
-# 100 epochs lets cosine annealing complete a full half-cycle. Early stopping
-# (patience=10) terminates well before 100 if converged.
-MAX_EPOCHS        = 100                                # max training epochs (upper bound)
-ES_PATIENCE       = 10                                 # epochs without val F1 improvement before stopping
-CHECKPOINT_FREQ   = 5                                  # save periodic checkpoint every N epochs
-KEEP_CKPTS        = 3                                  # disk-space cap: keep only 3 most recent periodic ckpts
-FS                = 500                                # native EDF sampling rate (Hz)
-SEGMENT_LEN       = 2500                               # samples per segment: 5 s * 500 Hz
-SEGMENT_SEC       = 5.0                                # segment duration in seconds
-STEP_SEC          = 2.5                                # step between segment starts: 50% overlap
-MIN_EVENT_SEC     = 10.0                               # discard events shorter than this (seconds)
-REFRACTORY_SEC    = 30.0                               # merge events separated by fewer than this (seconds)
-SMOOTHING_WIN     = 3                                  # segments in probability smoothing kernel
-MODEL_NAME        = "TCNWithTemporalAttention"         # model identifier for filenames and JSON
+SEED              = 42
+MAX_EPOCHS        = 100
+ES_PATIENCE       = 10
+CHECKPOINT_FREQ   = 5
+KEEP_CKPTS        = 3
+FS                = 500
+SEGMENT_LEN       = 2500
+SEGMENT_SEC       = 5.0
+STEP_SEC          = 2.5
+MIN_EVENT_SEC     = 10.0
+REFRACTORY_SEC    = 30.0
+SMOOTHING_WIN     = 3
+MODEL_NAME        = "MultiScaleTCNWithAttention"
 
-OUTPUT_ROOT       = Path("/home/people/22206468/scratch/OUTPUT/MODEL2_OUTPUT") / "TCNAttention"             # all M2 outputs here
-CKPT_DIR          = OUTPUT_ROOT / "checkpoints"                  # periodic and best checkpoints
-LOG_DIR           = OUTPUT_ROOT / "logs"                         # training log
-FIGURE_DIR        = OUTPUT_ROOT / "figures"                      # all 13 figures
-WEIGHTS_PATH      = OUTPUT_ROOT / "tcn_attention_final_weights.pt"
-TRAIN_LOG_PATH    = OUTPUT_ROOT / "tcn_attention_training_log.json"
-EVAL_REPORT_PATH  = OUTPUT_ROOT / "tcn_attention_evaluation_report.json"
-THRESH_PATH       = OUTPUT_ROOT / "tcn_attention_optimal_threshold.json"
-EPOCH_CSV         = OUTPUT_ROOT / "tcn_attention_epoch_metrics.csv"
-THREE_ROW_CSV     = OUTPUT_ROOT / "tcn_attention_three_row_summary.csv"
+OUTPUT_ROOT       = Path("/home/people/22206468/scratch/OUTPUT/MODEL4_OUTPUT") / "MultiScaleTCNAttention"
+CKPT_DIR          = OUTPUT_ROOT / "checkpoints"
+LOG_DIR           = OUTPUT_ROOT / "logs"
+FIGURE_DIR        = OUTPUT_ROOT / "figures"
+WEIGHTS_PATH      = OUTPUT_ROOT / "ms_attn_final_weights.pt"
+TRAIN_LOG_PATH    = OUTPUT_ROOT / "ms_attn_training_log.json"
+EVAL_REPORT_PATH  = OUTPUT_ROOT / "ms_attn_evaluation_report.json"
+THRESH_PATH       = OUTPUT_ROOT / "ms_attn_optimal_threshold.json"
+EPOCH_CSV         = OUTPUT_ROOT / "ms_attn_epoch_metrics.csv"
+THREE_ROW_CSV     = OUTPUT_ROOT / "ms_attn_three_row_summary.csv"
 
 # Two JSON input files -- backbone and attention tuning results
-BACKBONE_PARAMS_PATH = Path("/home/people/22206468/scratch/OUTPUT/MODEL1_OUTPUT/TCNtuning_outputs") / "best_params.json"            # from tcn_HPT_binary.ipynb
-ATTN_PARAMS_PATH     = Path("/home/people/22206468/scratch/OUTPUT/MODEL2_OUTPUT") / "best_attention_params.json"  # from tune_temporal_attention.py
+BACKBONE_PARAMS_PATH = Path("/home/people/22206468/scratch/OUTPUT/MODEL3_OUTPUT/MultiScaleTCNtuning_outputs") / "best_multiscale_params.json"
+ATTN_PARAMS_PATH     = Path("/home/people/22206468/scratch/OUTPUT/MODEL4_OUTPUT") / "best_multiscale_attn_params.json"
 
 # data_splits.json -- single source of truth (matches all other pipeline scripts)
 SPLITS_PATH = Path("/scratch/22206468/INPUT_DATA/data_splits_outputs/data_splits.json")
 
-# Backbone attribute prefix in TCNWithAttention (confirmed: self.tcn)
-BACKBONE_ATTR = "tcn"                                  # for parameter counting
+# Backbone attribute prefix in MultiScaleTCNWithAttention (confirmed: self.backbone)
+BACKBONE_ATTR = "backbone"
+
+# Fallback dilation schedules if branch_dilations not in JSON
+DEFAULT_BRANCH1 = [1, 2, 4]
+DEFAULT_BRANCH2 = [2, 4, 8]
+DEFAULT_BRANCH3 = [4, 8, 16]
 
 
 # ---------------------------------------------------------------------------
 # setup_logging
 # ---------------------------------------------------------------------------
 def setup_logging():
-    """Create all output directories and configure the logger.
+    """Create all output directories and configure the logger."""
+    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+    CKPT_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    FIGURE_DIR.mkdir(parents=True, exist_ok=True)
 
-    Mirror of TCN.py setup_logging() -- logger name and log file adapted.
+    log_file = LOG_DIR / "MultiScaleTCNAttention_training.log"
+    logger = logging.getLogger("MSAttention_training")
+    logger.setLevel(logging.DEBUG)
+    logger.handlers.clear()
 
-    Returns
-    -------
-    logger : logging.Logger
-    """
-    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)   # create outputs/TCNAttention/ if absent
-    CKPT_DIR.mkdir(parents=True, exist_ok=True)     # create checkpoints/ subdirectory
-    LOG_DIR.mkdir(parents=True, exist_ok=True)      # create logs/ subdirectory
-    FIGURE_DIR.mkdir(parents=True, exist_ok=True)   # create figures/ subdirectory
-
-    log_file = LOG_DIR / "TCNTemporalAttention_training.log"  # full DEBUG-level log on disk
-    logger = logging.getLogger("TCNAttention_training")       # named logger avoids root conflicts
-    logger.setLevel(logging.DEBUG)                  # capture all severity levels
-    logger.handlers.clear()                         # prevent duplicate handlers on re-import or resume
-
-    fmt = logging.Formatter(                        # timestamp | level | message format
+    fmt = logging.Formatter(
         "%(asctime)s | %(levelname)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S")               # human-readable date without microseconds
+        datefmt="%Y-%m-%d %H:%M:%S")
 
-    fh = logging.FileHandler(log_file, mode="a", encoding="utf-8")  # append to preserve logs on resume
-    fh.setLevel(logging.DEBUG)                      # file gets everything including debug
-    fh.setFormatter(fmt)                            # apply the same format to file
+    fh = logging.FileHandler(log_file, mode="a", encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(fmt)
 
-    sh = logging.StreamHandler(sys.stdout)          # console output for real-time monitoring
-    sh.setLevel(logging.INFO)                       # console gets INFO+ (skip debug noise)
-    sh.setFormatter(fmt)                            # same format as file for consistency
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setLevel(logging.INFO)
+    sh.setFormatter(fmt)
 
-    logger.addHandler(fh)                           # attach file handler to logger
-    logger.addHandler(sh)                           # attach console handler to logger
-    return logger                                   # caller stores this for all subsequent logging
+    logger.addHandler(fh)
+    logger.addHandler(sh)
+    return logger
 
 
 # ---------------------------------------------------------------------------
@@ -195,58 +187,60 @@ def setup_logging():
 def load_best_params(logger):
     """Load hyperparameters from two JSON files.
 
-    DIFFERENCE FROM TCN.py: loads from two files instead of one.
+    1. best_multiscale_params.json
+       MultiScaleTCN backbone: num_filters, kernel_size, dropout, fusion.
+       Branch dilations: branch1, branch2, branch3.
 
-    1. outputs/best_params.json
-       TCN backbone: num_layers, kernel_size, num_filters, dropout.
-
-    2. outputs/best_attention_params.json
-       Training HPs tuned on frozen backbone: learning_rate, weight_decay,
-       batch_size, max_grad_norm.
-       Also contains 'tcn_hyperparameters' for cross-validation.
-
-    Note: TCNWithAttention uses two-layer additive attention with tunable
-    attention_dim and attention_dropout from best_attention_params.json.
+    2. best_multiscale_attn_params.json
+       Attention: attention_dim, attention_dropout.
+       Training: learning_rate, weight_decay, batch_size.
 
     Returns
     -------
-    tuple of (backbone_config, backbone_hp, attn_config, attn_hp)
+    tuple of (backbone_config, backbone_hp, branch_dilations, attn_config, attn_hp)
     """
-    # -- Load backbone params (source 1: best_params.json) ----------------------
-    if not BACKBONE_PARAMS_PATH.exists():              # fail fast if prerequisite missing
-        logger.error("best_params.json not found at %s. "
-                     "Run tcn_HPT_binary.ipynb first.", BACKBONE_PARAMS_PATH)
+    # -- Load backbone params --------------------------------------------------
+    if not BACKBONE_PARAMS_PATH.exists():
+        logger.error("best_multiscale_params.json not found at %s. "
+                     "Run tune_multiscale_tcn.py first.", BACKBONE_PARAMS_PATH)
         raise FileNotFoundError(str(BACKBONE_PARAMS_PATH))
 
-    with open(BACKBONE_PARAMS_PATH, "r", encoding="utf-8") as f:  # read full JSON config
+    with open(BACKBONE_PARAMS_PATH, "r", encoding="utf-8") as f:
         backbone_config = json.load(f)
-    if "hyperparameters" not in backbone_config:       # validate expected schema
+    if "hyperparameters" not in backbone_config:
         logger.error("'hyperparameters' key missing from %s.", BACKBONE_PARAMS_PATH)
         raise KeyError("hyperparameters")
-    backbone_hp = backbone_config["hyperparameters"]   # extract backbone HP sub-dict
+    backbone_hp = backbone_config["hyperparameters"]
 
-    # -- Load attention tuning params (source 2: best_attention_params.json) ---
-    if not ATTN_PARAMS_PATH.exists():                  # fail fast if prerequisite missing
-        logger.error("best_attention_params.json not found at %s. "
-                     "Run tune_temporal_attention.py first.", ATTN_PARAMS_PATH)
+    # Extract branch dilations from JSON or fall back to constants
+    branch_dilations = backbone_config.get("branch_dilations", None)
+    if branch_dilations is None:
+        logger.warning("branch_dilations not found in JSON. Using defaults.")
+        branch_dilations = {
+            "branch1": DEFAULT_BRANCH1,
+            "branch2": DEFAULT_BRANCH2,
+            "branch3": DEFAULT_BRANCH3,
+        }
+
+    # -- Load attention tuning params ------------------------------------------
+    if not ATTN_PARAMS_PATH.exists():
+        logger.error("best_multiscale_attn_params.json not found at %s. "
+                     "Run tune_multiscale_attention.py first.", ATTN_PARAMS_PATH)
         raise FileNotFoundError(str(ATTN_PARAMS_PATH))
 
-    with open(ATTN_PARAMS_PATH, "r", encoding="utf-8") as f:  # read full JSON config
+    with open(ATTN_PARAMS_PATH, "r", encoding="utf-8") as f:
         attn_config = json.load(f)
-    if "hyperparameters" not in attn_config:           # validate expected schema
+    if "hyperparameters" not in attn_config:
         logger.error("'hyperparameters' key missing from %s.", ATTN_PARAMS_PATH)
         raise KeyError("hyperparameters")
-    attn_hp = attn_config["hyperparameters"]           # extract attention HP sub-dict
+    attn_hp = attn_config["hyperparameters"]
 
     # -- Consistency check: backbone in attention JSON must match backbone JSON -
-    # tune_temporal_attention.py saves the backbone it used under "tcn_hyperparameters".
-    # If these differ from best_params.json, the attention was tuned on a different
-    # backbone, which invalidates the M1-vs-M2 ablation.
-    saved_bb = attn_config.get("tcn_hyperparameters", None)  # may be absent in old runs
+    saved_bb = attn_config.get("backbone_hyperparameters", None)
     if saved_bb is not None:
-        for key in ["num_layers", "kernel_size", "num_filters", "dropout"]:
+        for key in ["num_filters", "kernel_size", "dropout", "fusion"]:
             if key in saved_bb and key in backbone_hp:
-                if saved_bb[key] != backbone_hp[key]:  # mismatch detected
+                if saved_bb[key] != backbone_hp[key]:
                     logger.warning(
                         "Backbone param mismatch: %s = %s in attention JSON vs %s in backbone JSON. "
                         "Attention was tuned on a different backbone. Proceeding with backbone JSON.",
@@ -254,19 +248,21 @@ def load_best_params(logger):
 
     # -- Log backbone hyperparameters ------------------------------------------
     logger.info("-" * 55)
-    logger.info("TCN backbone hyperparameters (from best_params.json):")
+    logger.info("MultiScaleTCN backbone hyperparameters:")
     for k, v in backbone_hp.items():
         logger.info("  %-20s: %s", k, v)
+    for bname, dils in branch_dilations.items():
+        logger.info("  %-20s: %s", bname, dils)
 
-    # RF = 2 * (2^L - 1) * (k - 1) + 1
-    rf = 2 * (2 ** int(backbone_hp["num_layers"]) - 1) * (int(backbone_hp["kernel_size"]) - 1) + 1
-    logger.info("  Receptive field : %d samples (%.3f s at %d Hz)", rf, rf / FS, FS)
-    if rf < FS:
-        logger.warning("RF %d < %d -- below 1 second. Verify backbone configuration.", rf, FS)
+    # Per-branch receptive field: RF = 1 + 2 * sum((k-1)*d for d in dilations)
+    ks = int(backbone_hp["kernel_size"])
+    for bname, dils in branch_dilations.items():
+        rf = 1 + 2 * sum((ks - 1) * d for d in dils)
+        logger.info("  %s RF: %d samples (%.3f s at %d Hz)", bname, rf, rf / FS, FS)
 
     # -- Log attention/training hyperparameters --------------------------------
     logger.info("-" * 55)
-    logger.info("Training hyperparameters (from best_attention_params.json):")
+    logger.info("Attention/training hyperparameters:")
     for k, v in attn_hp.items():
         logger.info("  %-20s: %s", k, v)
 
@@ -278,7 +274,7 @@ def load_best_params(logger):
     logger.info("Attention tuning best val F1: %s", attn_best_f1)
     logger.info("-" * 55)
 
-    return backbone_config, backbone_hp, attn_config, attn_hp
+    return backbone_config, backbone_hp, branch_dilations, attn_config, attn_hp
 
 
 # ---------------------------------------------------------------------------
@@ -287,11 +283,7 @@ def load_best_params(logger):
 def load_splits(logger):
     """Load train and val file-label pairs from data_splits.json.
 
-    Mirror of TCN.py load_splits() -- no differences. Never loads test pairs.
-
-    Returns
-    -------
-    tuple of (train_pairs, val_pairs)
+    Never loads test pairs. Returns (train_pairs, val_pairs).
     """
     if not SPLITS_PATH.exists():
         logger.error("data_splits.json not found at %s. "
@@ -299,50 +291,43 @@ def load_splits(logger):
         raise FileNotFoundError(str(SPLITS_PATH))
 
     logger.info("Loading splits from: %s", SPLITS_PATH)
-    with open(SPLITS_PATH, "r", encoding="utf-8") as f:  # read full JSON
+    with open(SPLITS_PATH, "r", encoding="utf-8") as f:
         splits = json.load(f)
 
-    # Convert list-of-dicts to list-of-tuples for make_loader() compatibility
-    train_pairs = [(rec["filepath"], rec["label"]) for rec in splits["train"]]  # (path, 0/1)
-    val_pairs = [(rec["filepath"], rec["label"]) for rec in splits["val"]]      # (path, 0/1)
+    train_pairs = [(rec["filepath"], rec["label"]) for rec in splits["train"]]
+    val_pairs = [(rec["filepath"], rec["label"]) for rec in splits["val"]]
 
-    if not train_pairs:                                # guard against empty partitions
+    if not train_pairs:
         logger.error("Train partition is empty.")
         raise RuntimeError("Empty train partition")
-    if not val_pairs:                                  # guard against empty partitions
+    if not val_pairs:
         logger.error("Val partition is empty.")
         raise RuntimeError("Empty val partition")
 
-    # Log class composition for each partition
     for name, pairs in [("TRAIN", train_pairs), ("VAL", val_pairs)]:
-        n_total = len(pairs)                           # total segment count
-        n_sz = sum(1 for _, l in pairs if l == 1)      # ictal (seizure) segment count
-        n_nsz = n_total - n_sz                         # non-ictal segment count
-        pct = n_sz / n_total * 100 if n_total > 0 else 0.0  # ictal prevalence percentage
-        mouse_ids = sorted({Path(fp).stem.split("_")[0] for fp, _ in pairs})  # unique mouse IDs
+        n_total = len(pairs)
+        n_sz = sum(1 for _, l in pairs if l == 1)
+        n_nsz = n_total - n_sz
+        pct = n_sz / n_total * 100 if n_total > 0 else 0.0
+        mouse_ids = sorted({Path(fp).stem.split("_")[0] for fp, _ in pairs})
         logger.info("%s: %d total | %d seizure | %d non-seizure | %.1f%% ictal | %d mice",
                     name, n_total, n_sz, n_nsz, pct, len(mouse_ids))
 
-    # Check whether test data is available (never loaded here -- reserved for final_evaluation.py)
     test_status = splits.get("metadata", {}).get("test_status", "pending")
     if test_status != "complete":
         logger.info("Test data not yet ready -- test split not loaded here.")
 
-    return train_pairs, val_pairs                      # only train and val returned
+    return train_pairs, val_pairs
 
 
 # ---------------------------------------------------------------------------
 # build_model
 # ---------------------------------------------------------------------------
-def build_model(backbone_hp, attn_hp, device, logger):
-    """Instantiate TCNWithAttention using backbone + attention hyperparameters.
+def build_model(backbone_hp, branch_dilations, attn_hp, device, logger):
+    """Instantiate MultiScaleTCNWithAttention.
 
-    DIFFERENCE FROM TCN.py: uses TCNWithAttention instead of TCN.
-    TCNWithAttention.__init__(num_layers, num_filters, kernel_size, dropout,
-                              attention_dim=64, attention_dropout=0.0,
-                              return_embedding=False, fs=500)
-    Backbone params from best_params.json, attention params from
-    best_attention_params.json.
+    Backbone params from best_multiscale_params.json, attention params from
+    best_multiscale_attn_params.json.
 
     ALL parameters are trainable (no freezing). This is logged explicitly.
 
@@ -350,17 +335,17 @@ def build_model(backbone_hp, attn_hp, device, logger):
     -------
     model : nn.Module
     """
-    # Fix seed before weight init for reproducibility
     set_seed(SEED)
-    model = TCNWithAttention(
-        num_layers=int(backbone_hp["num_layers"]),       # L: depth and RF growth
-        num_filters=int(backbone_hp["num_filters"]),     # channel width
-        kernel_size=int(backbone_hp["kernel_size"]),     # local temporal resolution
-        dropout=float(backbone_hp["dropout"]),           # spatial dropout (Dropout1d)
-        attention_dim=int(attn_hp["attention_dim"]),     # scoring projection dimension
-        attention_dropout=float(attn_hp["attention_dropout"]),  # context vector dropout
-        return_embedding=False,                          # classification mode (returns logits)
-        fs=FS,                                           # sampling rate for RF logging only
+    model = MultiScaleTCNWithAttention(
+        num_filters=int(backbone_hp["num_filters"]),
+        kernel_size=int(backbone_hp["kernel_size"]),
+        dropout=float(backbone_hp["dropout"]),
+        fusion=str(backbone_hp["fusion"]),
+        attention_dim=int(attn_hp["attention_dim"]),
+        attention_dropout=float(attn_hp["attention_dropout"]),
+        branch1_dilations=branch_dilations["branch1"],
+        branch2_dilations=branch_dilations["branch2"],
+        branch3_dilations=branch_dilations["branch3"],
     )
     model = model.to(device)
 
@@ -375,18 +360,20 @@ def build_model(backbone_hp, attn_hp, device, logger):
                        "{:,}".format(n_frozen))
 
     # -- Backbone vs attention parameter counts --------------------------------
-    # self.tcn is the backbone; everything else is attention + head
     backbone_module = getattr(model, BACKBONE_ATTR)
     n_backbone = sum(p.numel() for p in backbone_module.parameters() if p.requires_grad)
     n_attention = n_trainable - n_backbone
     logger.info("  Backbone params    : %s", "{:,}".format(n_backbone))
     logger.info("  Attention + head   : %s", "{:,}".format(n_attention))
 
-    # -- Log RF ----------------------------------------------------------------
-    rf = 2 * (2 ** int(backbone_hp["num_layers"]) - 1) * (int(backbone_hp["kernel_size"]) - 1) + 1
-    logger.info("  Receptive field    : %d samples (%.3f s)", rf, rf / FS)
-    logger.info("Model: %s", MODEL_NAME)
-    logger.info("Device: %s", device)
+    # -- Log per-branch RFs ----------------------------------------------------
+    ks = int(backbone_hp["kernel_size"])
+    for bname, dils in branch_dilations.items():
+        rf = 1 + 2 * sum((ks - 1) * d for d in dils)
+        logger.info("  %s RF: %d samples (%.3f s)", bname, rf, rf / FS)
+    logger.info("Model      : %s", MODEL_NAME)
+    logger.info("Fusion     : %s", backbone_hp["fusion"])
+    logger.info("Device     : %s", device)
 
     return model
 
@@ -397,26 +384,19 @@ def build_model(backbone_hp, attn_hp, device, logger):
 def build_training_components(model, pos_weight, attn_hp, device, logger):
     """Build optimiser, scheduler, and loss function.
 
-    DIFFERENCE FROM TCN.py: learning_rate, weight_decay come from attn_hp
-    (best_attention_params.json) because these were optimised during attention
-    tuning. Optimiser covers ALL parameters (backbone + attention jointly).
-
-    Imbalance strategy: offline stratified downsampling to 1:4 ratio with
-    pos_weight=1.0.
+    learning_rate, weight_decay come from attn_hp (optimised during attention
+    tuning). Optimiser covers ALL parameters (backbone + attention jointly).
 
     Returns (optimiser, scheduler, criterion).
     """
-    # AdamW decouples weight decay from gradient update (Loshchilov & Hutter, 2019)
     optimiser = torch.optim.AdamW(
-        model.parameters(),                               # ALL params -- no filtering
-        lr=float(attn_hp["learning_rate"]),                # from attention tuning
-        weight_decay=float(attn_hp["weight_decay"]))       # from attention tuning
-    # Cosine annealing: smooth LR decay over T_max epochs
+        model.parameters(),
+        lr=float(attn_hp["learning_rate"]),
+        weight_decay=float(attn_hp["weight_decay"]))
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimiser,
         T_max=MAX_EPOCHS,
-        eta_min=float(attn_hp["learning_rate"]) * 0.01)   # floor at 1% of initial LR
-    # Imbalance handled by offline stratified downsampling to 1:4 ratio; pos_weight=1.0
+        eta_min=float(attn_hp["learning_rate"]) * 0.01)
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight.to(device))
     logger.info("Optimiser: AdamW (lr=%.2e, wd=%.2e) -- from attention tuning",
                 attn_hp["learning_rate"], attn_hp["weight_decay"])
@@ -464,10 +444,9 @@ def save_checkpoint(epoch, model, optimiser, scheduler, val_f1, train_loss,
 def cleanup_checkpoints(ckpt_dir, keep_last_n, logger):
     """Delete old periodic checkpoints, keeping only the most recent keep_last_n.
 
-    Mirror of TCN.py -- pattern adapted for tcn_attention prefix.
-    Never deletes tcn_attention_best.pt.
+    Never deletes ms_attn_best.pt or ms_attn_latest.pt.
     """
-    pattern = "tcn_attention_epoch_*.pt"
+    pattern = "ms_attn_epoch_*.pt"
     ckpts = sorted(ckpt_dir.glob(pattern), key=lambda p: p.stat().st_mtime)
     to_remove = ckpts[:-keep_last_n] if len(ckpts) > keep_last_n else []
     for p in to_remove:
@@ -504,7 +483,6 @@ def evaluate_model(model, loader, device, logger, use_amp=False):
             x = x.to(device, non_blocking=True)
             with torch.amp.autocast("cuda", enabled=use_amp):
                 logits = model(x)
-            # sigmoid + threshold outside autocast for FP32 precision at decision boundary
             probs = torch.sigmoid(logits)
             preds = (probs >= 0.5).long()
             all_true.append(y.cpu().numpy())
@@ -523,29 +501,22 @@ def evaluate_model(model, loader, device, logger, use_amp=False):
 # compute_all_metrics
 # ---------------------------------------------------------------------------
 def compute_all_metrics(y_true, y_pred, y_prob, segment_sec, logger, label=""):
-    """Compute all evaluation metrics for one evaluation row.
-
-    Mirror of TCN.py compute_all_metrics() -- no differences.
-    """
-    # labels=[0,1] forces 2x2 matrix even if one class absent in y_pred
+    """Compute all evaluation metrics for one evaluation row."""
     tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
-    tn, fp, fn, tp = int(tn), int(fp), int(fn), int(tp)  # Python int for JSON serialisation
+    tn, fp, fn, tp = int(tn), int(fp), int(fn), int(tp)
 
-    accuracy    = accuracy_score(y_true, y_pred)           # (TP+TN) / total
-    prec        = precision_score(y_true, y_pred, pos_label=1, zero_division=0)  # TP / (TP+FP)
-    recall      = recall_score(y_true, y_pred, pos_label=1, zero_division=0)     # sensitivity = TP / (TP+FN)
-    f1_macro    = f1_score(y_true, y_pred, average="macro", zero_division=0)     # mean of per-class F1
-    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0   # TN / (TN+FP)
-    # AUROC uses continuous probabilities -- threshold-invariant, same across all 3 rows
+    accuracy    = accuracy_score(y_true, y_pred)
+    prec        = precision_score(y_true, y_pred, pos_label=1, zero_division=0)
+    recall      = recall_score(y_true, y_pred, pos_label=1, zero_division=0)
+    f1_macro    = f1_score(y_true, y_pred, average="macro", zero_division=0)
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
     auroc       = roc_auc_score(y_true, y_prob) if len(np.unique(y_true)) > 1 else 0.0
     avg_prec    = average_precision_score(y_true, y_prob) if len(np.unique(y_true)) > 1 else 0.0
-    # Youden J = sensitivity + specificity - 1; ranges [-1, +1]; used for threshold selection
     youden_j    = recall + specificity - 1.0
 
-    # Segment-level FAR/hr: FP segments / non-ictal recording hours
-    n_non_ic   = tn + fp                                   # total non-ictal segments (denominator)
-    non_ic_hrs = (n_non_ic * segment_sec) / 3600.0         # convert to hours
-    far_seg    = fp / non_ic_hrs if non_ic_hrs > 0 else 0.0  # false alarms per hour
+    n_non_ic   = tn + fp
+    non_ic_hrs = (n_non_ic * segment_sec) / 3600.0
+    far_seg    = fp / non_ic_hrs if non_ic_hrs > 0 else 0.0
 
     logger.info("-- Metrics [%s] --", label)
     logger.info("  Accuracy          : %.4f", accuracy)
@@ -579,25 +550,19 @@ def compute_all_metrics(y_true, y_pred, y_prob, segment_sec, logger, label=""):
 def run_postprocessing_evaluations(y_true, y_prob, logger):
     """Run all three evaluation rows and compute optimal threshold.
 
-    Mirror of TCN.py -- paths adapted for TCNAttention output directory.
-
     Returns (row1_metrics, row2_metrics, row3_metrics,
              post_row2, post_row3, far_row2, far_row3,
              thresh_result, optimal_threshold).
     """
-    # -- Row 1: raw predictions at standard threshold 0.5 -----------------------
-    # No post-processing. Baseline for comparison with prior work.
-    y_pred_row1 = (y_prob >= 0.5).astype(int)          # binarise at default threshold
+    # -- Row 1: raw at 0.5 ----------------------------------------------------
+    y_pred_row1 = (y_prob >= 0.5).astype(int)
     row1_metrics = compute_all_metrics(y_true, y_pred_row1, y_prob, SEGMENT_SEC, logger,
                                        label="Row1_raw_0.5")
-    row1_metrics["threshold"] = 0.5                    # record threshold used
-    row1_metrics["postprocessed"] = False               # flag: no post-processing applied
+    row1_metrics["threshold"] = 0.5
+    row1_metrics["postprocessed"] = False
 
-    # -- Find optimal threshold using Youden J statistic ----------------------
-    # Youden J = sensitivity + specificity - 1. Chosen because it treats missed
-    # seizures and false alarms symmetrically and is prevalence-independent.
-    # Always compute fresh from current model predictions — a cached threshold
-    # from a previous run would be stale if the model weights changed.
+    # -- Find optimal threshold ------------------------------------------------
+    # Always compute fresh from current model predictions.
     thresh_result = find_optimal_threshold(y_true, y_prob, objective="youden")
     optimal_threshold = thresh_result["optimal_threshold"]
     with open(THRESH_PATH, "w", encoding="utf-8") as f:
@@ -667,15 +632,15 @@ def run_postprocessing_evaluations(y_true, y_prob, logger):
 # save_all_results
 # ---------------------------------------------------------------------------
 def save_all_results(history, row1_metrics, row2_metrics, row3_metrics,
-                     far_row2, far_row3, backbone_hp, attn_hp,
+                     far_row2, far_row3, backbone_hp, branch_dilations, attn_hp,
                      best_epoch, best_val_f1, elapsed, device, n_params,
                      y_true, y_pred_row1, y_pred_row2, y_pred_row3, logger):
-    """Save all structured results to files (no figures).
-
-    DIFFERENCE FROM TCN.py: accepts backbone_hp and attn_hp separately.
-    Includes both in JSON outputs. Adds training_note about joint training.
-    """
-    rf = 2 * (2 ** int(backbone_hp["num_layers"]) - 1) * (int(backbone_hp["kernel_size"]) - 1) + 1
+    """Save all structured results to files (no figures)."""
+    ks = int(backbone_hp["kernel_size"])
+    branch_rfs = {}
+    for bname, dils in branch_dilations.items():
+        rf = 1 + 2 * sum((ks - 1) * d for d in dils)
+        branch_rfs[bname] = {"samples": rf, "seconds": round(rf / FS, 4)}
 
     # -- a. Training log JSON --------------------------------------------------
     train_log = {
@@ -687,13 +652,14 @@ def save_all_results(history, row1_metrics, row2_metrics, row3_metrics,
         "early_stopped": len(history["epoch"]) < MAX_EPOCHS,
         "duration_seconds": round(elapsed.total_seconds(), 1),
         "backbone_hyperparameters": backbone_hp,
+        "branch_dilations": branch_dilations,
         "attention_hyperparameters": attn_hp,
         "backbone_params_source": str(BACKBONE_PARAMS_PATH),
         "attention_params_source": str(ATTN_PARAMS_PATH),
         "training_note": ("All parameters (backbone + attention) trained jointly for 100 epochs. "
                           "Backbone was frozen only during attention tuning "
-                          "(tune_temporal_attention.py), not during this final training run."),
-        "receptive_field": {"samples": rf, "seconds": round(rf / FS, 4)},
+                          "(tune_multiscale_attention.py), not during this final training run."),
+        "branch_receptive_fields": branch_rfs,
         "trainable_params": n_params,
         "device": str(device),
         "history": history,
@@ -710,6 +676,7 @@ def save_all_results(history, row1_metrics, row2_metrics, row3_metrics,
         "evaluation_set": "validation",
         "note": "Test set reserved for final_evaluation.py",
         "backbone_hyperparameters": backbone_hp,
+        "branch_dilations": branch_dilations,
         "attention_hyperparameters": attn_hp,
         "backbone_params_source": str(BACKBONE_PARAMS_PATH),
         "attention_params_source": str(ATTN_PARAMS_PATH),
@@ -740,7 +707,7 @@ def save_all_results(history, row1_metrics, row2_metrics, row3_metrics,
             })
     logger.info("Saved: %s", EPOCH_CSV)
 
-    # -- d. Three-row summary CSV (M2 in ablation table) -----------------------
+    # -- d. Three-row summary CSV (M4 in ablation table) -----------------------
     fieldnames_3r = [
         "row", "threshold", "postprocessed",
         "accuracy", "precision", "recall", "specificity", "youden_j",
@@ -786,14 +753,14 @@ def save_all_results(history, row1_metrics, row2_metrics, row3_metrics,
         report_dict = classification_report(
             y_true, y_pred_row, target_names=["Non-ictal", "Ictal"],
             output_dict=True, zero_division=0)
-        rpath = OUTPUT_ROOT / ("tcn_attention_classification_report_%s.json" % row_label)
+        rpath = OUTPUT_ROOT / ("ms_attn_classification_report_%s.json" % row_label)
         with open(rpath, "w", encoding="utf-8") as f:
             json.dump(report_dict, f, indent=2)
         logger.info("Saved: %s", rpath)
 
     # -- f. Event detail CSVs --------------------------------------------------
     for far_result, row_label in [(far_row2, "row2"), (far_row3, "row3")]:
-        csv_path = OUTPUT_ROOT / ("tcn_attention_event_details_%s.csv" % row_label)
+        csv_path = OUTPUT_ROOT / ("ms_attn_event_details_%s.csv" % row_label)
         details = far_result.get("event_details", [])
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(
@@ -816,47 +783,37 @@ def plot_all_figures(history, best_epoch, best_val_f1,
                     row1_metrics, row2_metrics, row3_metrics,
                     post_row2, post_row3,
                     thresh_result, optimal_threshold, logger):
-    """Produce and save all 12 standard figures at dpi=150.
-
-    Mirror of TCN.py plot_all_figures() -- titles adapted for M2.
-    """
-    pfx = "tcn_attention"                              # filename prefix for all 12 figures
-    epochs = history["epoch"]                          # x-axis values for training curve plots
+    """Produce and save all 12 standard figures at dpi=150."""
+    pfx = "ms_attn"
+    epochs = history["epoch"]
 
     # -- Figure 1: Training curves ---------------------------------------------
-    # PURPOSE: Shows convergence behaviour. Left: loss declining confirms
-    # optimiser is working. Right: val F1 rising then stabilising confirms
-    # generalisation. Vertical dashed line marks the epoch whose weights are saved.
     fig, axes = plt.subplots(1, 2, figsize=(13, 4))
     axes[0].plot(epochs, history["train_loss"], color="#5A7DC8", linewidth=1.2, label="Train loss")
     axes[0].axvline(best_epoch, linestyle="--", color="#C85A5A", alpha=0.7, label="Best epoch")
     axes[0].set_xlabel("Epoch"); axes[0].set_ylabel("BCEWithLogitsLoss")
-    axes[0].set_title("TCN+Attention Training Loss"); axes[0].legend(fontsize=9)
+    axes[0].set_title("MS-TCN+Attention Training Loss"); axes[0].legend(fontsize=9)
     axes[1].plot(epochs, history["val_f1"], color="#5A7DC8", linewidth=1.2, label="Val F1")
     axes[1].axvline(best_epoch, linestyle="--", color="#C85A5A", alpha=0.7, label="Best epoch")
     axes[1].annotate("%.4f" % best_val_f1, xy=(best_epoch, best_val_f1),
                      xytext=(5, -15), textcoords="offset points", fontsize=9, color="#C85A5A")
     axes[1].set_xlabel("Epoch"); axes[1].set_ylabel("Macro F1-score")
-    axes[1].set_title("TCN+Attention Validation Macro F1"); axes[1].legend(fontsize=9)
+    axes[1].set_title("MS-TCN+Attention Validation Macro F1"); axes[1].legend(fontsize=9)
     plt.tight_layout()
     plt.savefig(FIGURE_DIR / ("%s_training_curves.png" % pfx), dpi=150, bbox_inches="tight")
     plt.close()
     logger.info("Saved: %s_training_curves.png", pfx)
 
     # -- Figure 2: LR schedule ------------------------------------------------
-    # PURPOSE: Verifies cosine annealing behaved as described in Methods.
-    # A flat tail indicates early stopping terminated before full cycle.
     fig, ax = plt.subplots(figsize=(8, 3))
     ax.plot(epochs, history["lr"], color="#5A7DC8", linewidth=1.2)
     ax.set_yscale("log"); ax.set_xlabel("Epoch"); ax.set_ylabel("Learning rate (log scale)")
-    ax.set_title("TCN+Attention Cosine Annealing LR")
+    ax.set_title("MS-TCN+Attention Cosine Annealing LR")
     plt.tight_layout()
     plt.savefig(FIGURE_DIR / ("%s_lr_schedule.png" % pfx), dpi=150, bbox_inches="tight")
     plt.close()
 
     # -- Figures 3-5: Confusion matrices ---------------------------------------
-    # PURPOSE: TP/FP/FN/TN counts per row. Row1-vs-Row2 isolates post-processing.
-    # Row2-vs-Row3 isolates threshold optimisation. Titles show key metrics.
     for row_idx, (yp, m, rl, th) in enumerate([
         (y_pred_row1, row1_metrics, "Row1: raw", 0.5),
         (y_pred_row2, row2_metrics, "Row2: post-proc", 0.5),
@@ -868,7 +825,7 @@ def plot_all_figures(history, best_epoch, best_val_f1,
                     xticklabels=["Non-ictal", "Ictal"], yticklabels=["Non-ictal", "Ictal"],
                     linewidths=0.5, ax=ax)
         ax.set_xlabel("Predicted"); ax.set_ylabel("True")
-        ax.set_title("M2 %s | t=%.3f | Sens=%.3f Spec=%.3f F1=%.3f J=%.3f" % (
+        ax.set_title("M4 %s | t=%.3f | Sens=%.3f Spec=%.3f F1=%.3f J=%.3f" % (
             rl, th, m["recall"], m["specificity"], m["f1_macro"], m["youden_j"]))
         plt.tight_layout()
         plt.savefig(FIGURE_DIR / ("%s_confusion_matrix_row%d.png" % (pfx, row_idx)),
@@ -876,27 +833,23 @@ def plot_all_figures(history, best_epoch, best_val_f1,
         plt.close()
 
     # -- Figure 6: ROC curve ---------------------------------------------------
-    # PURPOSE: Sensitivity vs FPR trade-off. AUROC is threshold-invariant.
-    # Three scatter points (R1, R2, R3) mark the actual operating points.
-    fpr, tpr, _ = roc_curve(y_true, y_prob)            # arrays for the full ROC curve
+    fpr, tpr, _ = roc_curve(y_true, y_prob)
     auroc_val = roc_auc_score(y_true, y_prob) if len(np.unique(y_true)) > 1 else 0.0
     fig, ax = plt.subplots(figsize=(5, 5))
     ax.plot(fpr, tpr, color="#5A7DC8", linewidth=1.5,
-            label="TCN+Attention (AUROC = %.4f)" % auroc_val)
+            label="MS-TCN+Attn (AUROC = %.4f)" % auroc_val)
     ax.plot([0, 1], [0, 1], linestyle="--", color="gray", alpha=0.5, label="Chance")
     ax.fill_between(fpr, tpr, alpha=0.08, color="#5A7DC8")
     for m, lbl, mk in [(row1_metrics, "R1", "o"), (row2_metrics, "R2", "s"), (row3_metrics, "R3", "D")]:
         ax.scatter([1 - m["specificity"]], [m["recall"]], marker=mk, s=60, zorder=5, label=lbl)
     ax.set_xlabel("FPR (1 - Specificity)"); ax.set_ylabel("TPR (Sensitivity)")
-    ax.set_title("TCN+Attention ROC -- Validation"); ax.legend(fontsize=8, loc="lower right")
+    ax.set_title("MS-TCN+Attention ROC -- Validation"); ax.legend(fontsize=8, loc="lower right")
     plt.tight_layout()
     plt.savefig(FIGURE_DIR / ("%s_roc_curve.png" % pfx), dpi=150, bbox_inches="tight")
     plt.close()
 
     # -- Figure 7: Threshold curve ---------------------------------------------
-    # PURPOSE: Answers "how was the threshold selected?" Youden J vs threshold.
-    # A broad peak = robust to threshold choice; narrow spike = sensitive.
-    curve = thresh_result.get("threshold_curve", {})   # dict mapping threshold -> Youden J
+    curve = thresh_result.get("threshold_curve", {})
     if curve:
         tlist = sorted(curve.keys()); slist = [curve[t] for t in tlist]
         fig, ax = plt.subplots(figsize=(8, 4))
@@ -906,14 +859,12 @@ def plot_all_figures(history, best_epoch, best_val_f1,
                     xy=(optimal_threshold, max(slist) if slist else 0),
                     xytext=(10, -10), textcoords="offset points", fontsize=9, color="#C85A5A")
         ax.set_xlabel("Threshold"); ax.set_ylabel("Youden J")
-        ax.set_title("TCN+Attention Threshold Selection -- Youden J")
+        ax.set_title("MS-TCN+Attention Threshold Selection -- Youden J")
         plt.tight_layout()
         plt.savefig(FIGURE_DIR / ("%s_threshold_curve.png" % pfx), dpi=150, bbox_inches="tight")
         plt.close()
 
     # -- Figure 8: Metrics comparison ------------------------------------------
-    # PURPOSE: Single-figure summary of all 7 metrics across 3 rows.
-    # Top panel: grouped bars. Bottom panel: FAR/hr (seg vs event).
     mnames = ["accuracy", "precision", "recall", "specificity", "f1_macro", "auroc", "average_precision"]
     r1 = [row1_metrics.get(m, 0) for m in mnames]
     r2 = [row2_metrics.get(m, 0) for m in mnames]
@@ -929,7 +880,7 @@ def plot_all_figures(history, best_epoch, best_val_f1,
                           xy=(bar.get_x() + bar.get_width() / 2, bar.get_height()),
                           xytext=(0, 2), textcoords="offset points", ha="center", fontsize=6)
     ax_t.set_xticks(xp); ax_t.set_xticklabels(mnames, fontsize=8)
-    ax_t.set_ylabel("Score"); ax_t.set_title("TCN+Attention Evaluation Metrics")
+    ax_t.set_ylabel("Score"); ax_t.set_title("MS-TCN+Attention Evaluation Metrics")
     ax_t.legend(fontsize=8); ax_t.set_ylim(0, 1.15)
     fv = [row1_metrics.get("far_per_hour_seg", 0),
           row2_metrics.get("far_per_hour_event", 0), row3_metrics.get("far_per_hour_event", 0)]
@@ -945,42 +896,34 @@ def plot_all_figures(history, best_epoch, best_val_f1,
     plt.close()
 
     # -- Figure 9: PR curve ----------------------------------------------------
-    # PURPOSE: More informative than ROC for imbalanced data. No-skill baseline
-    # at prevalence shows what a random classifier achieves. AP summarises area.
-    prec_arr, rec_arr, _ = precision_recall_curve(y_true, y_prob)  # arrays for full PR curve
+    prec_arr, rec_arr, _ = precision_recall_curve(y_true, y_prob)
     ap = average_precision_score(y_true, y_prob) if len(np.unique(y_true)) > 1 else 0.0
     prev = np.mean(y_true)
     fig, ax = plt.subplots(figsize=(5, 5))
-    ax.plot(rec_arr, prec_arr, color="#5A7DC8", linewidth=1.5, label="TCN+Attn (AP=%.4f)" % ap)
+    ax.plot(rec_arr, prec_arr, color="#5A7DC8", linewidth=1.5, label="MS-TCN+Attn (AP=%.4f)" % ap)
     ax.axhline(prev, linestyle="--", color="gray", alpha=0.5, label="No-skill (%.3f)" % prev)
     ax.fill_between(rec_arr, prec_arr, alpha=0.08, color="#5A7DC8")
     ax.set_xlabel("Recall"); ax.set_ylabel("Precision")
-    ax.set_title("TCN+Attention PR Curve -- Validation"); ax.legend(fontsize=9)
+    ax.set_title("MS-TCN+Attention PR Curve -- Validation"); ax.legend(fontsize=9)
     plt.tight_layout()
     plt.savefig(FIGURE_DIR / ("%s_pr_curve.png" % pfx), dpi=150, bbox_inches="tight")
     plt.close()
 
     # -- Figure 10: Calibration curve ------------------------------------------
-    # PURPOSE: Are predicted probabilities well-calibrated? Points above diagonal
-    # = under-confidence; below = over-confidence. Poor calibration does not
-    # affect AUROC but affects clinical interpretation of probability outputs.
     fig, ax = plt.subplots(figsize=(5, 5))
     try:
-        frac_pos, mean_pred = calibration_curve(y_true, y_prob, n_bins=10)  # bin probabilities
-        ax.plot(mean_pred, frac_pos, "o-", color="#5A7DC8", label="TCN+Attention")
-    except ValueError:                                 # can fail if too few positive samples
+        frac_pos, mean_pred = calibration_curve(y_true, y_prob, n_bins=10)
+        ax.plot(mean_pred, frac_pos, "o-", color="#5A7DC8", label="MS-TCN+Attention")
+    except ValueError:
         pass
     ax.plot([0, 1], [0, 1], linestyle="--", color="gray", alpha=0.5, label="Perfect")
     ax.set_xlabel("Mean predicted probability"); ax.set_ylabel("Fraction of positives")
-    ax.set_title("TCN+Attention Calibration Curve"); ax.legend(fontsize=9)
+    ax.set_title("MS-TCN+Attention Calibration Curve"); ax.legend(fontsize=9)
     plt.tight_layout()
     plt.savefig(FIGURE_DIR / ("%s_calibration_curve.png" % pfx), dpi=150, bbox_inches="tight")
     plt.close()
 
     # -- Figure 11: FAR comparison ---------------------------------------------
-    # PURPOSE: Highlights segment-level vs event-level FAR/hr. Post-processing
-    # collapses consecutive FP segments into single events, drastically reducing
-    # the clinically reported alarm rate. The visual drop quantifies the benefit.
     fig, ax = plt.subplots(figsize=(7, 4))
     fl = ["Row1\nsegment-level", "Row2\nevent-level", "Row3\nevent-level"]
     fvals = [row1_metrics.get("far_per_hour_seg", 0),
@@ -990,17 +933,14 @@ def plot_all_figures(history, best_epoch, best_val_f1,
         ax.annotate("%.2f" % bar.get_height(),
                     xy=(bar.get_x() + bar.get_width() / 2, bar.get_height()),
                     xytext=(0, 3), textcoords="offset points", ha="center", fontsize=9)
-    ax.set_ylabel("FAR/hr"); ax.set_title("TCN+Attention FAR/hr: segment vs event")
+    ax.set_ylabel("FAR/hr"); ax.set_title("MS-TCN+Attention FAR/hr: segment vs event")
     plt.tight_layout()
     plt.savefig(FIGURE_DIR / ("%s_far_comparison.png" % pfx), dpi=150, bbox_inches="tight")
     plt.close()
 
     # -- Figure 12: Segment length analysis ------------------------------------
-    # PURPOSE: Justifies MIN_EVENT_SEC and REFRACTORY_SEC. Left: event duration
-    # histogram shows the filter removes only short artefacts. Right: event
-    # timeline colour-coded by true/false alarm validates post-processing.
     fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-    durations = []                                     # collect all event durations for histogram
+    durations = []
     for post in [post_row2, post_row3]:
         for evt in post.get("events", []):
             durations.append(evt.get("duration_sec", 0))
@@ -1010,7 +950,7 @@ def plot_all_figures(history, best_epoch, best_val_f1,
                         label="Min = %.0fs" % MIN_EVENT_SEC)
         axes[0].legend(fontsize=8)
     axes[0].set_xlabel("Event duration (s)"); axes[0].set_ylabel("Count")
-    axes[0].set_title("TCN+Attention Event Duration Distribution")
+    axes[0].set_title("MS-TCN+Attention Event Duration Distribution")
     evts_r3 = compute_event_level_far(y_true, post_row3, STEP_SEC, SEGMENT_SEC).get("event_details", [])
     if evts_r3:
         axes[1].scatter([e["start_sec"] for e in evts_r3], [e["duration_sec"] for e in evts_r3],
@@ -1035,29 +975,23 @@ def plot_attention_saliency(model, val_loader, y_true, device, logger):
     """Produce temporal attention saliency figure (Figure 13).
 
     Extracts attention weights for all validation segments using
-    TCNWithAttention.get_attention_weights(). Plots mean saliency profiles
-    averaged over ictal and non-ictal segments separately.
-
-    File saved: outputs/TCNAttention/figures/tcn_attention_saliency_maps.png
+    MultiScaleTCNWithAttention.get_attention_weights(). Plots mean saliency
+    profiles averaged over ictal and non-ictal segments separately.
     """
-    # -- Collect attention weights alpha_t for every validation segment ----------
-    # get_attention_weights() runs a forward pass through the TCN backbone
-    # and attention layers, returning softmax-normalised weights per time step.
-    # These weights are the model's learned temporal saliency map.
-    model.eval()                                       # disable dropout for deterministic weights
-    all_weights = []                                   # accumulate (batch, T) arrays
-    all_labels = []                                    # accumulate ground truth labels
-    with torch.no_grad():                              # no gradients needed for inference
-        for x, y in val_loader:                        # iterate over all validation batches
-            x = x.to(device, non_blocking=True)         # transfer input to GPU
-            w = model.get_attention_weights(x)         # returns np.ndarray shape (batch, T)
-            all_weights.extend(w)                      # extend list with individual arrays
-            all_labels.extend(y.numpy())               # labels stay on CPU
-    weights = np.array(all_weights)                    # (n_segments, T) -- all val attention maps
-    labels = np.array(all_labels, dtype=int)           # (n_segments,) -- 0=non-ictal, 1=ictal
+    model.eval()
+    all_weights = []
+    all_labels = []
+    with torch.no_grad():
+        for x, y in val_loader:
+            x = x.to(device, non_blocking=True)
+            w = model.get_attention_weights(x)
+            all_weights.extend(w)
+            all_labels.extend(y.numpy())
+    weights = np.array(all_weights)
+    labels = np.array(all_labels, dtype=int)
 
-    ictal_weights = weights[labels == 1]               # attention maps for seizure segments
-    nonictal_weights = weights[labels == 0]            # attention maps for normal segments
+    ictal_weights = weights[labels == 1]
+    nonictal_weights = weights[labels == 0]
     logger.info("Attention saliency: %d ictal, %d non-ictal segments",
                 ictal_weights.shape[0], nonictal_weights.shape[0])
 
@@ -1065,21 +999,17 @@ def plot_attention_saliency(model, val_loader, y_true, device, logger):
         logger.warning("Cannot plot saliency: one class has zero segments.")
         return
 
-    mean_ictal = ictal_weights.mean(axis=0)             # average saliency profile for seizures
-    mean_nonictal = nonictal_weights.mean(axis=0)      # average saliency profile for normals
-    std_ictal = ictal_weights.std(axis=0)              # variability across ictal segments
-    std_nonictal = nonictal_weights.std(axis=0)        # variability across non-ictal segments
+    mean_ictal = ictal_weights.mean(axis=0)
+    mean_nonictal = nonictal_weights.mean(axis=0)
+    std_ictal = ictal_weights.std(axis=0)
+    std_nonictal = nonictal_weights.std(axis=0)
 
-    T = mean_ictal.shape[0]                            # number of time steps (= 2500 at 500 Hz)
-    # Convert time-step indices to seconds for interpretable x-axis labels.
-    # Causal trim in CausalConvBlock preserves the original sequence length.
-    time_axis = np.arange(T) / FS                      # seconds: 0.000, 0.002, ..., 4.998
+    T = mean_ictal.shape[0]
+    time_axis = np.arange(T) / FS
 
-    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 9))  # three stacked subplots
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 9))
 
     # -- Subplot 1: mean attention per class -----------------------------------
-    # PURPOSE: Shows whether the model attends to different time steps for ictal
-    # vs non-ictal segments. Higher ictal attention = model focuses on seizure.
     ax1.plot(time_axis, mean_ictal, color="#C85A5A", linewidth=1.2, label="Ictal (mean)")
     ax1.fill_between(time_axis, mean_ictal - std_ictal, mean_ictal + std_ictal,
                      color="#C85A5A", alpha=0.15, label="Ictal (std)")
@@ -1091,10 +1021,7 @@ def plot_attention_saliency(model, val_loader, y_true, device, logger):
     ax1.legend(fontsize=8)
 
     # -- Subplot 2: differential attention (ictal - non-ictal) -----------------
-    # PURPOSE: Positive values indicate time steps where ictal segments receive
-    # more attention than non-ictal ones. This directly shows whether the model
-    # has learned to preferentially attend to seizure-relevant time steps.
-    diff = mean_ictal - mean_nonictal                  # positive = ictal-focused
+    diff = mean_ictal - mean_nonictal
     ax2.fill_between(time_axis, 0, diff, where=(diff >= 0), color="#C85A5A", alpha=0.4,
                      label="Ictal > Non-ictal")
     ax2.fill_between(time_axis, 0, diff, where=(diff < 0), color="#5A7DC8", alpha=0.4,
@@ -1105,29 +1032,20 @@ def plot_attention_saliency(model, val_loader, y_true, device, logger):
     ax2.legend(fontsize=8)
 
     # -- Subplot 3: example ictal segment with attention overlay ---------------
-    # PURPOSE: Concrete visualisation of one seizure segment with the attention
-    # weights overlaid as a colour bar. This provides interpretable evidence
-    # that the model focuses on the ictal discharge rather than artefacts.
-    # Select the ictal segment with the highest mean attention weight as the
-    # most informative example for the figure.
-    ictal_indices = np.where(labels == 1)[0]           # indices of all ictal segments
-    mean_per_seg = weights[ictal_indices].mean(axis=1) # average attention across T per segment
-    best_seg_local = np.argmax(mean_per_seg)           # index within ictal subset
-    best_seg_global = ictal_indices[best_seg_local]    # index within full validation set
+    ictal_indices = np.where(labels == 1)[0]
+    mean_per_seg = weights[ictal_indices].mean(axis=1)
+    best_seg_local = np.argmax(mean_per_seg)
+    best_seg_global = ictal_indices[best_seg_local]
 
-    # Load the raw EEG waveform for this example segment
-    seg_path, seg_label = val_loader.dataset.pairs[best_seg_global]  # (filepath, label) tuple
-    raw_eeg = np.load(seg_path).astype(np.float32)     # load .npy segment as float32
-    # Normalise amplitude to [-1, 1] for visual display (does not affect attention weights)
-    raw_max = np.abs(raw_eeg).max()                    # peak absolute amplitude
+    seg_path, seg_label = val_loader.dataset.pairs[best_seg_global]
+    raw_eeg = np.load(seg_path).astype(np.float32)
+    raw_max = np.abs(raw_eeg).max()
     if raw_max > 0:
-        raw_eeg = raw_eeg / raw_max                    # scale to [-1, 1]
-    eeg_time = np.arange(len(raw_eeg)) / FS            # time axis in seconds for raw EEG
-    seg_weights = weights[best_seg_global]              # attention weights for this segment
+        raw_eeg = raw_eeg / raw_max
+    eeg_time = np.arange(len(raw_eeg)) / FS
+    seg_weights = weights[best_seg_global]
 
     ax3.plot(eeg_time, raw_eeg, color="gray", linewidth=0.5, alpha=0.7, label="EEG")
-    # Overlay attention as coloured scatter along the bottom
-    # Map attention weights to time axis (same length as T)
     w_time = np.arange(len(seg_weights)) / FS
     scatter = ax3.scatter(w_time, np.full_like(seg_weights, raw_eeg.min() - 0.15),
                           c=seg_weights, cmap="Reds", s=4, vmin=0,
@@ -1138,16 +1056,16 @@ def plot_attention_saliency(model, val_loader, y_true, device, logger):
     ax3.legend(fontsize=8, loc="upper right")
 
     plt.tight_layout()
-    plt.savefig(FIGURE_DIR / "tcn_attention_saliency_maps.png", dpi=150, bbox_inches="tight")
+    plt.savefig(FIGURE_DIR / "ms_attn_saliency_maps.png", dpi=150, bbox_inches="tight")
     plt.close()
-    logger.info("Saved: tcn_attention_saliency_maps.png")
+    logger.info("Saved: ms_attn_saliency_maps.png")
 
 
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 def main():
-    """Main entry point for TCN + Temporal Attention training (M2).
+    """Main entry point for MultiScaleTCN + Temporal Attention training (M4).
 
     Trains for MAX_EPOCHS=100 with early stopping. All params joint.
     Does not evaluate the test set.
@@ -1155,30 +1073,30 @@ def main():
     # -- Step 1: Logging and setup ---------------------------------------------
     logger = setup_logging()
     logger.info("=" * 65)
-    logger.info("TCNTemporalAttention.py -- TCN with Temporal Attention Training")
+    logger.info("MultiScaleTCNAttention.py -- Multi-Scale TCN with Temporal Attention Training")
     logger.info("Timestamp: %s", datetime.datetime.now().isoformat())
     logger.info("MAX_EPOCHS  : %d", MAX_EPOCHS)
     logger.info("ES_PATIENCE : %d", ES_PATIENCE)
-    logger.info("Backbone params : best_params.json")
-    logger.info("Attention params: best_attention_params.json")
+    logger.info("Backbone params : best_multiscale_params.json")
+    logger.info("Attention params: best_multiscale_attn_params.json")
     logger.info("Training mode   : ALL params joint (backbone + attention unfrozen)")
-    logger.info("Ablation role   : M2 -- TCN + Temporal Attention")
+    logger.info("Ablation role   : M4 -- Multi-Scale TCN + Temporal Attention")
     logger.info("Test set        : NOT loaded in this script")
     logger.info("=" * 65)
 
-    set_seed(SEED)                                     # fix all RNG seeds for reproducibility
-    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # auto-detect GPU
-    if torch.cuda.is_available():                      # log GPU details for reproducibility audit
+    set_seed(SEED)
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
         logger.info("GPU : %s", torch.cuda.get_device_name(0))
-        vram = torch.cuda.get_device_properties(0).total_memory / 1e9  # total VRAM in GB
+        vram = torch.cuda.get_device_properties(0).total_memory / 1e9
         logger.info("VRAM: %.2f GB", vram)
         logger.info("CUDA: %s", torch.version.cuda)
     else:
-        logger.info("Device: CPU")                     # warn: training on CPU will be slow
-    logger.info("PyTorch: %s", torch.__version__)      # log framework version for reproducibility
+        logger.info("Device: CPU")
+    logger.info("PyTorch: %s", torch.__version__)
 
     # -- Step 2: Load both parameter files -------------------------------------
-    backbone_config, backbone_hp, attn_config, attn_hp = load_best_params(logger)
+    backbone_config, backbone_hp, branch_dilations, attn_config, attn_hp = load_best_params(logger)
 
     # -- Step 3: Load data splits ----------------------------------------------
     train_pairs, val_pairs = load_splits(logger)
@@ -1196,11 +1114,10 @@ def main():
     # -- End corpus preparation ------------------------------------------------
 
     # -- Step 4: Build model ---------------------------------------------------
-    model = build_model(backbone_hp, attn_hp, DEVICE, logger)
+    model = build_model(backbone_hp, branch_dilations, attn_hp, DEVICE, logger)
     n_params = count_parameters(model)
 
     # -- Step 5: Build data loaders --------------------------------------------
-    # batch_size comes from attention tuning (attn_hp), not backbone tuning
     batch_size = int(attn_hp["batch_size"])
     train_loader = make_loader(train_pairs, batch_size, True, DEVICE)
     val_loader = make_loader(val_pairs, batch_size, False, DEVICE)
@@ -1208,7 +1125,6 @@ def main():
     logger.info("Val loader  : %d batches", len(val_loader))
 
     # -- Step 6: Build training components -------------------------------------
-    # lr, wd come from attn_hp (optimised during attention tuning)
     optimiser, scheduler, criterion = build_training_components(
         model, pos_weight, attn_hp, DEVICE, logger)
 
@@ -1222,13 +1138,8 @@ def main():
     training_start = datetime.datetime.now()
 
     # -- Resume from checkpoint if available -----------------------------------
-    # latest.pt contains everything: current model/optimiser/scheduler state,
-    # best-epoch weights, patience counter, and best_val_f1. A single file
-    # load restores the exact training state. tcn_attention_best.pt is a
-    # fallback if latest.pt was corrupted (e.g., Slurm killed during torch.save).
-    # To start fresh, delete the checkpoints/ directory.
-    latest_path = CKPT_DIR / "tcn_attention_latest.pt"
-    best_ckpt_path = CKPT_DIR / "tcn_attention_best.pt"
+    latest_path = CKPT_DIR / "ms_attn_latest.pt"
+    best_ckpt_path = CKPT_DIR / "ms_attn_best.pt"
     resume_path = latest_path if latest_path.exists() else (
         best_ckpt_path if best_ckpt_path.exists() else None)
 
@@ -1241,7 +1152,6 @@ def main():
         best_epoch = ckpt.get("best_epoch", ckpt.get("epoch", 0))
         start_epoch = ckpt["epoch"] + 1
         epochs_no_imp = ckpt.get("epochs_no_imp", 0)
-        # Restore best-epoch weights (stored inside latest.pt)
         if "best_model_state" in ckpt:
             best_state = {k: v.cpu().clone() for k, v in ckpt["best_model_state"].items()}
         else:
@@ -1271,7 +1181,7 @@ def main():
 
     final_epoch = 0
     for epoch in range(start_epoch, MAX_EPOCHS + 1):
-        final_epoch = epoch                            # update on each iteration for post-loop logging
+        final_epoch = epoch
 
         t0_train = time.time()
         train_loss = train_epoch(model, train_loader, optimiser, criterion, DEVICE, scaler=scaler)
@@ -1281,8 +1191,8 @@ def main():
         val_f1, _, _, _ = evaluate_model(model, val_loader, DEVICE, logger, use_amp=use_amp)
         val_sec = time.time() - t0_val
 
-        current_lr = scheduler.get_last_lr()[0]        # capture LR before scheduler.step() updates it
-        scheduler.step()                               # advance cosine annealing by one epoch
+        current_lr = scheduler.get_last_lr()[0]
+        scheduler.step()
 
         history["epoch"].append(epoch)
         history["train_loss"].append(train_loss)
@@ -1297,13 +1207,11 @@ def main():
                 epoch, MAX_EPOCHS, train_loss, val_f1, current_lr,
                 best_val_f1, epochs_no_imp, ES_PATIENCE, train_sec, val_sec)
 
-        if val_f1 > best_val_f1:                        # new best model found
-            best_val_f1 = val_f1                       # update best F1 tracker
-            best_epoch = epoch                         # record which epoch produced the best
-            epochs_no_imp = 0                          # reset patience counter
-            # Clone weights to CPU to avoid consuming a second GPU copy in VRAM
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
+            best_epoch = epoch
+            epochs_no_imp = 0
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-            # Save best checkpoint separately (insurance if latest.pt corrupts)
             save_checkpoint(epoch, model, optimiser, scheduler, val_f1, train_loss, attn_hp,
                             best_ckpt_path, logger,
                             best_model_state=best_state,
@@ -1311,7 +1219,7 @@ def main():
                             epochs_no_imp=epochs_no_imp)
             logger.info("  New best val F1: %.4f at epoch %d", best_val_f1, best_epoch)
         else:
-            epochs_no_imp += 1                         # no improvement -- increment patience
+            epochs_no_imp += 1
 
         # Save latest.pt every epoch — single file for clean resume
         save_checkpoint(epoch, model, optimiser, scheduler, val_f1, train_loss, attn_hp,
@@ -1323,13 +1231,11 @@ def main():
         if epoch % CHECKPOINT_FREQ == 0:
             cleanup_checkpoints(CKPT_DIR, KEEP_CKPTS, logger)
 
-        if epochs_no_imp >= ES_PATIENCE:               # early stopping triggered
+        if epochs_no_imp >= ES_PATIENCE:
             logger.info("Early stopping at epoch %d.", epoch)
-            break                                      # exit training loop
+            break
 
     # -- Step 9: Restore best weights ------------------------------------------
-    # Load the CPU-stored best_state back to GPU for final evaluation.
-    # This ensures all subsequent predictions use the best-epoch model.
     if best_state is not None:
         model.load_state_dict({k: v.to(DEVICE) for k, v in best_state.items()})
     logger.info("Best weights restored from epoch %d", best_epoch)
@@ -1343,19 +1249,16 @@ def main():
     logger.info("=" * 65)
 
     # -- Step 10: Save final weights -------------------------------------------
-    # Move to CPU before saving so the .pt file is device-agnostic
-    torch.save(model.cpu().state_dict(), WEIGHTS_PATH)  # save device-agnostic state_dict
-    size_mb = WEIGHTS_PATH.stat().st_size / 1e6         # compute file size for logging
+    torch.save(model.cpu().state_dict(), WEIGHTS_PATH)
+    size_mb = WEIGHTS_PATH.stat().st_size / 1e6
     logger.info("Weights saved : %s (%.2f MB)", WEIGHTS_PATH, size_mb)
-    model.to(DEVICE)                                    # move back to GPU for final evaluation
+    model.to(DEVICE)
 
     # -- Step 11: Final evaluation ---------------------------------------------
-    # Re-evaluate to produce y_true, y_prob arrays needed for post-processing
-    # and all 13 figures. Also serves as a consistency check on weight restoration.
     logger.info("Running final validation evaluation...")
     val_f1_final, y_true, y_pred_05, y_prob = evaluate_model(model, val_loader, DEVICE, logger, use_amp=use_amp)
-    tol = 1e-3                                          # tolerance for floating-point rounding
-    if abs(val_f1_final - best_val_f1) > tol:           # F1 should match best-epoch value
+    tol = 1e-3
+    if abs(val_f1_final - best_val_f1) > tol:
         logger.warning("F1 mismatch: best=%.6f final=%.6f.", best_val_f1, val_f1_final)
     else:
         logger.info("F1 consistency check: PASS")
@@ -1366,12 +1269,12 @@ def main():
      thresh_result, optimal_threshold) = run_postprocessing_evaluations(y_true, y_prob, logger)
 
     # -- Step 13: Save all results ---------------------------------------------
-    y_pred_row1 = (y_prob >= 0.5).astype(int)          # raw binary preds at standard threshold
-    y_pred_row2 = post_row2["smoothed_preds"]          # post-processed preds at threshold 0.5
-    y_pred_row3 = post_row3["smoothed_preds"]          # post-processed preds at optimal threshold
+    y_pred_row1 = (y_prob >= 0.5).astype(int)
+    y_pred_row2 = post_row2["smoothed_preds"]
+    y_pred_row3 = post_row3["smoothed_preds"]
     save_all_results(
         history, row1_metrics, row2_metrics, row3_metrics,
-        far_row2, far_row3, backbone_hp, attn_hp,
+        far_row2, far_row3, backbone_hp, branch_dilations, attn_hp,
         best_epoch, best_val_f1, elapsed, DEVICE, n_params, y_true,
         y_pred_row1, y_pred_row2, y_pred_row3, logger)
 
@@ -1383,7 +1286,6 @@ def main():
         post_row2, post_row3, thresh_result, optimal_threshold, logger)
 
     # -- Step 15: Plot attention saliency (Figure 13) --------------------------
-    # TCNWithAttention.get_attention_weights() confirmed present in tcn_utils.py
     plot_attention_saliency(model, val_loader, y_true, DEVICE, logger)
 
     # -- Step 16: Final inventory and cleanup ----------------------------------
@@ -1393,17 +1295,17 @@ def main():
 
     logger.info("=" * 65)
     logger.info("ALL OUTPUTS SAVED")
-    pfx = "tcn_attention"
+    pfx = "ms_attn"
     all_outputs = [
         WEIGHTS_PATH,
-        CKPT_DIR / "tcn_attention_latest.pt",
-        CKPT_DIR / "tcn_attention_best.pt",
+        CKPT_DIR / "ms_attn_latest.pt",
+        CKPT_DIR / "ms_attn_best.pt",
         TRAIN_LOG_PATH, EVAL_REPORT_PATH, THRESH_PATH, EPOCH_CSV, THREE_ROW_CSV,
-        OUTPUT_ROOT / "tcn_attention_classification_report_row1.json",
-        OUTPUT_ROOT / "tcn_attention_classification_report_row2.json",
-        OUTPUT_ROOT / "tcn_attention_classification_report_row3.json",
-        OUTPUT_ROOT / "tcn_attention_event_details_row2.csv",
-        OUTPUT_ROOT / "tcn_attention_event_details_row3.csv",
+        OUTPUT_ROOT / "ms_attn_classification_report_row1.json",
+        OUTPUT_ROOT / "ms_attn_classification_report_row2.json",
+        OUTPUT_ROOT / "ms_attn_classification_report_row3.json",
+        OUTPUT_ROOT / "ms_attn_event_details_row2.csv",
+        OUTPUT_ROOT / "ms_attn_event_details_row3.csv",
         FIGURE_DIR / ("%s_training_curves.png" % pfx),
         FIGURE_DIR / ("%s_lr_schedule.png" % pfx),
         FIGURE_DIR / ("%s_confusion_matrix_row1.png" % pfx),
@@ -1416,99 +1318,18 @@ def main():
         FIGURE_DIR / ("%s_calibration_curve.png" % pfx),
         FIGURE_DIR / ("%s_far_comparison.png" % pfx),
         FIGURE_DIR / ("%s_segment_length_analysis.png" % pfx),
-        FIGURE_DIR / "tcn_attention_saliency_maps.png",
+        FIGURE_DIR / "ms_attn_saliency_maps.png",
     ]
     for p in all_outputs:
         status = "OK     " if Path(p).exists() else "MISSING"
         logger.info("  [%s] %s", status, p)
 
     logger.info("=" * 65)
-    logger.info("ABLATION NOTE: Compare outputs/TCN/tcn_three_row_summary.csv (M1) "
-                "with outputs/TCNAttention/tcn_attention_three_row_summary.csv (M2) "
-                "to isolate the contribution of temporal attention.")
+    logger.info("ABLATION NOTE: Compare M3 (MultiScaleTCN) three_row_summary.csv "
+                "with M4 (this script) ms_attn_three_row_summary.csv "
+                "to isolate the contribution of temporal attention over multi-scale TCN.")
     logger.info("NEXT: run final_evaluation.py when test data is ready.")
 
 
 if __name__ == "__main__":
     main()
-
-
-# ======================================================================
-# RESEARCH REPORTING GUIDE -- TCNTemporalAttention.py
-# ======================================================================
-#
-# -- ARCHITECTURE (Methods) ------------------------------------------------
-# "Model 2 extended the TCN baseline (M1) by replacing global average
-# pooling with two-layer additive temporal attention. For the TCN output
-# H in R^(T x F), per-timestep energy scores were computed as
-# e_t = tanh(W_a h_t + b_a) where W_a in R^(D_a x F), followed by
-# scalar scores v^T e_t. Attention weights alpha_t = softmax({v^T e_t})
-# formed a context vector c = sum_t alpha_t h_t, regularised by dropout
-# before the linear classification head.
-# Complexity is O(T * F * D_a), linear in sequence length."
-#
-# Attention uses two-layer additive scoring (tanh + linear) with
-# tunable attention_dim and attention_dropout from best_attention_params.json.
-# This matches MultiScaleTCNWithAttention for consistent ablation.
-#
-# Backbone params (from best_params.json):
-#   num_layers L  -- determines RF = 2*(2^L - 1)*(k-1) + 1
-#   kernel_size k
-#   num_filters F -- also determines attention embed_dim
-#   dropout p
-#
-# Attention params (from best_attention_params.json):
-#   attention_dim D_a -- projection dimension of scoring function
-#   attention_dropout p_a -- dropout on context vector
-#   learning_rate, weight_decay, batch_size
-#
-# Total trainable parameters (all -- backbone + attention)
-# Backbone parameter count (reported separately)
-# Attention parameter count (= total - backbone)
-#
-# -- TRAINING (Methods) ----------------------------------------------------
-# "Training hyperparameters (learning rate, weight decay, batch size) were
-# tuned using Optuna TPE (tune_temporal_attention.py) with the TCN backbone
-# frozen. For final training, all parameters (backbone and attention) were
-# trained jointly for up to 100 epochs with early stopping (patience 10),
-# allowing the backbone to adapt to the attention mechanism."
-#
-# WHY 100 EPOCHS: Standard EEG DL budget. Cosine annealing needs a full
-#   half-cycle. Early stopping terminates when converged. Same as M1.
-#
-# WHY JOINT TRAINING (not frozen backbone):
-#   During tuning, the backbone was frozen to isolate the attention
-#   hyperparameter search. During final training, unfreezing the backbone
-#   allows it to adapt slightly to the attention mechanism, producing
-#   the best possible final model. The backbone architecture is still
-#   identical to M1, ensuring the ablation comparison is valid.
-#
-# WHY TRAINING HPs FROM ATTENTION TUNING (not backbone tuning):
-#   The learning rate and weight decay were optimised specifically for
-#   training the attention-augmented model. Using backbone tuning HPs
-#   would apply training settings optimised for a different architecture.
-#
-# -- ABLATION CONTEXT (Results/Discussion) ----------------------------------
-# M1 (TCN) vs M2 (TCN + Temporal Attention):
-#   Both share identical backbone (num_layers, kernel_size, num_filters,
-#   dropout). The only difference is the attention pooling mechanism.
-#   Compare: outputs/TCN/tcn_three_row_summary.csv (M1)
-#       vs:  outputs/TCNAttention/tcn_attention_three_row_summary.csv (M2)
-#
-# -- INTERPRETABILITY (Results) --------------------------------------------
-# "Temporal attention weights were extracted for all validation segments
-# using get_attention_weights() and averaged over ictal and non-ictal
-# classes separately. The saliency profiles demonstrated [higher/lower]
-# attention during ictal periods, indicating preferential focus on
-# seizure-relevant time steps without requiring post-hoc attribution."
-# See: tcn_attention_saliency_maps.png (Figure 13)
-#
-# -- FIGURES ----------------------------------------------------------------
-# Figures 1-12: same reviewer questions as TCN.py.
-# Figure 13 (tcn_attention_saliency_maps.png):
-#   Q: Does the attention learn clinically meaningful temporal focus?
-#   Q: Is there a measurable class-dependent difference in saliency?
-#   Q: Can predictions be explained without SHAP / GradCAM?
-#   A: Three-panel figure: mean attention per class, differential
-#      profile, and example segment with attention overlay.
-# ======================================================================

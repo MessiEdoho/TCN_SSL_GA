@@ -62,21 +62,7 @@ set_seed(42)  # set global seed immediately
 # -- Device detection ----------------------------------------------------------
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-if torch.cuda.is_available():
-    gpu_name = torch.cuda.get_device_name(0)
-    vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-    cuda_ver = torch.version.cuda
-    print(f"Device        : {gpu_name}")
-    print(f"VRAM total    : {vram_gb:.2f} GB")
-    print(f"CUDA version  : {cuda_ver}")
-else:
-    gpu_name = "cpu"
-    print("No GPU detected -- training will run on CPU.")
-    print("Tuning 60 trials on CPU may take considerably longer.")
-
-print(f"PyTorch       : {torch.__version__}")
-print(f"Optuna        : {optuna.__version__}")
-print(f"Using device  : {DEVICE}")
+# GPU info logged after logger setup (Section 4)
 # -- Section 4: Configuration --------------------------------------------------
 
 # -- Data splits ---------------------------------------------------------------
@@ -97,7 +83,7 @@ SEED          = 42     # random seed for reproducibility
 
 # -- Optuna configuration ------------------------------------------------------
 N_TRIALS      = 50     # total number of Optuna trials
-N_STARTUP     = 15     # random exploration trials before TPE kicks in
+N_STARTUP     = 10     # random exploration trials before TPE kicks in
 STUDY_NAME    = "tcn_HPT_binary_optuna"  # Optuna study name
 
 # -- Output --------------------------------------------------------------------
@@ -120,6 +106,14 @@ log.addHandler(ch)                    # attach console handler
 
 log.info(f"Configuration loaded. Device: {DEVICE}")
 log.info(f"Output directory: {OUTPUT_DIR.resolve()}")
+if torch.cuda.is_available():
+    log.info("GPU  : %s", torch.cuda.get_device_name(0))
+    log.info("VRAM : %.2f GB", torch.cuda.get_device_properties(0).total_memory / 1e9)
+    log.info("CUDA : %s", torch.version.cuda)
+else:
+    log.info("Device: CPU")
+log.info("PyTorch: %s", torch.__version__)
+log.info("Optuna : %s", optuna.__version__)
 # -- Section 5: Dataset and DataLoader -----------------------------------------
 # Load train/val file-label pairs from data_splits.json (single source of truth).
 # All pipeline scripts and this notebook use the same JSON to guarantee consistent
@@ -241,7 +235,7 @@ def trial_callback(study, trial):
 
 # -- Create study --------------------------------------------------------------
 sampler = TPESampler(seed=SEED, n_startup_trials=N_STARTUP)  # TPE with 15 random starts
-pruner  = MedianPruner(n_startup_trials=N_STARTUP, n_warmup_steps=15)  # prune below median
+pruner  = MedianPruner(n_startup_trials=N_STARTUP, n_warmup_steps=3)   # prune below median after epoch 3
 
 # SQLite storage enables resume after crash: re-running the script picks up
 # from the last completed trial. load_if_exists=True loads the existing study
@@ -431,7 +425,7 @@ summary = {
     "best_trial_number":      study.best_trial.number,
     "best_val_f1":            round(study.best_trial.value, 6),
     "training_device":        DEVICE.type,
-    "gpu_name":               gpu_name,
+    "gpu_name":               torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
     "fs_hz":                  FS,
     "segment_len_samples":    SEGMENT_LEN,
     "segment_len_seconds":    SEGMENT_LEN / FS

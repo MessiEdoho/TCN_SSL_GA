@@ -130,7 +130,7 @@ SEED              = 42                                 # global reproducibility 
 MAX_EPOCHS        = 20                                 # max epochs per trial (ES fires before 20)
 ES_PATIENCE       = 5                                  # early stopping patience (epochs)
 N_TRIALS          = 50                                 # total Optuna trials
-N_STARTUP         = 12                                 # random startup before TPE
+N_STARTUP         = 10                                 # random startup before TPE
 FS                = 500                                # EEG sampling rate (Hz)
 SEGMENT_LEN       = 2500                               # samples per segment (5 s at 500 Hz)
 SEGMENT_SEC       = 5.0                                # segment duration in seconds
@@ -734,7 +734,7 @@ def main():
         study_name="multiscale_attention_tuning",
         direction="maximize",
         sampler=TPESampler(seed=SEED, n_startup_trials=N_STARTUP),
-        pruner=MedianPruner(n_startup_trials=N_STARTUP, n_warmup_steps=10),
+        pruner=MedianPruner(n_startup_trials=N_STARTUP, n_warmup_steps=3),
         storage="sqlite:///" + str(study_db.resolve()),
         load_if_exists=True,
     )

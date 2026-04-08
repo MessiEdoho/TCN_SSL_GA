@@ -54,6 +54,7 @@ import json
 import logging
 import sys
 import csv
+import time
 import datetime
 import shutil
 from pathlib import Path
@@ -84,8 +85,8 @@ from tcn_utils import (
     make_loader,
     filter_unpaired_subjects,
     downsample_non_ictal,
+    filter_extreme_segments,
     train_one_epoch,
-    evaluate,
     count_parameters,
     segment_predictions_to_events,
     compute_event_level_far,
@@ -129,7 +130,7 @@ REFRACTORY_SEC    = 30.0                               # merge events separated 
 SMOOTHING_WIN     = 3                                  # number of segments in probability smoothing kernel
 MODEL_NAME        = "MultiScaleTCN"                    # model identifier for filenames and JSON records
 
-OUTPUT_ROOT       = Path("outputs") / "MultiScaleTCN"            # all M3 outputs under this directory
+OUTPUT_ROOT       = Path("/home/people/22206468/scratch/OUTPUT/MODEL3_OUTPUT") / "MultiScaleTCN"            # all M3 outputs under this directory
 CKPT_DIR          = OUTPUT_ROOT / "checkpoints"                  # periodic and best-model checkpoints
 LOG_DIR           = OUTPUT_ROOT / "logs"                         # training log (DEBUG-level detail)
 FIGURE_DIR        = OUTPUT_ROOT / "figures"                      # all 13 evaluation figures
@@ -139,12 +140,9 @@ EVAL_REPORT_PATH  = OUTPUT_ROOT / "multiscale_tcn_evaluation_report.json"  # thr
 THRESH_PATH       = OUTPUT_ROOT / "multiscale_tcn_optimal_threshold.json"  # Youden-optimal threshold
 EPOCH_CSV         = OUTPUT_ROOT / "multiscale_tcn_epoch_metrics.csv"     # per-epoch loss, F1, LR
 THREE_ROW_CSV     = OUTPUT_ROOT / "multiscale_tcn_three_row_summary.csv" # paper Table (M3 block)
-# data_splits.json lives at data_splits_outputs/ per generate_data_splits.py;
-# SPLITS_PATH_ALT is a fallback in case the user moved it to outputs/
-SPLITS_PATH_PRIMARY = Path("data_splits_outputs") / "data_splits.json"
-SPLITS_PATH_ALT     = Path("outputs") / "data_splits.json"
-BEST_PARAMS_PATH    = Path("outputs") / "best_multiscale_params.json"    # from tune_multiscale_tcn.py
-PREV_THRESH_PATH    = Path("outputs") / "optimal_threshold_multiscale.json"  # reuse if already computed
+# data_splits.json -- single source of truth (matches all other pipeline scripts)
+SPLITS_PATH         = Path("/scratch/22206468/INPUT_DATA/data_splits_outputs/data_splits.json")
+BEST_PARAMS_PATH    = Path("/home/people/22206468/scratch/OUTPUT/MODEL3_OUTPUT/MultiScaleTCNtuning_outputs") / "best_multiscale_params.json"
 
 # Fallback dilation schedules if branch_dilations not in JSON
 DEFAULT_BRANCH1 = [1, 2, 4]                            # fine temporal scale
@@ -173,12 +171,13 @@ def setup_logging():
     log_file = LOG_DIR / "MultiScaleTCN_training.log"
     logger = logging.getLogger("MultiScaleTCN_training")
     logger.setLevel(logging.DEBUG)
+    logger.handlers.clear()                         # prevent duplicate handlers on resume
 
     fmt = logging.Formatter(
         "%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S")
 
-    fh = logging.FileHandler(log_file, mode="w", encoding="utf-8")
+    fh = logging.FileHandler(log_file, mode="a", encoding="utf-8")  # append to preserve logs on resume
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(fmt)
 
@@ -264,18 +263,13 @@ def load_splits(logger):
     -------
     tuple of (train_pairs, val_pairs)
     """
-    if SPLITS_PATH_PRIMARY.exists():
-        splits_path = SPLITS_PATH_PRIMARY
-    elif SPLITS_PATH_ALT.exists():
-        splits_path = SPLITS_PATH_ALT
-    else:
-        logger.error("data_splits.json not found at %s or %s. "
-                     "Run generate_data_splits.py first.",
-                     SPLITS_PATH_PRIMARY, SPLITS_PATH_ALT)
-        raise FileNotFoundError("data_splits.json")
+    if not SPLITS_PATH.exists():
+        logger.error("data_splits.json not found at %s. "
+                     "Run generate_data_splits.py first.", SPLITS_PATH)
+        raise FileNotFoundError(str(SPLITS_PATH))
 
-    logger.info("Loading splits from: %s", splits_path)
-    with open(splits_path, "r", encoding="utf-8") as f:
+    logger.info("Loading splits from: %s", SPLITS_PATH)
+    with open(SPLITS_PATH, "r", encoding="utf-8") as f:
         splits = json.load(f)
 
     train_pairs = [(rec["filepath"], rec["label"]) for rec in splits["train"]]
@@ -380,22 +374,31 @@ def build_training_components(model, pos_weight, hp, device, logger):
 # ---------------------------------------------------------------------------
 # save_checkpoint
 # ---------------------------------------------------------------------------
-def save_checkpoint(epoch, model, optimiser, scheduler, val_f1, train_loss, hp, path, logger):
+def save_checkpoint(epoch, model, optimiser, scheduler, val_f1, train_loss,
+                    hp, path, logger, best_model_state=None,
+                    best_val_f1=None, best_epoch=None, epochs_no_imp=None):
     """Save a full training state checkpoint. Non-fatal on failure.
 
-    Mirror of TCN.py save_checkpoint() -- no differences.
+    When best_model_state is provided, the checkpoint contains everything
+    needed for a clean resume: current training state + best-epoch weights.
     """
     try:
-        torch.save({
+        payload = {
             "epoch": epoch,
             "model_state": model.state_dict(),
             "optimiser_state": optimiser.state_dict(),
             "scheduler_state": scheduler.state_dict(),
             "val_f1": val_f1,
             "train_loss": train_loss,
+            "best_val_f1": best_val_f1,
+            "best_epoch": best_epoch,
+            "epochs_no_imp": epochs_no_imp,
             "hyperparameters": hp,
             "timestamp": datetime.datetime.now().isoformat(),
-        }, path)
+        }
+        if best_model_state is not None:
+            payload["best_model_state"] = best_model_state
+        torch.save(payload, path)
         logger.debug("Checkpoint saved: %s", path)
     except Exception as exc:
         logger.error("Checkpoint save failed (%s): %s", path, exc)
@@ -421,41 +424,43 @@ def cleanup_checkpoints(ckpt_dir, keep_last_n, logger):
 # ---------------------------------------------------------------------------
 # train_epoch
 # ---------------------------------------------------------------------------
-def train_epoch(model, loader, optimiser, criterion, device):
-    """Run one training epoch using train_one_epoch() from tcn_utils.py.
+def train_epoch(model, loader, optimiser, criterion, device, scaler=None):
+    """Run one training epoch. Delegates to train_one_epoch with optional AMP scaler.
 
-    Mirror of TCN.py train_epoch() -- no differences.
     Returns mean training loss.
     """
-    return train_one_epoch(model, loader, optimiser, criterion, device)
+    return train_one_epoch(model, loader, optimiser, criterion, device, scaler=scaler)
 
 
 # ---------------------------------------------------------------------------
 # evaluate_model
 # ---------------------------------------------------------------------------
-def evaluate_model(model, loader, device, logger):
-    """Evaluate model and collect predictions and probabilities.
+def evaluate_model(model, loader, device, logger, use_amp=False):
+    """Evaluate model in a single forward pass, collecting predictions and probabilities.
 
-    Mirror of TCN.py evaluate_model() -- no differences.
     Returns (val_f1, y_true, y_pred, y_prob).
     """
-    # evaluate() returns macro F1, ground truth, and binary preds at threshold 0.5.
-    # It does NOT return continuous probabilities, which are needed for AUROC,
-    # calibration curves, PR curves, and the post-processing pipeline.
-    val_f1, y_true, y_pred = evaluate(model, loader, device)
-
-    # Second inference pass collects continuous sigmoid probabilities (y_prob).
-    # This is a separate pass because evaluate() in tcn_utils.py only stores
-    # binarised predictions. The overhead is acceptable because inference is
-    # fast relative to the training epoch that preceded it.
-    model.eval()                                         # ensure dropout/batchnorm are off
+    model.eval()
+    all_true = []
+    all_pred = []
     all_probs = []
-    with torch.no_grad():                                # disable gradient tracking for speed
-        for x, _ in loader:
-            x = x.to(device)                             # transfer batch to GPU
-            probs = torch.sigmoid(model(x)).cpu().numpy()  # sigmoid maps logits to [0,1]
-            all_probs.extend(probs)                      # accumulate on CPU to avoid VRAM buildup
-    y_prob = np.array(all_probs)                         # shape: (n_segments,) continuous in [0,1]
+
+    with torch.no_grad():
+        for x, y in loader:
+            x = x.to(device, non_blocking=True)
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                logits = model(x)
+            # sigmoid + threshold outside autocast for FP32 precision at decision boundary
+            probs = torch.sigmoid(logits)
+            preds = (probs >= 0.5).long()
+            all_true.append(y.cpu().numpy())
+            all_pred.append(preds.cpu().numpy())
+            all_probs.append(probs.cpu().numpy())
+
+    y_true = np.concatenate(all_true)
+    y_pred = np.concatenate(all_pred)
+    y_prob = np.concatenate(all_probs)
+    val_f1 = f1_score(y_true, y_pred, average="macro", zero_division=0)
 
     return val_f1, y_true, y_pred, y_prob
 
@@ -557,32 +562,27 @@ def run_postprocessing_evaluations(y_true, y_prob, logger):
     # The alternative (F1) weights false negatives more heavily than false
     # positives via the precision term, which may not reflect the clinical
     # balance required in continuous EEG monitoring.
-    if PREV_THRESH_PATH.exists():
-        with open(PREV_THRESH_PATH, "r", encoding="utf-8") as f:
-            td = json.load(f)
-        optimal_threshold = td["optimal_threshold"]
-        thresh_result = find_optimal_threshold(y_true, y_prob, objective="youden")
-        logger.info("Optimal threshold loaded from %s: %.4f", PREV_THRESH_PATH, optimal_threshold)
-    else:
-        thresh_result = find_optimal_threshold(y_true, y_prob, objective="youden")
-        optimal_threshold = thresh_result["optimal_threshold"]
-        with open(THRESH_PATH, "w", encoding="utf-8") as f:
-            json.dump({
-                "model": MODEL_NAME,
-                "timestamp": datetime.datetime.now().isoformat(),
-                "optimal_threshold": optimal_threshold,
-                "objective": "youden",
-                "optimal_score": thresh_result["optimal_score"],
-                "sensitivity_at_opt": thresh_result["sensitivity_at_opt"],
-                "specificity_at_opt": thresh_result["specificity_at_opt"],
-                "post_processing": {
-                    "smoothing_window": SMOOTHING_WIN,
-                    "refractory_period_sec": REFRACTORY_SEC,
-                    "min_event_duration_sec": MIN_EVENT_SEC,
-                    "step_sec": STEP_SEC,
-                },
-            }, f, indent=2)
-        logger.info("Optimal threshold computed and saved: %.4f", optimal_threshold)
+    # Always compute fresh from current model predictions — a cached threshold
+    # from a previous run would be stale if the model weights changed.
+    thresh_result = find_optimal_threshold(y_true, y_prob, objective="youden")
+    optimal_threshold = thresh_result["optimal_threshold"]
+    with open(THRESH_PATH, "w", encoding="utf-8") as f:
+        json.dump({
+            "model": MODEL_NAME,
+            "timestamp": datetime.datetime.now().isoformat(),
+            "optimal_threshold": optimal_threshold,
+            "objective": "youden",
+            "optimal_score": thresh_result["optimal_score"],
+            "sensitivity_at_opt": thresh_result["sensitivity_at_opt"],
+            "specificity_at_opt": thresh_result["specificity_at_opt"],
+            "post_processing": {
+                "smoothing_window": SMOOTHING_WIN,
+                "refractory_period_sec": REFRACTORY_SEC,
+                "min_event_duration_sec": MIN_EVENT_SEC,
+                "step_sec": STEP_SEC,
+            },
+        }, f, indent=2)
+    logger.info("Optimal threshold computed and saved: %.4f", optimal_threshold)
 
     # -- Row 2: post-processed at 0.5 -----------------------------------------
     post_row2 = segment_predictions_to_events(
@@ -1204,9 +1204,11 @@ def main():
     train_pairs = filter_unpaired_subjects(train_pairs, logger=logger)
     # Step 2: downsample non-ictal to 1:4 ratio, stratified by recording.
     train_pairs = downsample_non_ictal(train_pairs, ratio=4, seed=42)
-    # Step 3: pos_weight = 1.0 (downsampling is the sole imbalance correction).
-    pos_weight = torch.tensor([1.0], dtype=torch.float32)
     logger.info("Post-downsampling corpus: %d segments", len(train_pairs))
+    # Step 3: remove segments with extreme amplitudes (preprocessing failures).
+    train_pairs = filter_extreme_segments(train_pairs, threshold=1000.0, logger=logger)
+    # Step 4: pos_weight = 1.0 (downsampling is the sole imbalance correction).
+    pos_weight = torch.tensor([1.0], dtype=torch.float32)
     # -- End corpus preparation ------------------------------------------------
 
     # -- Step 3: Build model ---------------------------------------------------
@@ -1234,37 +1236,64 @@ def main():
     training_start = datetime.datetime.now()
 
     # -- Resume from checkpoint if available -----------------------------------
-    resume_ckpt = CKPT_DIR / "multiscale_tcn_best.pt"
-    if resume_ckpt.exists():
-        ckpt = torch.load(resume_ckpt, map_location=DEVICE)
+    # latest.pt contains everything: current model/optimiser/scheduler state,
+    # best-epoch weights, patience counter, and best_val_f1. A single file
+    # load restores the exact training state. multiscale_tcn_best.pt is a
+    # fallback if latest.pt was corrupted (e.g., Slurm killed during torch.save).
+    # To start fresh, delete the checkpoints/ directory.
+    latest_path = CKPT_DIR / "multiscale_tcn_latest.pt"
+    best_ckpt_path = CKPT_DIR / "multiscale_tcn_best.pt"
+    resume_path = latest_path if latest_path.exists() else (
+        best_ckpt_path if best_ckpt_path.exists() else None)
+
+    if resume_path is not None:
+        ckpt = torch.load(resume_path, map_location=DEVICE)
         model.load_state_dict(ckpt["model_state"])
         optimiser.load_state_dict(ckpt["optimiser_state"])
         scheduler.load_state_dict(ckpt["scheduler_state"])
-        best_val_f1 = ckpt.get("val_f1", 0.0)
-        best_epoch = ckpt.get("epoch", 0)
-        start_epoch = best_epoch + 1
-        epochs_no_imp = 0
-        best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-        logger.info("RESUMED from checkpoint: epoch %d, val_f1=%.4f",
-                    best_epoch, best_val_f1)
+        best_val_f1 = ckpt.get("best_val_f1", ckpt.get("val_f1", 0.0))
+        best_epoch = ckpt.get("best_epoch", ckpt.get("epoch", 0))
+        start_epoch = ckpt["epoch"] + 1
+        epochs_no_imp = ckpt.get("epochs_no_imp", 0)
+        # Restore best-epoch weights (stored inside latest.pt)
+        if "best_model_state" in ckpt:
+            best_state = {k: v.cpu().clone() for k, v in ckpt["best_model_state"].items()}
+        else:
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+        logger.info("RESUMED from %s: epoch %d, best_val_f1=%.4f (epoch %d), patience=%d/%d",
+                    resume_path.name, ckpt["epoch"], best_val_f1,
+                    best_epoch, epochs_no_imp, ES_PATIENCE)
     else:
         logger.info("No checkpoint found. Starting from epoch 1.")
 
     # -- Step 7: Training loop -------------------------------------------------
+    # Mixed precision (AMP): use FP16 forward/backward on CUDA to leverage
+    # Tensor Cores (V100, A100, L40S, T4). GradScaler dynamically adjusts
+    # the loss scale to prevent FP16 gradient underflow. On CPU, use_amp is
+    # False and all operations remain FP32 — no behavioural change.
+    use_amp = DEVICE.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp) if use_amp else None
+
     logger.info("=" * 65)
     logger.info("TRAINING STARTED")
     logger.info("  Start epoch : %d", start_epoch)
     logger.info("  Max epochs  : %d", MAX_EPOCHS)
     logger.info("  ES patience : %d", ES_PATIENCE)
     logger.info("  Ckpt freq   : every %d", CHECKPOINT_FREQ)
+    logger.info("  Mixed prec  : %s", "AMP (FP16)" if use_amp else "FP32")
     logger.info("=" * 65)
 
     final_epoch = 0
     for epoch in range(start_epoch, MAX_EPOCHS + 1):
         final_epoch = epoch
 
-        train_loss = train_epoch(model, train_loader, optimiser, criterion, DEVICE)
-        val_f1, _, _, _ = evaluate_model(model, val_loader, DEVICE, logger)
+        t0_train = time.time()
+        train_loss = train_epoch(model, train_loader, optimiser, criterion, DEVICE, scaler=scaler)
+        train_sec = time.time() - t0_train
+
+        t0_val = time.time()
+        val_f1, _, _, _ = evaluate_model(model, val_loader, DEVICE, logger, use_amp=use_amp)
+        val_sec = time.time() - t0_val
 
         current_lr = scheduler.get_last_lr()[0]
         scheduler.step()
@@ -1277,24 +1306,34 @@ def main():
         # Lightweight logging: first, every 10th, early-stop, and new-best epochs
         if epoch == start_epoch or epoch % 10 == 0 or epochs_no_imp >= ES_PATIENCE or val_f1 > best_val_f1:
             logger.info(
-                "Epoch %3d/%d | loss=%.4f | val_f1=%.4f | lr=%.2e | best=%.4f | patience=%d/%d",
+                "Epoch %3d/%d | loss=%.4f | val_f1=%.4f | lr=%.2e | best=%.4f | patience=%d/%d"
+                " | train %.0fs | val %.0fs",
                 epoch, MAX_EPOCHS, train_loss, val_f1, current_lr,
-                best_val_f1, epochs_no_imp, ES_PATIENCE)
+                best_val_f1, epochs_no_imp, ES_PATIENCE, train_sec, val_sec)
 
         if val_f1 > best_val_f1:
             best_val_f1 = val_f1
             best_epoch = epoch
             epochs_no_imp = 0
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            # Save best checkpoint separately (insurance if latest.pt corrupts)
             save_checkpoint(epoch, model, optimiser, scheduler, val_f1, train_loss, hp,
-                            CKPT_DIR / "multiscale_tcn_best.pt", logger)
+                            best_ckpt_path, logger,
+                            best_model_state=best_state,
+                            best_val_f1=best_val_f1, best_epoch=best_epoch,
+                            epochs_no_imp=epochs_no_imp)
             logger.info("  New best val F1: %.4f at epoch %d", best_val_f1, best_epoch)
         else:
             epochs_no_imp += 1
 
+        # Save latest.pt every epoch — single file for clean resume
+        save_checkpoint(epoch, model, optimiser, scheduler, val_f1, train_loss, hp,
+                        latest_path, logger,
+                        best_model_state=best_state,
+                        best_val_f1=best_val_f1, best_epoch=best_epoch,
+                        epochs_no_imp=epochs_no_imp)
+
         if epoch % CHECKPOINT_FREQ == 0:
-            save_checkpoint(epoch, model, optimiser, scheduler, val_f1, train_loss, hp,
-                            CKPT_DIR / ("multiscale_tcn_epoch_%d.pt" % epoch), logger)
             cleanup_checkpoints(CKPT_DIR, KEEP_CKPTS, logger)
 
         if epochs_no_imp >= ES_PATIENCE:
@@ -1326,7 +1365,7 @@ def main():
     # Re-evaluate after restoring best weights. This produces the y_true and
     # y_prob arrays needed for post-processing (Rows 1-3) and all figures.
     logger.info("Running final validation evaluation...")
-    val_f1_final, y_true, y_pred_05, y_prob = evaluate_model(model, val_loader, DEVICE, logger)
+    val_f1_final, y_true, y_pred_05, y_prob = evaluate_model(model, val_loader, DEVICE, logger, use_amp=use_amp)
 
     # Consistency check: confirm F1 matches the best-epoch value. A mismatch
     # indicates weight restoration failed. Tolerance of 1e-3 accounts for
@@ -1374,6 +1413,7 @@ def main():
     pfx = "multiscale_tcn"
     all_outputs = [
         WEIGHTS_PATH,
+        CKPT_DIR / "multiscale_tcn_latest.pt",
         CKPT_DIR / "multiscale_tcn_best.pt",
         TRAIN_LOG_PATH,
         EVAL_REPORT_PATH,
