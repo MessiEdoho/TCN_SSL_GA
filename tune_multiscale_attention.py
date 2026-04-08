@@ -4,7 +4,34 @@ tune_multiscale_attention.py
 Tunes temporal attention hyperparameters of
 MultiScaleTCNWithAttention using Optuna TPE.
 
-Tuning protocol: N_TRIALS=40, MAX_EPOCHS=20, ES_PATIENCE=5.
+Tuning protocol
+----------------
+N_TRIALS    = 50   total Optuna trials
+MAX_EPOCHS  = 20   max epochs per trial (cosine annealing half-cycle)
+ES_PATIENCE = 5    early stopping patience (epochs without val F1 improvement)
+
+Early stopping at patience=5 within a 20-epoch budget means most trials
+terminate between epochs 8-15. The reduced budget accelerates the search
+while retaining enough epochs for the cosine schedule to differentiate
+good from bad hyperparameter configurations (Li et al., 2017).
+
+Validation subset: a stratified 10% subset of the validation partition
+is used during tuning to reduce per-epoch evaluation cost. The subset
+preserves the original class ratio and is fixed across all trials
+(Falkner et al., 2018).
+
+DataLoader optimisations: num_workers=4, persistent_workers=True,
+prefetch_factor=4 overlap CPU-side data loading with GPU compute,
+reducing per-epoch wall time on multi-core nodes (Mattson et al., 2020).
+
+References
+----------
+Li, L., Jamieson, K., DeSalvo, G., Rostamizadeh, A., & Talwalkar, A.
+    (2017). Hyperband: A Novel Bandit-Based Approach to Hyperparameter
+    Optimization. JMLR, 18(185), 1-52.
+Falkner, S., Klein, A., & Hutter, F. (2018). BOHB: Robust and Efficient
+    Hyperparameter Optimization at Scale. ICML 2018.
+Mattson, P. et al. (2020). MLPerf Training Benchmark. MLSys 2020.
 
 The MultiScaleTCN backbone parameters are transferred
 from outputs/best_multiscale_params.json and frozen.
@@ -66,6 +93,7 @@ import json
 import logging
 import sys
 import csv
+import time
 import datetime
 from pathlib import Path
 
@@ -86,6 +114,8 @@ from tcn_utils import (
     make_loader,
     filter_unpaired_subjects,
     downsample_non_ictal,
+    filter_extreme_segments,
+    downsample_val_stratified,
     MultiScaleTCNWithAttention,
     count_parameters,
     train_one_epoch,
@@ -99,7 +129,7 @@ from tcn_utils import (
 SEED              = 42                                 # global reproducibility seed
 MAX_EPOCHS        = 20                                 # max epochs per trial (ES fires before 20)
 ES_PATIENCE       = 5                                  # early stopping patience (epochs)
-N_TRIALS          = 40                                 # total Optuna trials
+N_TRIALS          = 50                                 # total Optuna trials
 N_STARTUP         = 12                                 # random startup before TPE
 FS                = 500                                # EEG sampling rate (Hz)
 SEGMENT_LEN       = 2500                               # samples per segment (5 s at 500 Hz)
@@ -362,7 +392,14 @@ def optuna_objective(trial, train_pairs, val_pairs,
         logger.info("  Frozen (backbone) : %s", "{:,}".format(n_frozen))
         logger.info("  Trainable (attn)  : %s", "{:,}".format(n_trainable))
 
-    # -- e. Build data loaders -------------------------------------------------
+    # -- e. Log trial header with all sampled hyperparameters --------------------
+    n_params = count_parameters(model)
+    logger.info(
+        "Trial %d: attn_dim=%d attn_drop=%.2f lr=%.2e wd=%.2e bs=%d params=%d",
+        trial.number, attention_dim, attention_dropout,
+        learning_rate, weight_decay, batch_size, n_params)
+
+    # -- f. Build data loaders -------------------------------------------------
     train_loader = make_loader(train_pairs, batch_size=batch_size, train=True, device=device)
     val_loader   = make_loader(val_pairs, batch_size=batch_size, train=False, device=device)
 
@@ -381,9 +418,22 @@ def optuna_objective(trial, train_pairs, val_pairs,
     best_val_f1   = 0.0
     epochs_no_imp = 0
 
+    # Mixed precision (AMP): use FP16 forward/backward on CUDA to leverage
+    # Tensor Cores (V100, A100, L40S, T4). GradScaler dynamically adjusts
+    # the loss scale to prevent FP16 gradient underflow. On CPU, use_amp is
+    # False and all operations remain FP32 — no behavioural change.
+    use_amp = device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp) if use_amp else None
+
     for epoch in range(1, MAX_EPOCHS + 1):
-        train_loss = train_one_epoch(model, train_loader, optimiser, criterion, device)
-        val_f1, _, _ = evaluate(model, val_loader, device)
+        t0_train = time.time()
+        train_loss = train_one_epoch(model, train_loader, optimiser, criterion, device, scaler=scaler)
+        train_sec = time.time() - t0_train
+
+        t0_val = time.time()
+        val_f1, _, _ = evaluate(model, val_loader, device, use_amp=use_amp)
+        val_sec = time.time() - t0_val
+
         scheduler.step()
 
         if val_f1 > best_val_f1:
@@ -395,9 +445,10 @@ def optuna_objective(trial, train_pairs, val_pairs,
         # Lightweight progress: first, every 10th, and early-stop epoch
         if epoch == 1 or epoch % 10 == 0 or epochs_no_imp >= ES_PATIENCE:
             logger.info(
-                "  T%d ep %3d/%d | loss=%.4f | f1=%.4f | best=%.4f | pat=%d/%d",
+                "  T%d ep %3d/%d | loss=%.4f | f1=%.4f | best=%.4f | pat=%d/%d"
+                " | train %.0fs | val %.0fs",
                 trial.number, epoch, MAX_EPOCHS, train_loss, val_f1,
-                best_val_f1, epochs_no_imp, ES_PATIENCE)
+                best_val_f1, epochs_no_imp, ES_PATIENCE, train_sec, val_sec)
 
         trial.report(val_f1, epoch)
         if trial.should_prune():
@@ -448,13 +499,17 @@ def save_results(study, ms_hp, ms_config, branch_dilations, device, logger):
 
     logger.info("=" * 60)
     logger.info("TUNING COMPLETE")
-    logger.info("  Best trial      : #%d", best_trial.number)
-    logger.info("  Best val F1     : %.4f", best_val_f1)
     logger.info("  Completed       : %d", len(completed))
     logger.info("  Pruned          : %d", len(pruned))
+    logger.info("  Best trial      : #%d", best_trial.number)
+    logger.info("  Best val F1     : %.4f", best_val_f1)
     logger.info("  Best parameters :")
-    for k, v in best_params.items():
-        logger.info("    %-25s: %s", k, v)
+    logger.info("    attention_dim   : %d", best_params["attention_dim"])
+    logger.info("    attention_drop  : %.2f", best_params["attention_dropout"])
+    logger.info("    learning_rate   : %.2e", best_params["learning_rate"])
+    logger.info("    weight_decay    : %.2e", best_params["weight_decay"])
+    logger.info("    batch_size      : %d", best_params["batch_size"])
+    logger.info("    Device          : %s", device)
 
     # -- a. Save best_multiscale_attn_params.json ------------------------------
     record = {
@@ -661,6 +716,12 @@ def main():
     train_pairs = downsample_non_ictal(train_pairs, ratio=4, seed=42)
     # pos_weight = 1.0 is set inside optuna_objective() per trial (on device).
     logger.info("Post-downsampling corpus: %d segments", len(train_pairs))
+    # Step 3: remove segments with extreme amplitudes (preprocessing failures).
+    train_pairs = filter_extreme_segments(train_pairs, threshold=1000.0, logger=logger)
+
+    # Step 4: stratified 10% validation subset for tuning speed.
+    val_pairs = downsample_val_stratified(val_pairs, fraction=0.10, seed=42)
+    logger.info("Val subset for tuning: %d segments (10%% stratified)", len(val_pairs))
     # -- End corpus preparation ------------------------------------------------
 
     # -- Step 3: create and run Optuna study -----------------------------------

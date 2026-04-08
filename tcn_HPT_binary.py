@@ -3,14 +3,19 @@ tcn_HPT_binary.py -- TCN hyperparameter tuning via Optuna TPE.
 
 Tuning protocol
 ---------------
-N_TRIALS    = 40   total Optuna trials
+N_TRIALS    = 50   total Optuna trials
 MAX_EPOCHS  = 20   max epochs per trial (cosine annealing half-cycle)
 ES_PATIENCE = 5    early stopping patience (epochs without val F1 improvement)
 
 Early stopping at patience=5 within a 20-epoch budget means most trials
 terminate between epochs 8-15. The reduced budget accelerates the search
 while retaining enough epochs for the cosine schedule to differentiate
-good from bad hyperparameter configurations.
+good from bad hyperparameter configurations (Li et al., 2017).
+
+Validation subset: a stratified 10% subset of the validation partition
+is used during tuning to reduce per-epoch evaluation cost from 67K
+batches to ~6.7K batches. The subset preserves the original class ratio
+and is fixed across all trials (Falkner et al., 2018).
 """
 
 # -- Section 2: Install dependencies (skip if already installed) ---------------
@@ -44,6 +49,8 @@ from tcn_utils import (
     make_loader,
     filter_unpaired_subjects,
     downsample_non_ictal,
+    filter_extreme_segments,
+    downsample_val_stratified,
     TCN,
     count_parameters,
     evaluate,
@@ -89,7 +96,7 @@ GRAD_CLIP     = 1.0    # maximum gradient norm for gradient clipping
 SEED          = 42     # random seed for reproducibility
 
 # -- Optuna configuration ------------------------------------------------------
-N_TRIALS      = 40     # total number of Optuna trials
+N_TRIALS      = 50     # total number of Optuna trials
 N_STARTUP     = 15     # random exploration trials before TPE kicks in
 STUDY_NAME    = "tcn_HPT_binary_optuna"  # Optuna study name
 
@@ -144,6 +151,12 @@ train_pairs = filter_unpaired_subjects(train_pairs, logger=log)
 train_pairs = downsample_non_ictal(train_pairs, ratio=4, seed=42)
 # pos_weight = 1.0 is set inside run_training() (downsampling is sole correction).
 log.info(f"Post-downsampling corpus: {len(train_pairs)} segments")
+# Step 3: remove segments with extreme amplitudes (preprocessing failures).
+train_pairs = filter_extreme_segments(train_pairs, threshold=1000.0, logger=log)
+
+# Step 4: stratified 10% validation subset for tuning speed.
+val_pairs = downsample_val_stratified(val_pairs, fraction=0.10, seed=42)
+log.info(f"Val subset for tuning: {len(val_pairs)} segments (10%% stratified)")
 # -- End corpus preparation ----------------------------------------------------
 
 # -- Class statistics (post-downsampling) --------------------------------------
@@ -175,9 +188,9 @@ def optuna_objective(trial):
     kernel_size = trial.suggest_categorical("kernel_size", [3, 5, 7])  # odd kernel sizes only
     num_filters = trial.suggest_categorical("num_filters", [32, 64, 128])  # channel width
     dropout = trial.suggest_float("dropout", 0.10, 0.50, step=0.05)   # spatial dropout rate
-    lr = trial.suggest_float("learning_rate", 1e-4, 1e-2, log=True)   # AdamW learning rate
+    lr = trial.suggest_float("learning_rate", 1e-4, 5e-4, log=True)   # AdamW learning rate
     wd = trial.suggest_float("weight_decay", 1e-5, 1e-3, log=True)    # L2 regularisation
-    batch_size = trial.suggest_categorical("batch_size", [16, 32, 64]) # segments per batch
+    batch_size = trial.suggest_categorical("batch_size", [32, 64]) # segments per batch
 
     # -- Check receptive field constraint --------------------------------------
     # RF = 2*(2^L - 1)*(k - 1) + 1: two convolutions per block (Bai et al., 2018)
@@ -221,7 +234,9 @@ def trial_callback(study, trial):
         p = trial.params
         log.info(f"  [Trial {trial.number:3d}] F1={trial.value:.4f} "
                  f"L={p['num_layers']} k={p['kernel_size']} f={p['num_filters']} "
-                 f"lr={p['learning_rate']:.2e} device={DEVICE.type}")
+                 f"drop={p['dropout']:.2f} lr={p['learning_rate']:.2e} "
+                 f"wd={p['weight_decay']:.2e} bs={p['batch_size']} "
+                 f"device={DEVICE.type}")
 
 
 # -- Create study --------------------------------------------------------------

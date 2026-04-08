@@ -18,6 +18,7 @@ documenting which parameters must be reported in the methods section.
 # 1. Imports
 # ---------------------------------------------------------------------------
 import random
+import time
 from pathlib import Path
 import numpy as np
 import torch
@@ -435,15 +436,220 @@ def downsample_non_ictal(pairs, ratio=4, seed=42):
 
 
 # ---------------------------------------------------------------------------
-# 7. make_loader
+# 7. filter_extreme_segments
 # ---------------------------------------------------------------------------
-def make_loader(file_label_pairs, batch_size, train, device):
+def filter_extreme_segments(pairs, threshold=1000.0, logger=None):
+    """Remove segments whose max absolute amplitude exceeds *threshold*.
+
+    This is a hard filter, not a clipping operation.  Segments with
+    catastrophic values (raw unscaled EEG from preprocessing failures)
+    are removed entirely because their waveform morphology is not
+    recoverable by clipping.
+
+    The function also removes segments that contain NaN or Inf values,
+    regardless of the amplitude threshold.
+
+    Parameters
+    ----------
+    pairs : list of (str or Path, int)
+        File-label pairs (filepath, label).
+    threshold : float, default 1000.0
+        Maximum allowed ``max(|x|)`` per segment.  Segments exceeding
+        this value are removed.  1000.0 is appropriate for z-scored EEG
+        (median / MAD normalisation).
+    logger : logging.Logger, optional
+        If provided, logs progress every 50 000 segments, a summary
+        of removed segments, and per-subject breakdown.
+
+    Returns
+    -------
+    list of (str or Path, int)
+        Pairs with extreme segments removed.
+
+    RESEARCH REPORTING NOTE
+    -----------------------
+    Report the threshold value, number of segments removed, and
+    affected subjects.  Example:
+
+      "Six segments from five subjects were removed prior to training
+       because max(|x|) exceeded 1000 (worst: 4.36e+17 in m340),
+       indicating incomplete z-score normalisation from interrupted
+       preprocessing jobs."
+    """
+    t0 = time.time()
+    clean = []
+    removed = []
+    worst_val = 0.0
+    worst_file = ""
+
+    for i, (fp, label) in enumerate(pairs):
+        x = np.load(fp)
+
+        # Check for NaN / Inf first
+        if not np.isfinite(x).all():
+            mx = float(np.nanmax(np.abs(x))) if np.any(np.isfinite(x)) else float("inf")
+            removed.append((fp, label, mx))
+            if mx > worst_val:
+                worst_val = mx
+                worst_file = fp
+        else:
+            mx = float(np.abs(x).max())
+            if mx > threshold:
+                removed.append((fp, label, mx))
+                if mx > worst_val:
+                    worst_val = mx
+                    worst_file = fp
+            else:
+                clean.append((fp, label))
+
+        if logger and (i + 1) % 50000 == 0:
+            logger.info("  filter_extreme_segments: scanned %d/%d | removed so far: %d",
+                        i + 1, len(pairs), len(removed))
+
+    elapsed = time.time() - t0
+
+    if logger:
+        logger.info("=" * 60)
+        logger.info("filter_extreme_segments summary:")
+        logger.info("  Threshold          : %.1f", threshold)
+        logger.info("  Total scanned      : %d", len(pairs))
+        logger.info("  Removed            : %d (%.2f%%)",
+                    len(removed), 100 * len(removed) / max(len(pairs), 1))
+        logger.info("  Retained           : %d", len(clean))
+        logger.info("  Scan time          : %.1f s", elapsed)
+
+        if removed:
+            logger.info("  Worst value        : %.4e in %s", worst_val, worst_file)
+
+            subject_counts = {}
+            for fp, label, mx in removed:
+                subj = Path(fp).stem.split("_", 1)[0]
+                if subj not in subject_counts:
+                    subject_counts[subj] = {"count": 0, "worst": 0.0}
+                subject_counts[subj]["count"] += 1
+                subject_counts[subj]["worst"] = max(subject_counts[subj]["worst"], mx)
+
+            logger.info("  Affected subjects  : %d", len(subject_counts))
+            for subj in sorted(subject_counts):
+                info = subject_counts[subj]
+                logger.info("    %s: %d segments removed (worst=%.2e)",
+                            subj, info["count"], info["worst"])
+
+            catastrophic = sum(1 for _, _, mx in removed if mx > 1e6)
+            mild = len(removed) - catastrophic
+            logger.info("  Catastrophic (>1e6): %d", catastrophic)
+            logger.info("  Mild (%.0f-1e6)     : %d", threshold, mild)
+
+        logger.info("=" * 60)
+
+    return clean
+
+
+# ---------------------------------------------------------------------------
+# 8. downsample_val_stratified
+# ---------------------------------------------------------------------------
+def downsample_val_stratified(val_pairs, fraction=0.10, seed=42):
+    """Draw a stratified subset of the validation partition for use
+    during hyperparameter tuning.
+
+    With 4.3 million validation segments, full validation per epoch
+    during Optuna trials is computationally prohibitive (67K batches
+    per evaluation pass). A stratified 10% subset (~430K segments)
+    preserves the original ictal/non-ictal class ratio and provides
+    a sufficiently accurate F1 proxy for ranking trials, consistent
+    with established practice in neural architecture search and
+    hyperparameter optimisation (Li et al., 2017; Falkner et al.,
+    2018; Jamieson & Talwalkar, 2016).
+
+    The subset is drawn once before tuning begins and held fixed
+    across all trials and all tuning scripts, ensuring that
+    trial-to-trial F1 comparisons reflect hyperparameter differences
+    rather than validation subset composition differences.
+
+    IMPORTANT: This function is used ONLY during tuning. Final
+    training scripts (TCN.py, etc.) must use the full validation
+    set for early stopping and model selection.
+
+    Parameters
+    ----------
+    val_pairs : list of (str or Path, int) tuples
+        Full validation file-label pairs from data_splits.json.
+    fraction : float, default 0.10
+        Fraction of each class to retain. 0.10 = 10%.
+    seed : int, default 42
+        Random seed for reproducibility. Must be identical across
+        all tuning scripts.
+
+    Returns
+    -------
+    list of (str or Path, int) tuples
+        Stratified subset of val_pairs preserving the class ratio.
+
+    References
+    ----------
+    Li, L., Jamieson, K., DeSalvo, G., Rostamizadeh, A., & Talwalkar,
+    A. (2017). Hyperband: A novel bandit-based approach to hyperparameter
+    optimization. JMLR, 18(185), 1-52.
+
+    Falkner, S., Klein, A., & Hutter, F. (2018). BOHB: Robust and
+    efficient hyperparameter optimization at scale. ICML 2018.
+
+    Jamieson, K. & Talwalkar, A. (2016). Non-stochastic best arm
+    identification and hyperparameter optimization. AISTATS 2016.
+    """
+    import random as _random
+
+    rng = _random.Random(seed)
+
+    ictal = [(f, l) for f, l in val_pairs if l == 1]
+    nonictal = [(f, l) for f, l in val_pairs if l == 0]
+
+    n_ic = max(1, round(len(ictal) * fraction))
+    n_nic = max(1, round(len(nonictal) * fraction))
+
+    ic_sample = rng.sample(ictal, min(n_ic, len(ictal)))
+    nic_sample = rng.sample(nonictal, min(n_nic, len(nonictal)))
+
+    subset = ic_sample + nic_sample
+    rng.shuffle(subset)
+    return subset
+
+
+# -- RESEARCH REPORTING NOTE: downsample_val_stratified ------------------------
+# Methods description:
+#   During hyperparameter tuning, a stratified 10% subset of the
+#   validation partition was used to evaluate trial performance,
+#   preserving the original class ratio. The subset was drawn once
+#   with a fixed seed (42) and held constant across all trials and
+#   tuning scripts. Full validation was reserved for final model
+#   training and evaluation.
+#
+# Cite: Li et al. (2017) Hyperband; Falkner et al. (2018) BOHB;
+#       Jamieson & Talwalkar (2016) AISTATS.
+# -----------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# 8. make_loader
+# ---------------------------------------------------------------------------
+def make_loader(file_label_pairs, batch_size, train, device, num_workers=4):
     """Build a DataLoader for training or evaluation.
 
     Class imbalance is addressed by filter_unpaired_subjects() and
     downsample_non_ictal() prior to DataLoader construction, with
     pos_weight = 1.0 in BCEWithLogitsLoss. The DataLoader itself
     uses simple shuffle=True for training (no weighted sampler).
+
+    Data loading optimisations
+    --------------------------
+    num_workers=4 : overlaps CPU data loading with GPU computation,
+        reducing GPU idle time between batches.
+    persistent_workers=True : keeps worker processes alive between
+        epochs, eliminating per-epoch process spawn/kill overhead.
+    prefetch_factor=4 : each worker pre-loads 4 batches ahead,
+        buffering against I/O latency spikes on parallel filesystems.
+    These settings follow best practices from PyTorch documentation
+    and Goyal et al. (2017) for large-scale training throughput.
 
     Parameters
     ----------
@@ -458,6 +664,8 @@ def make_loader(file_label_pairs, batch_size, train, device):
         If False, load sequentially without shuffling (for val/test).
     device : torch.device
         Used to set pin_memory (True when device is CUDA).
+    num_workers : int, default 4
+        Number of parallel data loading workers.
 
     Returns
     -------
@@ -467,17 +675,22 @@ def make_loader(file_label_pairs, batch_size, train, device):
     -------
     >>> loader = make_loader(pairs, 32, train=True, device=torch.device("cuda"))
     """
-    dataset = EEGSegmentDataset(file_label_pairs)          # create dataset instance
-    pin = (device.type == "cuda")                          # pin memory for faster GPU transfer
+    dataset = EEGSegmentDataset(file_label_pairs)
+    pin = (device.type == "cuda")
+    use_persistent = (num_workers > 0)
 
     if train:
         return DataLoader(dataset, batch_size=batch_size,
-                          shuffle=True, num_workers=0,
-                          pin_memory=pin, drop_last=False)
+                          shuffle=True, num_workers=num_workers,
+                          pin_memory=pin, drop_last=False,
+                          persistent_workers=use_persistent,
+                          prefetch_factor=4 if num_workers > 0 else None)
     else:
         return DataLoader(dataset, batch_size=batch_size,
-                          shuffle=False, num_workers=0,
-                          pin_memory=pin, drop_last=False)
+                          shuffle=False, num_workers=num_workers,
+                          pin_memory=pin, drop_last=False,
+                          persistent_workers=use_persistent,
+                          prefetch_factor=4 if num_workers > 0 else None)
 
 
 # -- RESEARCH REPORTING NOTE: make_loader --------------------------------------
@@ -967,7 +1180,7 @@ def count_parameters(model):
 # 15. train_one_epoch
 # ---------------------------------------------------------------------------
 def train_one_epoch(model, loader, optimiser, criterion, device,
-                    max_grad_norm=1.0):
+                    max_grad_norm=1.0, scaler=None):
     """Train the model for one epoch.
 
     Parameters
@@ -984,6 +1197,11 @@ def train_one_epoch(model, loader, optimiser, criterion, device,
         Target device for tensor transfer.
     max_grad_norm : float, default 1.0
         Maximum gradient norm for clipping.
+    scaler : torch.amp.GradScaler or None, default None
+        If provided, enables mixed-precision training (FP16 forward
+        and backward on CUDA, FP32 weight updates).  On GPUs without
+        FP16 Tensor Cores the autocast context falls back to FP32
+        transparently.
 
     Returns
     -------
@@ -994,19 +1212,37 @@ def train_one_epoch(model, loader, optimiser, criterion, device,
     -------
     >>> loss = train_one_epoch(model, loader, opt, criterion, device)
     """
-    model.train()                                  # set model to training mode
+    model.train()
     total_loss = 0.0
     n_batches = 0
+    use_amp = scaler is not None                   # True when GradScaler was created (CUDA only)
 
     for x, y in loader:
-        x, y = x.to(device), y.to(device)         # transfer batch to device (batch-by-batch)
-        optimiser.zero_grad()                      # clear accumulated gradients
-        logits = model(x)                          # forward pass
-        loss = criterion(logits, y)                # compute loss
-        loss.backward()                            # backward pass
-        nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)  # clip gradients
-        optimiser.step()                           # update weights
-        total_loss += loss.item()                  # accumulate scalar loss
+        x, y = x.to(device), y.to(device)
+        optimiser.zero_grad()
+
+        # autocast: forward pass and loss in FP16 on CUDA (FP32 fallback on CPU
+        # or GPUs without Tensor Cores). Loss is still computed in FP32 internally
+        # by BCEWithLogitsLoss to maintain numerical stability.
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            logits = model(x)
+            loss = criterion(logits, y)
+
+        if use_amp:
+            # AMP backward: scale loss to prevent FP16 underflow in gradients,
+            # then unscale before clipping so clip threshold stays in FP32 units.
+            scaler.scale(loss).backward()          # backward in scaled FP16
+            scaler.unscale_(optimiser)              # restore FP32 gradients for clipping
+            nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            scaler.step(optimiser)                  # skips step if NaN/Inf detected
+            scaler.update()                         # adjust scale factor for next iteration
+        else:
+            # Standard FP32 path (CPU or when scaler is not provided)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            optimiser.step()
+
+        total_loss += loss.item()                  # .item() returns FP32 scalar regardless of AMP
         n_batches += 1
 
     return total_loss / max(n_batches, 1)
@@ -1016,14 +1252,21 @@ def train_one_epoch(model, loader, optimiser, criterion, device,
 # Methods description:
 #   Each training epoch iterated over all batches, computing the forward pass,
 #   loss, and backward pass with gradient clipping before each weight update.
+#   Mixed-precision training (PyTorch AMP) was enabled on CUDA devices:
+#   forward and backward passes ran in FP16 via torch.amp.autocast, with
+#   dynamic loss scaling (GradScaler) to prevent gradient underflow.
+#   Gradient clipping was applied after unscaling to FP32.
 #
 # Parameters to report in paper:
 #   max_grad_norm : gradient clipping threshold (affects training stability)
+#   mixed_precision : enabled on CUDA (FP16 autocast + GradScaler)
 #
 # Design choices to justify:
 #   Gradient clipping : prevents exploding gradients in deep TCN stacks;
 #     max_norm=1.0 is a standard conservative choice.
 #   Batch-by-batch device transfer : avoids exhausting GPU memory.
+#   AMP : ~30-40% throughput gain on V100/A100/L40S Tensor Cores with
+#     negligible effect on convergence (Micikevicius et al., 2018).
 # -----------------------------------------------------------------------------
 
 
@@ -1031,7 +1274,7 @@ def train_one_epoch(model, loader, optimiser, criterion, device,
 # 16. evaluate
 # ---------------------------------------------------------------------------
 @torch.no_grad()
-def evaluate(model, loader, device):
+def evaluate(model, loader, device, use_amp=False):
     """Evaluate model and return macro F1, true labels, and predictions.
 
     Parameters
@@ -1042,6 +1285,9 @@ def evaluate(model, loader, device):
         Evaluation data loader.
     device : torch.device
         Target device for tensor transfer.
+    use_amp : bool, default False
+        If True, runs the forward pass under ``torch.amp.autocast``
+        for FP16 inference speedup on supported GPUs.
 
     Returns
     -------
@@ -1058,11 +1304,16 @@ def evaluate(model, loader, device):
     all_pred = []
 
     for x, y in loader:
-        x = x.to(device)                          # transfer input to device
-        logits = model(x)                          # forward pass
+        x = x.to(device)
+        # autocast during inference: FP16 forward for speed, no GradScaler
+        # needed because no backward pass occurs under @torch.no_grad().
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            logits = model(x)
+        # sigmoid + threshold are computed outside autocast in FP32
+        # to avoid any FP16 rounding near the 0.5 decision boundary.
         preds = (torch.sigmoid(logits) >= 0.5).long()
-        all_true.append(y.cpu().numpy())           # move to CPU to prevent VRAM accumulation
-        all_pred.append(preds.cpu().numpy())       # move to CPU to prevent VRAM accumulation
+        all_true.append(y.cpu().numpy())           # accumulate on CPU to prevent VRAM growth
+        all_pred.append(preds.cpu().numpy())
 
     y_true = np.concatenate(all_true)
     y_pred = np.concatenate(all_pred)
@@ -1144,15 +1395,28 @@ def run_training(model, train_loader, val_loader, lr, weight_decay,
     optimiser = AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = CosineAnnealingLR(optimiser, T_max=max_epochs, eta_min=lr * 0.01)
 
+    # Mixed precision (AMP): use FP16 forward/backward on CUDA to leverage
+    # Tensor Cores (V100, A100, L40S, T4). GradScaler dynamically adjusts
+    # the loss scale to prevent FP16 gradient underflow. On CPU, use_amp is
+    # False and all operations remain FP32 — no behavioural change.
+    use_amp = device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp) if use_amp else None
+
     best_val_f1 = 0.0
     epochs_no_improve = 0
     # Store best weights on CPU to avoid a second GPU copy occupying VRAM
     best_state = None
 
     for epoch in range(max_epochs):
+        t0_train = time.time()
         train_loss = train_one_epoch(model, train_loader, optimiser, criterion,
-                                     device, max_grad_norm)
-        val_f1, _, _ = evaluate(model, val_loader, device)
+                                     device, max_grad_norm, scaler=scaler)
+        train_sec = time.time() - t0_train
+
+        t0_val = time.time()
+        val_f1, _, _ = evaluate(model, val_loader, device, use_amp=use_amp)
+        val_sec = time.time() - t0_val
+
         scheduler.step()
 
         if val_f1 > best_val_f1:
@@ -1169,9 +1433,10 @@ def run_training(model, train_loader, val_loader, lr, weight_decay,
             ep = epoch + 1  # 1-indexed for display
             if ep == 1 or ep % 10 == 0 or epochs_no_improve >= patience:
                 logger.info(
-                    "  ep %3d/%d | loss=%.4f | f1=%.4f | best=%.4f | pat=%d/%d",
+                    "  ep %3d/%d | loss=%.4f | f1=%.4f | best=%.4f | pat=%d/%d"
+                    " | train %.0fs | val %.0fs",
                     ep, max_epochs, train_loss, val_f1,
-                    best_val_f1, epochs_no_improve, patience)
+                    best_val_f1, epochs_no_improve, patience, train_sec, val_sec)
 
         # Optuna integration (guarded: only runs if trial is provided)
         if trial is not None:
