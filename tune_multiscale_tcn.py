@@ -339,8 +339,8 @@ def optuna_objective(trial, train_pairs, val_pairs, device, logger):
         else:
             epochs_no_imp += 1
 
-        # Lightweight progress: first, every 10th, and early-stop epoch
-        if epoch == 1 or epoch % 10 == 0 or epochs_no_imp >= ES_PATIENCE:
+        # Log every epoch (20-epoch budget is short enough for full visibility)
+        if True:
             logger.info(
                 "  T%d ep %3d/%d | loss=%.4f | f1=%.4f | best=%.4f | pat=%d/%d"
                 " | train %.0fs | val %.0fs",

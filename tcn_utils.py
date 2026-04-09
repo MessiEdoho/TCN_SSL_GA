@@ -1427,11 +1427,11 @@ def run_training(model, train_loader, val_loader, lr, weight_decay,
         else:
             epochs_no_improve += 1
 
-        # Lightweight progress logging: first epoch, every 10th, and last epoch.
-        # ~12 lines per trial keeps log files small enough for WinSCP.
+        # Log every epoch — with 20-epoch tuning budget, full visibility is needed.
+        # For 100-epoch training scripts that use their own loop, this is not called.
         if logger is not None:
             ep = epoch + 1  # 1-indexed for display
-            if ep == 1 or ep % 10 == 0 or epochs_no_improve >= patience:
+            if True:
                 logger.info(
                     "  ep %3d/%d | loss=%.4f | f1=%.4f | best=%.4f | pat=%d/%d"
                     " | train %.0fs | val %.0fs",
