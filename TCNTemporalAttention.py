@@ -99,8 +99,6 @@ from tcn_utils import (
     TCNWithAttention,                # M2 architecture: TCN backbone + two-layer additive attention
     make_loader,                     # build DataLoader (sequential for val, shuffled for train)
     filter_unpaired_subjects,        # remove subjects with no ictal segments
-    downsample_non_ictal,            # offline stratified downsampling to 1:4 ratio
-    filter_extreme_segments,         # remove segments with catastrophic amplitudes
     train_one_epoch,                 # one epoch: forward + loss + backward + gradient clip + step
     count_parameters,                # sum of requires_grad=True parameter elements
     segment_predictions_to_events,   # post-processing: smooth -> merge -> min-duration filter
@@ -144,7 +142,7 @@ BACKBONE_PARAMS_PATH = Path("/home/people/22206468/scratch/OUTPUT/MODEL1_OUTPUT/
 ATTN_PARAMS_PATH     = Path("/home/people/22206468/scratch/OUTPUT/MODEL2_OUTPUT") / "best_attention_params.json"  # from tune_temporal_attention.py
 
 # data_splits.json -- single source of truth (matches all other pipeline scripts)
-SPLITS_PATH = Path("/scratch/22206468/INPUT_DATA/data_splits_outputs/data_splits.json")
+SPLITS_PATH = Path("/scratch/22206468/INPUT_DATA/data_splits_outputs/data_splits_nonictal_sampled.json")
 
 # Backbone attribute prefix in TCNWithAttention (confirmed: self.tcn)
 BACKBONE_ATTR = "tcn"                                  # for parameter counting
@@ -1182,14 +1180,11 @@ def main():
     train_pairs, val_pairs = load_splits(logger)
 
     # -- Corpus preparation ----------------------------------------------------
-    # Step 1: remove subjects with no ictal segments.
+    # Downsampling and extreme-segment filtering are handled offline by
+    # create_balanced_splits.py. The manifest is already clean.
+    # Safety check: filter_unpaired_subjects is a no-op on the clean manifest.
     train_pairs = filter_unpaired_subjects(train_pairs, logger=logger)
-    # Step 2: downsample non-ictal to 1:4 ratio, stratified by recording.
-    train_pairs = downsample_non_ictal(train_pairs, ratio=4, seed=42)
-    logger.info("Post-downsampling corpus: %d segments", len(train_pairs))
-    # Step 3: remove segments with extreme amplitudes (preprocessing failures).
-    train_pairs = filter_extreme_segments(train_pairs, threshold=1000.0, logger=logger)
-    # Step 4: pos_weight = 1.0 (downsampling is the sole imbalance correction).
+    logger.info("Training corpus: %d segments (from balanced manifest)", len(train_pairs))
     pos_weight = torch.tensor([1.0], dtype=torch.float32)
     # -- End corpus preparation ------------------------------------------------
 

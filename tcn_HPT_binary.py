@@ -48,8 +48,6 @@ from tcn_utils import (
     set_seed,
     make_loader,
     filter_unpaired_subjects,
-    downsample_non_ictal,
-    filter_extreme_segments,
     downsample_val_stratified,
     TCN,
     count_parameters,
@@ -69,7 +67,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # All training and tuning scripts load data from data_splits.json, produced by
 # generate_data_splits.py. This ensures consistent train/val partitions across
 # the entire pipeline and inherits the mouse-level leakage check.
-SPLITS_PATH = Path("/scratch/22206468/INPUT_DATA/data_splits_outputs/data_splits.json")
+SPLITS_PATH = Path("/scratch/22206468/INPUT_DATA/data_splits_outputs/data_splits_nonictal_sampled.json")
 
 # -- Signal parameters ---------------------------------------------------------
 FS            = 500    # sampling rate in Hz
@@ -149,16 +147,13 @@ if not val_pairs:
     raise RuntimeError("Val partition is empty in data_splits.json.")
 
 # -- Corpus preparation --------------------------------------------------------
-# Step 1: remove subjects with no ictal segments.
+# Downsampling and extreme-segment filtering are handled offline by
+# create_balanced_splits.py. The manifest is already clean.
+# Safety check: filter_unpaired_subjects is a no-op on the clean manifest.
 train_pairs = filter_unpaired_subjects(train_pairs, logger=log)
-# Step 2: downsample non-ictal to 1:4 ratio, stratified by recording.
-train_pairs = downsample_non_ictal(train_pairs, ratio=4, seed=42)
-# pos_weight = 1.0 is set inside run_training() (downsampling is sole correction).
-log.info(f"Post-downsampling corpus: {len(train_pairs)} segments")
-# Step 3: remove segments with extreme amplitudes (preprocessing failures).
-train_pairs = filter_extreme_segments(train_pairs, threshold=1000.0, logger=log)
+log.info(f"Training corpus: {len(train_pairs)} segments (from balanced manifest)")
 
-# Step 4: stratified 10% validation subset for tuning speed.
+# Stratified 10% validation subset for tuning speed.
 val_pairs = downsample_val_stratified(val_pairs, fraction=0.10, seed=42)
 log.info(f"Val subset for tuning: {len(val_pairs)} segments (10%% stratified)")
 # -- End corpus preparation ----------------------------------------------------
@@ -268,6 +263,7 @@ study.optimize(
     optuna_objective,
     n_trials=N_TRIALS,
     callbacks=[trial_callback],
+    catch=(OSError,),            # trial-level catch: transient I/O errors fail the trial, not the study
     show_progress_bar=False      # disabled for cluster/log compatibility
 )
 

@@ -110,8 +110,6 @@ from tcn_utils import (
     set_seed,
     make_loader,
     filter_unpaired_subjects,
-    downsample_non_ictal,
-    filter_extreme_segments,
     downsample_val_stratified,
     TCNWithAttention,
     count_parameters,
@@ -136,7 +134,7 @@ OUTPUT_DIR      = Path("outputs")                      # all pipeline outputs
 LOG_DIR         = OUTPUT_DIR / "logs"                   # log file directory
 FIGURE_DIR      = OUTPUT_DIR / "figures"                # figure output directory
 BEST_TCN_PATH   = OUTPUT_DIR / "best_params.json"       # fixed TCN backbone hyperparameters
-SPLITS_PATH     = Path("data_splits_outputs") / "data_splits.json"  # train/val partition file
+SPLITS_PATH     = Path("/scratch/22206468/INPUT_DATA/data_splits_outputs/data_splits_nonictal_sampled.json")
 BEST_ATTN_PATH  = OUTPUT_DIR / "best_attention_params.json"
 STUDY_CSV       = OUTPUT_DIR / "attention_study_results.csv"
 SUMMARY_PATH    = OUTPUT_DIR / "attention_tuning_summary.json"
@@ -795,16 +793,13 @@ def main():
     train_pairs, val_pairs = load_splits(logger)
 
     # -- Corpus preparation ----------------------------------------------------
-    # Step 1: remove subjects with no ictal segments.
+    # Downsampling and extreme-segment filtering are handled offline by
+    # create_balanced_splits.py. The manifest is already clean.
+    # Safety check: filter_unpaired_subjects is a no-op on the clean manifest.
     train_pairs = filter_unpaired_subjects(train_pairs, logger=logger)
-    # Step 2: downsample non-ictal to 1:4 ratio, stratified by recording.
-    train_pairs = downsample_non_ictal(train_pairs, ratio=4, seed=42)
-    # pos_weight = 1.0 is set inside optuna_objective() per trial (on device).
-    logger.info("Post-downsampling corpus: %d segments", len(train_pairs))
-    # Step 3: remove segments with extreme amplitudes (preprocessing failures).
-    train_pairs = filter_extreme_segments(train_pairs, threshold=1000.0, logger=logger)
+    logger.info("Training corpus: %d segments (from balanced manifest)", len(train_pairs))
 
-    # Step 4: stratified 10% validation subset for tuning speed.
+    # Stratified 10% validation subset for tuning speed.
     val_pairs = downsample_val_stratified(val_pairs, fraction=0.10, seed=42)
     logger.info("Val subset for tuning: %d segments (10%% stratified)", len(val_pairs))
     # -- End corpus preparation ------------------------------------------------
@@ -835,6 +830,7 @@ def main():
             trial, train_pairs, val_pairs,
             tcn_hp, device, logger),
         n_trials=N_TRIALS,
+        catch=(OSError,),          # transient I/O errors fail the trial, not the study
     )
 
     # -- Step 4: save all results ----------------------------------------------

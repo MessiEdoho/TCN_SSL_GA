@@ -106,7 +106,24 @@ class EEGSegmentDataset(Dataset):
 
     def __getitem__(self, idx):
         path, label = self.pairs[idx]              # retrieve path and label
-        x = np.load(path).astype(np.float32)       # load segment as float32
+        # Retry loop for transient Lustre/GPFS I/O errors (Errno 121).
+        # Shared cluster filesystems can drop reads under heavy load.
+        # 3 retries with 5s sleep typically outlasts the transient.
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            try:
+                x = np.load(path).astype(np.float32)
+                break
+            except OSError as e:
+                if attempt < max_retries:
+                    import logging
+                    logging.getLogger("EEGSegmentDataset").warning(
+                        "Retry %d/%d for %s: %s", attempt, max_retries, path, e)
+                    time.sleep(5)
+                else:
+                    raise OSError(
+                        f"Failed to load {path} after {max_retries} retries: {e}"
+                    ) from e
         # No normalisation -- data was already robust z-scored during preprocessing
         x = torch.from_numpy(x).unsqueeze(0)       # shape: (1, segment_len) -- 1 EEG channel
         y = torch.tensor(label, dtype=torch.float32)  # scalar label: 0.0 or 1.0
@@ -120,14 +137,26 @@ class EEGSegmentDataset(Dataset):
 #   z-score (median and MAD) during the preprocessing pipeline; no additional
 #   normalisation was applied at training time.
 #
+#   I/O resilience: transient network filesystem errors (Lustre Errno 121)
+#   were handled by retrying failed reads up to 3 times with 5-second delays.
+#   If all retries failed, the error was propagated with the failing filepath
+#   included in the message for diagnostic purposes. At the Optuna study level,
+#   OSError exceptions were caught per-trial (catch=(OSError,)) so that a
+#   single I/O failure marks one trial as failed without terminating the
+#   entire hyperparameter search.
+#
 # Parameters to report in paper:
 #   segment_shape : (1, 2500) -- single-channel, 5 s at 500 Hz
 #   normalisation : robust z-score applied during preprocessing (not at load time)
+#   I/O retry     : 3 attempts, 5 s delay, OSError caught at trial level
 #
 # Design choices to justify:
 #   No load-time normalisation : avoids double-normalising data that was already
 #     robust z-scored, which would undo the MAD-based artefact resistance.
 #   On-demand loading : keeps memory proportional to batch size, not dataset size.
+#   Retry on OSError : shared HPC filesystems (Lustre/GPFS) experience transient
+#     network errors under heavy multi-job I/O load. Retrying with a short delay
+#     is standard practice for long-running training jobs on shared clusters.
 # -----------------------------------------------------------------------------
 
 

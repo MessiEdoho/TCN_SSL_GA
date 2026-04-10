@@ -84,8 +84,6 @@ from tcn_utils import (
     MultiScaleTCN,
     make_loader,
     filter_unpaired_subjects,
-    downsample_non_ictal,
-    filter_extreme_segments,
     train_one_epoch,
     count_parameters,
     segment_predictions_to_events,
@@ -141,7 +139,7 @@ THRESH_PATH       = OUTPUT_ROOT / "multiscale_tcn_optimal_threshold.json"  # You
 EPOCH_CSV         = OUTPUT_ROOT / "multiscale_tcn_epoch_metrics.csv"     # per-epoch loss, F1, LR
 THREE_ROW_CSV     = OUTPUT_ROOT / "multiscale_tcn_three_row_summary.csv" # paper Table (M3 block)
 # data_splits.json -- single source of truth (matches all other pipeline scripts)
-SPLITS_PATH         = Path("/scratch/22206468/INPUT_DATA/data_splits_outputs/data_splits.json")
+SPLITS_PATH         = Path("/scratch/22206468/INPUT_DATA/data_splits_outputs/data_splits_nonictal_sampled.json")
 BEST_PARAMS_PATH    = Path("/home/people/22206468/scratch/OUTPUT/MODEL3_OUTPUT/MultiScaleTCNtuning_outputs") / "best_multiscale_params.json"
 
 # Fallback dilation schedules if branch_dilations not in JSON
@@ -1200,14 +1198,11 @@ def main():
     train_pairs, val_pairs = load_splits(logger)
 
     # -- Corpus preparation ----------------------------------------------------
-    # Step 1: remove subjects with no ictal segments.
+    # Downsampling and extreme-segment filtering are handled offline by
+    # create_balanced_splits.py. The manifest is already clean.
+    # Safety check: filter_unpaired_subjects is a no-op on the clean manifest.
     train_pairs = filter_unpaired_subjects(train_pairs, logger=logger)
-    # Step 2: downsample non-ictal to 1:4 ratio, stratified by recording.
-    train_pairs = downsample_non_ictal(train_pairs, ratio=4, seed=42)
-    logger.info("Post-downsampling corpus: %d segments", len(train_pairs))
-    # Step 3: remove segments with extreme amplitudes (preprocessing failures).
-    train_pairs = filter_extreme_segments(train_pairs, threshold=1000.0, logger=logger)
-    # Step 4: pos_weight = 1.0 (downsampling is the sole imbalance correction).
+    logger.info("Training corpus: %d segments (from balanced manifest)", len(train_pairs))
     pos_weight = torch.tensor([1.0], dtype=torch.float32)
     # -- End corpus preparation ------------------------------------------------
 

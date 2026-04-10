@@ -39,10 +39,49 @@ Independent tuning ensures MultiScaleTCN is assessed
 at its true optimum.
 
 Architecture: MultiScaleTCN (from tcn_utils.py)
-Dilation schedules fixed by design:
-  Branch 1: [1, 2, 4]
-  Branch 2: [2, 4, 8]
-  Branch 3: [4, 8, 16]
+
+Branch depth and dilation schedules -- fixed, not tuned
+-------------------------------------------------------
+Each branch has exactly 3 CausalConvBlocks with fixed dilation schedules:
+  Branch 1: [1, 2, 4]   -- fine scale   (sub-second patterns)
+  Branch 2: [2, 4, 8]   -- medium scale (1-2 second patterns)
+  Branch 3: [4, 8, 16]  -- coarse scale (2-4 second patterns)
+
+Unlike the single-branch TCN (M1), where num_layers is tuned to control
+depth and receptive field, MultiScaleTCN replaces depth with breadth:
+three shallow branches operating at complementary temporal resolutions
+provide receptive field diversity without deep stacking. This follows
+the multi-scale temporal convolution design in Lea et al. (2017) and
+Farha & Gall (2019), where branch structure is an architectural prior
+fixed before hyperparameter search.
+
+Branch depth is not tuned for three reasons:
+  1. The multi-scale design derives its expressive power from the
+     dilation spread across branches, not from per-branch depth.
+     Receptive fields of 15, 31, and 63 samples (at kernel_size=3)
+     already span the relevant EEG temporal scales for rodent seizure
+     detection (Luttjohann et al., 2009).
+  2. Tuning per-branch depth would create a combinatorial explosion
+     (e.g. 3-6 blocks x 3 branches = 64 combinations) that 50 trials
+     cannot explore meaningfully. Fixing depth focuses the search
+     budget on parameters with higher sensitivity: num_filters,
+     dropout, and learning_rate (Bergstra & Bengio, 2012).
+  3. The dilation schedules [1,2,4], [2,4,8], [4,8,16] are motivated
+     by the signal structure of rodent EEG seizures, where ictal
+     discharges exhibit rhythmic activity at multiple temporal scales
+     from ~50 ms spike complexes to ~2-4 s burst envelopes.
+
+References (architecture):
+  Lea, C., Flynn, M. D., Vidal, R., Reiter, A., & Hager, G. D. (2017).
+      Temporal Convolutional Networks for Action Segmentation and
+      Detection. CVPR 2017.
+  Farha, Y. A. & Gall, J. (2019). MS-TCN: Multi-Stage Temporal
+      Convolutional Network for Action Segmentation. CVPR 2019.
+  Bergstra, J. & Bengio, Y. (2012). Random Search for Hyper-Parameter
+      Optimization. JMLR, 13, 281-305.
+  Luttjohann, A., Fabene, P. F., & van Luijtelaar, G. (2009). A revised
+      Racine's scale for PTZ-induced seizures in rats. Physiology &
+      Behavior, 98(5), 579-586.
 
 Hyperparameters tuned
 ---------------------
@@ -104,8 +143,6 @@ from tcn_utils import (
     set_seed,
     make_loader,
     filter_unpaired_subjects,
-    downsample_non_ictal,
-    filter_extreme_segments,
     downsample_val_stratified,
     MultiScaleTCN,
     count_parameters,
@@ -129,7 +166,7 @@ SEGMENT_SEC       = 5.0                                # segment duration in sec
 OUTPUT_DIR        = Path("/home/people/22206468/scratch/OUTPUT/MODEL3_OUTPUT/MultiScaleTCNtuning_outputs")
 LOG_DIR           = OUTPUT_DIR / "logs"
 FIGURE_DIR        = OUTPUT_DIR / "figures"
-SPLITS_PATH       = Path("/scratch/22206468/INPUT_DATA/data_splits_outputs/data_splits.json")
+SPLITS_PATH       = Path("/scratch/22206468/INPUT_DATA/data_splits_outputs/data_splits_nonictal_sampled.json")
 BEST_MS_PATH      = OUTPUT_DIR / "best_multiscale_params.json"
 STUDY_CSV         = OUTPUT_DIR / "multiscale_study_results.csv"
 SUMMARY_PATH      = OUTPUT_DIR / "multiscale_tuning_summary.json"
@@ -618,16 +655,13 @@ def main():
     train_pairs, val_pairs = load_splits(logger)
 
     # -- Corpus preparation ----------------------------------------------------
-    # Step 1: remove subjects with no ictal segments.
+    # Downsampling and extreme-segment filtering are handled offline by
+    # create_balanced_splits.py. The manifest is already clean.
+    # Safety check: filter_unpaired_subjects is a no-op on the clean manifest.
     train_pairs = filter_unpaired_subjects(train_pairs, logger=logger)
-    # Step 2: downsample non-ictal to 1:4 ratio, stratified by recording.
-    train_pairs = downsample_non_ictal(train_pairs, ratio=4, seed=42)
-    # pos_weight = 1.0 is set inside optuna_objective() per trial (on device).
-    logger.info("Post-downsampling corpus: %d segments", len(train_pairs))
-    # Step 3: remove segments with extreme amplitudes (preprocessing failures).
-    train_pairs = filter_extreme_segments(train_pairs, threshold=1000.0, logger=logger)
+    logger.info("Training corpus: %d segments (from balanced manifest)", len(train_pairs))
 
-    # Step 4: stratified 10% validation subset for tuning speed.
+    # Stratified 10% validation subset for tuning speed.
     val_pairs = downsample_val_stratified(val_pairs, fraction=0.10, seed=42)
     logger.info("Val subset for tuning: %d segments (10%% stratified)", len(val_pairs))
     # -- End corpus preparation ------------------------------------------------
@@ -654,6 +688,7 @@ def main():
     study.optimize(
         lambda trial: optuna_objective(trial, train_pairs, val_pairs, device, logger),
         n_trials=N_TRIALS,
+        catch=(OSError,),          # transient I/O errors fail the trial, not the study
     )
 
     # -- Step 4: save all results ----------------------------------------------
