@@ -58,7 +58,7 @@ DATA_DIRS = [
 ]
 
 # Output
-OUTPUT_DIR = Path("/scratch/22206468/INPUT_DATA/data_splits_outputs")
+OUTPUT_DIR = Path("/scratch/22206468/OUTPUT/DATA_INTEGRITY_CHECK")
 REPORT_PATH = OUTPUT_DIR / "data_integrity_report.json"
 LOG_PATH = OUTPUT_DIR / "data_integrity.log"
 
