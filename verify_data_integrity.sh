@@ -8,7 +8,7 @@
 
 # Scanning ~33M .npy files across 7 directories. Estimated 4-8 hours
 # depending on /scratch load. 1-day walltime provides safety margin.
-#SBATCH -t 1-00:00:00
+#SBATCH -t 5-00:00:00
 
 # No GPU partition -- runs on any available CPU node
 # (Do NOT request --partition=csgpu or --gres=gpu)
