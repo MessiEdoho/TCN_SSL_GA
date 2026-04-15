@@ -1,0 +1,1497 @@
+================================================================================
+EEG DATASET DESCRIPTION -- UNIQURE SEIZURE DETECTION STUDY
+================================================================================
+Prepared for: PhD thesis and publication
+Author: Messi Edoho
+Institution: University College Dublin (UCD)
+Date: April 2026
+
+--------------------------------------------------------------------------------
+1. DATA ACQUISITION
+--------------------------------------------------------------------------------
+
+Continuous single-channel electroencephalographic (EEG) recordings were
+obtained from 102 mice enrolled in the UNIQURE preclinical epilepsy
+study. Each recording was acquired as a single EEG channel digitised at
+a sampling frequency of 500 Hz and stored in European Data Format (EDF).
+One EDF file was generated per subject (e.g., m1.edf). Recording
+durations varied across subjects, ranging from several hours to multiple
+days of uninterrupted monitoring.
+
+Seizure events were annotated independently in Excel spreadsheets (.xlsx),
+with one annotation file per subject (e.g., m1_xlsx.xlsx). Each row
+specified the onset ('start_time') and offset ('end_time') of a single
+electrographic seizure in absolute datetime format (DD/MM/YYYY
+HH:MM:SS.fff). For computational use, all annotation timestamps were
+converted to elapsed seconds relative to the EDF recording start time
+extracted from the file header.
+
+--------------------------------------------------------------------------------
+2. DATA PARTITIONING
+--------------------------------------------------------------------------------
+
+To ensure unbiased evaluation, the 102 subjects were assigned to three
+mutually exclusive partitions at the animal level prior to any model
+development:
+
+    Partition       Subjects    Purpose
+    --------------- ----------- -------------------------------------------
+    Training        ~82         Model fitting and hyperparameter tuning
+    Validation      ~10         Early stopping, threshold optimisation
+    Test            ~10         Final held-out evaluation (reserved)
+
+Subject-level partitioning guarantees that no EEG data from the same
+animal appears in more than one partition. This design prevents inflated
+performance estimates that arise when temporally correlated segments from
+a single recording are distributed across training and evaluation sets
+(Gemein et al., 2020) [VERIFY EXACT QUOTE BEFORE SUBMISSION].
+
+An automated leakage check was executed at the time of partition
+generation to confirm that no subject identifier appeared in more than
+one split. This check is enforced programmatically each time the
+data manifest is regenerated.
+
+Reference:
+    Gemein, L. A. W., Schirrmeister, R. T., Chrabąszcz, P., Wilson, D.,
+        Boedecker, J., Schulze-Bonhage, A., Hutter, F., & Ball, T. (2020).
+        Machine-Learning-Based Diagnostics of EEG Pathology. NeuroImage,
+        220, 117021. https://doi.org/10.1016/j.neuroimage.2020.117021
+
+--------------------------------------------------------------------------------
+3. PREPROCESSING
+--------------------------------------------------------------------------------
+
+Prior to segmentation, each continuous EEG recording was subjected to
+a three-stage preprocessing pipeline applied sequentially:
+
+(i) Powerline interference removal. A second-order zero-phase IIR notch
+    filter centred at 50 Hz (quality factor Q = 30) was applied using
+    forward-backward filtering (scipy.signal.filtfilt) to suppress mains
+    interference while preserving the amplitude and phase of adjacent
+    frequency components.
+
+(ii) Baseline correction. The arithmetic mean of each processing block
+     was subtracted to eliminate any DC offset introduced by the recording
+     hardware or electrode drift.
+
+(iii) Robust amplitude normalisation. Each block was normalised using
+      the robust z-score:
+
+          z = (x - median(x)) / (1.4826 * MAD(x))
+
+      where MAD denotes the median absolute deviation. The scaling
+      constant 1.4826 ensures consistency with the standard deviation
+      under a Gaussian distribution (Rousseeuw & Croux, 1993). The
+      median and MAD were chosen over the mean and standard deviation
+      because of their resistance to the large-amplitude transients
+      characteristic of rodent EEG, including grooming artefacts and
+      movement-related spikes.
+
+To manage memory constraints on the high-performance computing cluster,
+the preprocessing pipeline was applied in contiguous blocks of 40
+segments rather than loading entire recordings into memory.
+
+Reference:
+    Rousseeuw, P. J. & Croux, C. (1993). Alternatives to the Median
+        Absolute Deviation. Journal of the American Statistical
+        Association, 88(424), 1273-1283.
+
+--------------------------------------------------------------------------------
+4. SEGMENTATION
+--------------------------------------------------------------------------------
+
+Each preprocessed recording was divided into fixed-length segments using
+a sliding window approach with the following parameters:
+
+    Parameter           Value       Description
+    ------------------- ----------- -----------------------------------------
+    Window length       2,500       5 seconds at 500 Hz
+    Step size           1,250       2.5 seconds (50% overlap)
+    Segment dimensions  (1, 2500)   Single channel, 2,500 time points
+
+A 50% overlap between consecutive windows was employed to augment the
+effective training set size and to preserve temporal continuity across
+adjacent segments. Each segment was stored as an individual NumPy array
+file (.npy) in 32-bit floating-point format, occupying approximately
+10 KB per segment.
+
+The naming convention for output files follows the pattern:
+    {subject_id}_{ictal|nonictal}_{index:05d}.npy
+
+where the index is a sequential one-based counter per class per subject
+(e.g., m1_ictal_00001.npy, m1_nonictal_00003.npy). This counter
+reflects the temporal order of segments within the recording but does
+not encode the absolute grid position.
+
+--------------------------------------------------------------------------------
+5. SEGMENT LABELLING
+--------------------------------------------------------------------------------
+
+Binary labels were assigned to each segment based on temporal overlap
+with the annotated seizure intervals. A segment spanning the time
+interval [t_start, t_end) was labelled as ictal (y = 1) if it satisfied
+the overlap condition:
+
+    t_start < seizure_end  AND  t_end > seizure_start
+
+for at least one annotated seizure interval. Under this criterion, any
+degree of temporal overlap -- including a single sample -- classifies
+the segment as ictal. All remaining segments were labelled as non-ictal
+(y = 0).
+
+This any-overlap labelling strategy was adopted to maximise sensitivity
+to seizure boundaries, ensuring that onset and offset segments are
+included in the ictal class even when only partially overlapping with
+the annotated event.
+
+--------------------------------------------------------------------------------
+6. MODEL ARCHITECTURE
+--------------------------------------------------------------------------------
+
+Four models are evaluated in an ablation study to isolate the
+contributions of multi-scale temporal processing and temporal attention:
+
+    Model   Architecture                        Ablation role
+    ------- ----------------------------------- ---------------------------
+    M1      TCN                                 Baseline
+    M2      TCN + Temporal Attention            + attention over M1
+    M3      Multi-Scale TCN                     + multi-scale over M1
+    M4      Multi-Scale TCN + Temporal Attention + both over M1
+
+All four models share the same CausalConvBlock as their fundamental
+building unit.
+
+6.1 CausalConvBlock (residual block)
+
+    Each residual block comprises two dilated causal one-dimensional
+    convolutional layers operating at the same dilation factor
+    (d = 2^L, where L denotes the layer index), following the temporal
+    convolutional network (TCN) architecture proposed by Bai et al.
+    (2018). The use of two convolutional layers at each dilation level
+    enables multiple non-linear transformations to be learned before
+    progressing to larger receptive fields, thereby enhancing
+    representational capacity.
+
+    Each convolution is followed by layer normalisation applied across
+    the channel dimension, Gaussian Error Linear Unit (GELU) activation,
+    and spatial dropout (Dropout1d). Layer normalisation is employed in
+    place of batch normalisation to mitigate the effects of inter-subject
+    variability in EEG amplitude and the instability of batch statistics
+    under relatively small batch sizes (16-64). Spatial dropout is used
+    instead of element-wise dropout to provide structured, channel-wise
+    regularisation that better reflects the correlated nature of EEG
+    feature maps, while GELU activation is adopted to facilitate smoother
+    gradient propagation and improved modelling of continuous biosignal
+    dynamics. A 1x1 pointwise convolution is used to form the residual
+    skip connection when required for dimensionality matching. Causal
+    padding with right-side trimming is applied throughout to preserve
+    temporal causality and prevent leakage of future information during
+    sequence modelling.
+
+    Architecture diagram (single CausalConvBlock):
+
+    Input x (F_in channels, T time steps)
+    |
+    |--[ Residual path ]--------------------------------------------.
+    |                                                               |
+    +--[ Conv1d(F_in, F_out, k, dilation=d, causal padding) ]      |
+    |       |                                                       |
+    |       +--[ Trim right (remove future samples) ]               |
+    |       |                                                       |
+    |       +--[ LayerNorm (channel dim) ]                          |
+    |       |                                                       |
+    |       +--[ GELU ]                                             |
+    |       |                                                       |
+    |       +--[ Dropout1d (spatial, channel-wise) ]                |
+    |                                                               |
+    +--[ Conv1d(F_out, F_out, k, dilation=d, causal padding) ]     |
+    |       |                                                       |
+    |       +--[ Trim right ]                                       |
+    |       |                                                       |
+    |       +--[ LayerNorm ]                                        |
+    |       |                                                       |
+    |       +--[ GELU ]                                             |
+    |       |                                                       |
+    |       +--[ Dropout1d ]                                        |
+    |                                                               |
+    +--[ + ]<------[ 1x1 Conv (if F_in != F_out) ]<----------------'
+    |           or identity (if F_in == F_out)
+    |
+    Output (F_out channels, T time steps)
+
+    The receptive field of L stacked CausalConvBlocks with exponentially
+    increasing dilation (d = 1, 2, 4, ..., 2^(L-1)) and two
+    convolutions per block is:
+
+        RF = 2 * (2^L - 1) * (k - 1) + 1
+
+    where k is the kernel size. For example, with L = 6 layers and
+    k = 7, the receptive field spans 757 samples (1.514 s at 500 Hz).
+
+6.2 Shared output components
+
+    While the four models differ in their temporal feature extraction
+    strategy (single-branch vs multi-scale, uniform vs attention-based
+    aggregation), they share a common downstream pathway from temporal
+    aggregation through to the training objective. This standardised
+    output design ensures that performance differences across the
+    ablation study are attributable to the upstream architectural
+    variation rather than to differences in the classification head,
+    loss function, optimiser, or training procedure.
+
+    (i) Temporal aggregation: global average pooling.
+
+        After the convolutional backbone processes a 5-second EEG
+        segment, the resulting temporal feature map H has shape
+        (batch, F, T), where F denotes the number of convolutional
+        filters and T denotes the number of output time steps. Because
+        causal padding preserves the input length, T remains equal to
+        the original 2,500 samples throughout the convolutional stack.
+
+        This high-dimensional sequence must be reduced to a fixed-
+        length vector before classification. In M1 (TCN) and M3
+        (Multi-Scale TCN), this reduction is performed by global
+        average pooling, which computes the arithmetic mean of the
+        feature vectors across all T time steps:
+
+            z = (1/T) * sum_{t=1}^{T} h_t        z in R^F
+
+        This operation collapses the temporal dimension entirely,
+        producing a single F-dimensional summary vector z that
+        represents the average activation pattern over the full
+        5-second segment. By treating every time step with equal
+        weight, global average pooling assumes that seizure-
+        discriminative information is distributed uniformly across
+        the segment rather than concentrated at specific temporal
+        locations.
+
+        In M2 (TCN + Attention) and M4 (Multi-Scale TCN + Attention),
+        global average pooling is replaced by a learned temporal
+        attention mechanism (described in Section 6.4). Rather than
+        assigning uniform weight 1/T to every time step, the
+        attention module learns data-dependent weights alpha_t that
+        allow the model to focus on the most seizure-informative
+        portions of the segment. This replacement is the central
+        architectural variable in the M1-vs-M2 and M3-vs-M4 ablation
+        comparisons.
+
+    (ii) Classification head: single linear layer.
+
+         The aggregated feature vector z in R^F -- whether obtained
+         from global average pooling (M1, M3) or from the attention-
+         weighted context vector (M2, M4) -- is projected to a single
+         scalar output by a fully connected linear layer:
+
+             logit = w^T z + b
+
+         where w in R^F is the learned weight vector and b in R is
+         the bias term. This layer contains F + 1 trainable parameters
+         and produces an unbounded real-valued output (the logit) that
+         represents the model's unnormalised confidence that the input
+         segment contains seizure activity.
+
+         Critically, no activation function is applied after this
+         layer during training. The raw logit is passed directly to
+         the loss function, which internally applies the sigmoid
+         transformation. This design avoids the numerical instability
+         that arises from computing log(sigmoid(x)) separately, as
+         discussed below.
+
+         At inference time, the sigmoid function is applied explicitly
+         to convert the logit to a probability estimate p in [0, 1]:
+
+             p = sigma(logit) = 1 / (1 + exp(-logit))
+
+         A segment is classified as ictal if p >= threshold, where
+         the threshold is either the default value of 0.5 or the
+         Youden-optimal threshold determined from the validation set.
+
+    (iii) Training objective: binary cross-entropy with logits.
+
+          The network is trained to minimise the binary cross-entropy
+          (BCE) loss, computed using PyTorch's BCEWithLogitsLoss. This
+          function fuses the sigmoid activation and the BCE computation
+          into a single operation that exploits the log-sum-exp
+          identity for numerical stability:
+
+              L(logit, y) = -[ y * log(sigma(logit))
+                            + (1 - y) * log(1 - sigma(logit)) ]
+
+          where y in {0, 1} is the ground-truth binary label (1 for
+          ictal, 0 for non-ictal) and sigma denotes the sigmoid
+          function. When the logit is a large positive number and y=1,
+          or a large negative number and y=0, the naive computation of
+          log(sigma(.)) would suffer from floating-point underflow.
+          The fused implementation avoids this by reformulating the
+          expression using numerically stable primitives.
+
+          The pos_weight parameter, which scales the loss contribution
+          of positive (ictal) samples, is set to 1.0. Class imbalance
+          is instead addressed entirely through offline stratified
+          downsampling of the training corpus (Section 9). This
+          separation of concerns ensures that the loss function treats
+          each training sample with equal weight, preventing the
+          gradient magnitude distortion that can arise when pos_weight
+          is set to large values (e.g., 438 for the raw 1:438
+          imbalance ratio). Such distortion would disproportionately
+          amplify gradients from ictal samples, potentially causing
+          optimiser instability and overconfident predictions on the
+          minority class.
+
+6.3 M1: TCN (baseline)
+
+    L CausalConvBlocks are stacked sequentially with exponentially
+    increasing dilation factors (d = 1, 2, 4, ..., 2^(L-1)). The
+    output is globally average-pooled along the temporal axis and
+    passed through a linear classification head producing a single
+    logit for binary seizure detection.
+
+    Input (1 x 2500)
+    |
+    +--[ CausalConvBlock, d=1   ]
+    +--[ CausalConvBlock, d=2   ]
+    +--[ CausalConvBlock, d=4   ]
+    +--[ ...                    ]
+    +--[ CausalConvBlock, d=2^(L-1) ]
+    |
+    +--[ Global Average Pool (T -> 1) ]
+    |
+    +--[ Linear(F, 1) ]
+    |
+    logit
+
+    Tunable hyperparameters: num_layers (L), num_filters (F),
+    kernel_size (k), dropout rate.
+
+6.4 M2: TCN + Temporal Attention
+
+    M2 replaces the global average pooling of M1 with a two-layer
+    additive temporal attention mechanism that learns to assign
+    non-uniform importance weights to individual time steps. The
+    TCN backbone is identical to M1; the only architectural
+    difference is the aggregation stage.
+
+    6.4.1 Motivation
+
+    Global average pooling treats every time step equally, which
+    implicitly assumes that seizure-discriminative information is
+    distributed uniformly across the 5-second segment. In practice,
+    seizure onset or offset patterns may be concentrated in a
+    fraction of the window, while the remainder contains background
+    EEG that dilutes the discriminative signal. A learned attention
+    mechanism allows the model to focus on the most informative
+    temporal regions, potentially improving both classification
+    accuracy and interpretability (the attention weights form a
+    temporal saliency map over the raw EEG segment).
+
+    6.4.2 Two-layer additive attention: step by step
+
+    The TCN backbone produces a temporal feature sequence:
+
+        H = [h_1, h_2, ..., h_T]       H in R^(T x F)
+
+    where T = 2,500 (the segment length preserved by causal padding)
+    and F = num_filters (the channel dimension from the final
+    CausalConvBlock). Each h_t in R^F is a learned representation of
+    the EEG signal at time step t.
+
+    The attention mechanism processes H in four stages:
+
+    Stage 1 -- Projection (Linear + tanh):
+
+        e_t = tanh(W_a * h_t + b_a)        for each t = 1, ..., T
+
+        W_a in R^(D_a x F) is a learnable weight matrix that projects
+        each F-dimensional feature vector h_t into a D_a-dimensional
+        attention space. b_a in R^(D_a) is a learnable bias. The
+        hyperbolic tangent (tanh) activation squashes each element of
+        the projected vector to the range [-1, +1], introducing the
+        non-linearity that allows the scoring function to capture
+        feature interactions that a purely linear projection cannot.
+
+        D_a (attention_dim) is a tunable hyperparameter controlling
+        the dimensionality of this intermediate representation. A
+        larger D_a increases the expressiveness of the scoring function
+        but adds parameters. In this study, D_a is selected from
+        {32, 64, 128} by Optuna.
+
+    Stage 2 -- Scoring (Linear, no bias):
+
+        s_t = v^T * e_t                     for each t = 1, ..., T
+
+        v in R^(D_a) is a learnable vector (implemented as
+        nn.Linear(D_a, 1, bias=False)) that reduces each D_a-
+        dimensional energy vector e_t to a single scalar score s_t.
+        This score represents the unnormalised importance of time
+        step t. The absence of bias ensures that the scoring function
+        is centred: a zero-energy vector produces a zero score.
+
+    Stage 3 -- Normalisation (Softmax):
+
+        alpha_t = exp(s_t) / sum_{j=1}^{T} exp(s_j)
+
+        The softmax function converts the T unnormalised scores into
+        a proper probability distribution over time steps. The
+        resulting attention weights alpha_t satisfy two properties:
+        (a) alpha_t >= 0 for all t (non-negativity), and (b)
+        sum_{t=1}^{T} alpha_t = 1 (normalisation). A time step with
+        a high score receives a large weight; a time step with a low
+        score receives a near-zero weight.
+
+    Stage 4 -- Aggregation (Weighted sum):
+
+        c = sum_{t=1}^{T} alpha_t * h_t        c in R^F
+
+        The context vector c is a weighted average of the original
+        feature vectors h_t, where the weights alpha_t are determined
+        by the learned scoring function rather than fixed at 1/T.
+        Unlike global average pooling, this allows the model to
+        concentrate its representation on the temporal regions most
+        relevant to seizure detection.
+
+    After aggregation, dropout is applied to the context vector c
+    (with rate attention_dropout, tunable in [0.0, 0.4]) to
+    regularise the attention output and prevent the model from
+    relying on a single dominant time step. The regularised context
+    vector is then passed to the shared linear classification head
+    (Section 6.2).
+
+    6.4.3 Learnable parameters
+
+    The attention module introduces three sets of learnable parameters:
+
+        Component           Shape               Parameters
+        ------------------- ------------------- --------------------
+        W_a (projection)    (D_a x F)           D_a * F + D_a (bias)
+        v   (scorer)        (D_a x 1)           D_a (no bias)
+        Dropout             --                  0 (no learnable params)
+
+        Total attention parameters: D_a * (F + 2)
+
+    For D_a = 64 and F = 64: 64 * 66 = 4,224 parameters. This is
+    a small fraction (~2-5%) of the total model parameters, meaning
+    the attention mechanism adds minimal computational overhead while
+    providing temporal selectivity and interpretability.
+
+    6.4.4 Interpretability: attention as saliency
+
+    The attention weights alpha_t provide an intrinsic interpretability
+    mechanism. By inspecting alpha_t across the T = 2,500 time steps,
+    one can visualise which temporal regions the model considers most
+    relevant for its seizure/non-seizure decision. A method
+    get_attention_weights(x) is provided that extracts these weights
+    for any input segment, enabling:
+
+      - Per-segment saliency maps overlaid on raw EEG waveforms
+      - Class-averaged attention profiles (mean alpha_t for ictal vs
+        non-ictal segments)
+      - Differential attention analysis (ictal minus non-ictal mean
+        attention, highlighting time steps where the model attends
+        more to seizure segments)
+
+    These visualisations are produced automatically during training
+    (Figure 13 in the training scripts).
+
+    6.4.5 Architecture diagram
+
+    Input (1 x 2500)
+    |
+    +--[ TCN backbone: L CausalConvBlocks, d=1,2,...,2^(L-1) ]
+    |
+    |  H: (batch, F, T) -- temporal feature maps
+    |
+    +--[ Transpose -> (batch, T, F) ]
+    |
+    |  For each time step t:
+    |
+    +--[ Linear(F, D_a) ]----> W_a * h_t + b_a     (projection)
+    |       |
+    |       +--[ tanh ]------> e_t in R^(D_a)       (non-linear energy)
+    |       |
+    |       +--[ Linear(D_a, 1, no bias) ]--> s_t   (scalar score)
+    |
+    +--[ Softmax over T ]----> alpha_t               (attention weights)
+    |                          alpha_t >= 0, sum = 1
+    |
+    +--[ Weighted sum: c = sum(alpha_t * h_t) ]      (context vector)
+    |                          c in R^F
+    |
+    +--[ Dropout(attention_dropout) ]                (regularisation)
+    |
+    +--[ Linear(F, 1) ]                              (classification head)
+    |
+    logit
+
+    6.4.6 Design choices and justification
+
+    The two-layer additive formulation (project + tanh + score) was
+    chosen over simpler alternatives for two reasons:
+
+    (a) A single-layer linear scorer (s_t = w^T h_t) computes a
+        fixed linear combination of feature channels. It cannot learn
+        non-linear feature interactions (e.g., "attend to time steps
+        where channel A is high AND channel B is low"). The
+        intermediate tanh projection enables such interactions.
+
+    (b) Multi-head self-attention (Transformer-style) computes
+        pairwise interactions between all T^2 time step pairs. With
+        T = 2,500, this would produce a 2,500 x 2,500 attention
+        matrix per head, adding substantial memory and compute cost
+        for a binary classification task where the output is a single
+        scalar, not a sequence. The additive formulation computes
+        T independent scores with O(T) complexity.
+
+    This formulation is identical in M2 (over the single-branch TCN
+    backbone) and M4 (over the multi-scale TCN backbone), ensuring
+    that the M2-vs-M4 comparison isolates the backbone architecture
+    rather than attention design differences.
+
+    Additional tunable hyperparameters: attention_dim (D_a),
+    attention_dropout. (Full search space in Section 7.3.)
+
+    Ablation: M2 vs M1 isolates the contribution of learned temporal
+    attention over uniform average pooling. If M2 outperforms M1,
+    the temporal attention mechanism captures seizure-relevant
+    temporal structure that uniform averaging fails to exploit.
+
+6.5 M3: Multi-Scale TCN
+
+    Three parallel branches process the input simultaneously, each
+    operating at a different temporal resolution defined by its
+    dilation schedule:
+
+        Branch 1 (fine):   dilations [1, 2, 4]   -- sub-second patterns
+        Branch 2 (medium): dilations [2, 4, 8]   -- 1-2 second patterns
+        Branch 3 (coarse): dilations [4, 8, 16]  -- 2-4 second patterns
+
+    Each branch consists of three CausalConvBlocks arranged
+    sequentially -- one block per dilation value. For example,
+    Branch 1 contains: block at d=1, followed by block at d=2,
+    followed by block at d=4. Since each CausalConvBlock internally
+    comprises two dilated convolutional layers (as described in
+    Section 6.1), each branch contains 3 blocks x 2 convolutions
+    = 6 convolutional layers, and the full three-branch model
+    contains 18 convolutional layers in parallel.
+
+    Importantly, each branch is NOT a single residual block. The
+    dilation list [1, 2, 4] specifies three separate blocks stacked
+    in sequence within that branch, with each block operating at a
+    progressively larger dilation factor. This stacking within each
+    branch provides a branch-local receptive field given by:
+
+        RF_branch = 1 + 2 * sum((k - 1) * d for d in dilations)
+
+    For Branch 1 with k=3: RF = 1 + 2*(2*1 + 2*2 + 2*4) = 29 samples
+    For Branch 3 with k=3: RF = 1 + 2*(2*4 + 2*8 + 2*16) = 113 samples
+
+    Branch outputs are fused (concatenation with 1x1 projection, or
+    element-wise average), globally average-pooled, and classified.
+
+    Input (1 x 2500)
+    |
+    +----------------+------------------+------------------+
+    |                |                  |                  |
+    | Branch 1       | Branch 2         | Branch 3         |
+    | Block d=1      | Block d=2        | Block d=4        |
+    | Block d=2      | Block d=4        | Block d=8        |
+    | Block d=4      | Block d=8        | Block d=16       |
+    | (3 blocks,     | (3 blocks,       | (3 blocks,       |
+    |  6 conv layers)|  6 conv layers)  |  6 conv layers)  |
+    |                |                  |                  |
+    +----------------+------------------+------------------+
+    |
+    +--[ Fusion: concat + 1x1 Conv  OR  element-wise average ]
+    |
+    +--[ Global Average Pool (T -> 1) ]
+    |
+    +--[ Linear(F, 1) ]
+    |
+    logit
+
+    The multi-scale design replaces depth with breadth: three
+    moderately deep branches (3 blocks each) at complementary
+    dilation scales provide receptive field diversity across temporal
+    resolutions without requiring a single very deep stack.
+    Branch depth (3 blocks) and dilation schedules are architectural
+    design choices fixed before hyperparameter search, not tuned
+    parameters.
+
+    Tunable hyperparameters: num_filters (F), kernel_size (k),
+    dropout rate, fusion strategy.
+
+    Ablation: M3 vs M1 isolates the contribution of multi-scale
+    temporal processing.
+
+6.6 M4: Multi-Scale TCN + Temporal Attention
+
+    Combines the multi-scale backbone of M3 with the temporal attention
+    mechanism of M2. The fused multi-scale output is processed by the
+    same two-layer additive attention before classification.
+
+    Input (1 x 2500)
+    |
+    +--------+-----------+-----------+
+    |        |           |           |
+    | Branch 1       Branch 2    Branch 3
+    | d=[1,2,4]      d=[2,4,8]   d=[4,8,16]
+    |        |           |           |
+    +--------+-----------+-----------+
+    |
+    +--[ Fusion ]
+    |
+    +--[ H: (T x F) multi-scale temporal features ]
+    |
+    +--[ Attention FC + tanh ]
+    +--[ Attention scorer ]
+    +--[ Softmax -> alpha_t ]
+    +--[ Weighted sum -> c ]
+    |
+    +--[ Dropout ]
+    +--[ Linear(F, 1) ]
+    |
+    logit
+
+    Additional tunable hyperparameters: attention_dim, attention_dropout.
+
+    Ablation: M4 vs M3 isolates the contribution of temporal attention
+    over the multi-scale backbone. M4 vs M2 isolates multi-scale
+    processing. The full ablation table is:
+
+        Comparison      Controls for        Isolates
+        --------------- ------------------- -------------------------
+        M2 vs M1        Architecture depth  Temporal attention
+        M3 vs M1        Pooling strategy    Multi-scale branches
+        M4 vs M3        Branch structure    Temporal attention
+        M4 vs M2        Attention design    Multi-scale branches
+        M4 vs M1        --                  Combined contribution
+
+Reference:
+    Bai, S., Kolter, J. Z., & Koltun, V. (2018). An Empirical
+        Evaluation of Generic Convolutional and Recurrent Networks for
+        Sequence Modeling. arXiv preprint arXiv:1803.01271.
+
+--------------------------------------------------------------------------------
+7. HYPERPARAMETER OPTIMISATION
+--------------------------------------------------------------------------------
+
+Hyperparameters were optimised using the Tree-structured Parzen
+Estimator (TPE) algorithm implemented in Optuna (Akiba et al., 2019).
+A two-stage tuning strategy was employed: backbone architectural and
+training hyperparameters were tuned first, and attention-specific
+hyperparameters were tuned subsequently with the backbone weights
+frozen. This sequential design ensures that the M1-vs-M2 and M3-vs-M4
+ablation comparisons share identical backbone configurations.
+
+7.1 Common tuning protocol
+
+    For each model, 50 Optuna trials were conducted using the TPE
+    sampler with 10 initial random exploration trials, after which
+    Bayesian kernel density estimation guided subsequent sampling
+    (Bergstra & Bengio, 2012). Each trial trained a candidate model
+    for a maximum of 20 epochs, with early stopping triggered when
+    the validation macro F1-score failed to improve for 5 consecutive
+    epochs. Within each trial, the AdamW optimiser (Loshchilov &
+    Hutter, 2019) was employed with cosine annealing learning rate
+    decay, in which the learning rate was reduced from the
+    trial-specific initial value to 1% of that value over the
+    20-epoch budget. Gradient clipping with a maximum norm of 1.0
+    was applied at each parameter update step to stabilise training
+    in deep temporal convolutional architectures.
+
+    To reduce computational cost, a MedianPruner was configured to
+    terminate underperforming trials after 3 warm-up epochs: once a
+    trial's intermediate validation F1 fell below the running median
+    of all completed trials, training was halted and the trial was
+    marked as pruned. The pruner was inactive during the first 10
+    trials to allow a sufficient baseline of completed evaluations
+    for robust median estimation.
+
+    A fixed random seed of 42 was set at the start of every trial
+    to ensure reproducible weight initialisation across all
+    hyperparameter configurations. During tuning, a stratified 10%
+    subset of the validation partition was used for per-epoch
+    evaluation, reducing validation cost while preserving the
+    original class ratio.
+
+    Table 2. Common hyperparameter tuning configuration.
+
+    Parameter               Value
+    ----------------------- -------------------------------------------
+    Total trials            50
+    Max epochs per trial    20
+    Early stopping patience 5 epochs
+    Random startup trials   10
+    Pruner                  MedianPruner (n_warmup_steps = 3)
+    Sampler                 TPESampler (seed = 42)
+    Optimiser               AdamW
+    LR scheduler            CosineAnnealingLR (eta_min = lr x 0.01)
+    Loss function           BCEWithLogitsLoss (pos_weight = 1.0)
+    Gradient clipping       max_norm = 1.0
+    Validation subset       10% stratified
+    Mixed precision         AMP (FP16 on CUDA, FP32 fallback)
+
+7.2 M1: TCN hyperparameter search space
+
+    All seven hyperparameters are tuned from scratch with no
+    parameter transfer from prior runs. The search space is
+    partitioned into architectural hyperparameters, which define
+    the model's representational capacity and receptive field, and
+    training hyperparameters, which govern the optimisation
+    dynamics.
+
+    Table 3. M1 (TCN) hyperparameter search space.
+
+    ARCHITECTURAL HYPERPARAMETERS
+    Hyperparameter      Type          Range / Choices     Justification
+    ------------------- ------------- ------------------- -------------------
+    num_layers (L)      Integer       [5, 9]              Controls network
+                                                          depth and receptive
+                                                          field. Lower bound
+                                                          5 ensures minimum
+                                                          RF coverage; upper
+                                                          bound 9 prevents
+                                                          excessive depth
+                                                          that risks gradient
+                                                          degradation with
+                                                          diminishing returns
+                                                          in temporal context.
+
+    kernel_size (k)     Categorical   {3, 5, 7}           Determines local
+                                                          temporal resolution
+                                                          per convolution.
+                                                          Restricted to odd
+                                                          values for symmetric
+                                                          causal padding. k=3
+                                                          captures fine-grained
+                                                          spike morphology;
+                                                          k=7 captures broader
+                                                          waveform envelopes.
+
+    num_filters (F)     Categorical   {32, 64, 128}       Channel width
+                                                          governing feature
+                                                          capacity per layer.
+                                                          Powers of 2 align
+                                                          with GPU memory
+                                                          layout for efficient
+                                                          tensor computation.
+
+    dropout             Float (step)  [0.10, 0.50]        Spatial dropout
+                                      step 0.05           (Dropout1d) rate
+                                                          controlling
+                                                          regularisation
+                                                          strength. Range
+                                                          spans mild (0.10)
+                                                          to aggressive (0.50)
+                                                          regularisation.
+
+    TRAINING HYPERPARAMETERS
+    Hyperparameter      Type          Range / Choices     Justification
+    ------------------- ------------- ------------------- -------------------
+    learning_rate       Float (log)   [1e-4, 5e-4]       AdamW initial step
+                                                          size. Log-uniform
+                                                          sampling reflects
+                                                          the scale-invariant
+                                                          nature of learning
+                                                          rate sensitivity.
+                                                          Narrow range based
+                                                          on preliminary runs
+                                                          showing instability
+                                                          above 5e-4.
+
+    weight_decay        Float (log)   [1e-5, 1e-3]       L2 regularisation
+                                                          coefficient. Log-
+                                                          uniform sampling
+                                                          spans two orders
+                                                          of magnitude to
+                                                          balance under- and
+                                                          over-regularisation.
+
+    batch_size          Categorical   {32, 64}            Segments per gradient
+                                                          step. Affects
+                                                          gradient noise and
+                                                          GPU utilisation.
+                                                          Restricted to powers
+                                                          of 2 for hardware
+                                                          efficiency on V100/
+                                                          A100/L40S GPUs.
+
+    The four architectural hyperparameters (num_layers, kernel_size,
+    num_filters, dropout) jointly determine the model's capacity to
+    represent temporal patterns in the EEG signal, while the three
+    training hyperparameters (learning_rate, weight_decay, batch_size)
+    control how effectively the optimiser navigates the resulting loss
+    landscape. All seven are tuned jointly because architectural and
+    training choices interact: for example, deeper networks with more
+    filters may require stronger regularisation (higher dropout or
+    weight decay) to avoid overfitting, while wider networks may
+    tolerate larger batch sizes without gradient noise becoming
+    problematic.
+
+    Architectural constraint: the receptive field (RF) of a TCN
+    determines the number of consecutive input samples that can
+    influence each output time step. For the detection of seizure
+    events that unfold over at least one second of EEG, the RF
+    must span a minimum of 500 samples at 500 Hz. The RF of L
+    stacked CausalConvBlocks, each containing two dilated
+    convolutions with exponentially increasing dilation factors
+    (d = 1, 2, ..., 2^(L-1)), is given by:
+
+        RF = 2 * (2^L - 1) * (k - 1) + 1
+
+    where k is the kernel size and the factor of 2 accounts for
+    the two convolutions per block. Hyperparameter configurations
+    for which this expression evaluates to fewer than 500 samples
+    are rejected before training begins (the trial is pruned
+    immediately), avoiding the computational cost of a full
+    20-epoch evaluation on an architecturally inadequate model.
+    For example, L = 5 with k = 3 yields RF = 125 samples
+    (0.25 s) and is rejected, whereas L = 6 with k = 7 yields
+    RF = 757 samples (1.51 s) and is accepted.
+
+7.3 M2: Temporal attention hyperparameter search space
+
+    The TCN backbone is instantiated from M1's best hyperparameters
+    (best_params.json) and its weights are frozen during attention
+    tuning. Only the temporal attention module and classification
+    head receive gradient updates.
+
+    Backbone freezing serves three purposes. (Ablation integrity)First, it preserves
+    the controlled ablation design: because M1 and M2 share an
+    identical, independently optimised backbone, any performance
+    difference between them can be attributed solely to the
+    temporal attention mechanism rather than to confounded changes
+    in backbone configuration. If backbone parameters were
+    co-tuned with attention hyperparameters, the search would
+    conflate backbone adaptation with attention contribution,
+    undermining the ablation. Second (search efficiency), freezing reduces the number
+    of trainable parameters from the full model (~80K-200K) to
+    the attention module alone (~4K-10K), which substantially
+    narrows the effective search space and allows the 50-trial
+    budget to converge more efficiently on attention-specific
+    hyperparameters. Third (backbone stability), freezing eliminates the risk of
+    catastrophic drift in backbone representations during
+    attention tuning: without frozen weights, large attention
+    learning rates could destabilise the pre-optimised feature
+    extractor. Note that freezing applies only during this
+    hyperparameter search; during final model training (Section
+    7.6), all parameters are unfrozen and trained jointly.
+
+    Table 4. M2 (TCN + Temporal Attention) hyperparameter search space.
+
+    FROZEN (from M1 best_params.json -- not tuned)
+    -----------------------------------------------
+    num_layers, num_filters, kernel_size, dropout
+    These four architectural hyperparameters are inherited from M1
+    to preserve the controlled ablation design (see above).
+
+    TUNED: ARCHITECTURAL (attention module)
+    Hyperparameter        Type          Range / Choices    Justification
+    --------------------- ------------- ------------------ ------------------
+    attention_dim (D_a)   Categorical   {32, 64, 128}     Projection dimension
+                                                           of the scoring
+                                                           function (W_a). A
+                                                           larger D_a increases
+                                                           the expressiveness
+                                                           of the attention
+                                                           mapping but adds
+                                                           parameters. The
+                                                           range mirrors
+                                                           num_filters choices
+                                                           to maintain
+                                                           proportional
+                                                           capacity.
+
+    attention_dropout     Float (step)  [0.00, 0.40]      Dropout applied to
+                                        step 0.05          the context vector
+                                                           after the weighted
+                                                           sum. Regularises
+                                                           the attention
+                                                           output to prevent
+                                                           the model from
+                                                           relying on a
+                                                           single dominant
+                                                           time step. Lower
+                                                           bound 0.0 allows
+                                                           the search to
+                                                           discover whether
+                                                           attention dropout
+                                                           is beneficial.
+
+    TUNED: TRAINING
+    Hyperparameter        Type          Range / Choices    Justification
+    --------------------- ------------- ------------------ ------------------
+    learning_rate         Float (log)   [1e-4, 1e-2]      Wider range than M1
+                                                           ([1e-4, 5e-4])
+                                                           because the smaller
+                                                           number of trainable
+                                                           parameters (~4K-10K
+                                                           vs ~80K-200K) may
+                                                           benefit from higher
+                                                           initial step sizes
+                                                           to traverse the
+                                                           lower-dimensional
+                                                           loss surface
+                                                           efficiently.
+
+    weight_decay          Float (log)   [1e-5, 1e-3]      Same range as M1.
+                                                           L2 regularisation
+                                                           on attention
+                                                           parameters.
+
+    batch_size            Categorical   {16, 32, 64}      Includes 16 (absent
+                                                           from M1) because
+                                                           the frozen backbone
+                                                           reduces per-sample
+                                                           gradient cost,
+                                                           making smaller
+                                                           batches with
+                                                           noisier gradients
+                                                           computationally
+                                                           feasible.
+
+    The two architectural hyperparameters (attention_dim,
+    attention_dropout) define the capacity and regularisation of
+    the temporal attention mechanism, while the three training
+    hyperparameters (learning_rate, weight_decay, batch_size)
+    govern the optimisation of the attention weights. Only five
+    hyperparameters are tuned (versus seven for M1), reflecting
+    the reduced search space after backbone freezing. The same
+    partitioning applies to M4 (Section 7.5), which tunes the
+    identical five attention and training hyperparameters over the
+    Multi-Scale TCN backbone.
+
+7.4 M3: Multi-Scale TCN hyperparameter search space
+
+    All architectural and training hyperparameters are tuned from
+    scratch. No parameters are transferred from M1. Branch dilation
+    schedules are fixed architectural design choices and are not tuned.
+
+    Hyperparameter      Type          Range / Choices
+    ------------------- ------------- ----------------------------------
+    num_filters (F)     Categorical   {32, 64, 128}
+    kernel_size (k)     Categorical   {3, 5, 7}
+    dropout             Float (step)  [0.10, 0.40], step 0.05
+    fusion              Categorical   {concat, average}
+    learning_rate       Float (log)   [1e-4, 5e-4]
+    weight_decay        Float (log)   [5e-5, 1e-3]
+    batch_size          Categorical   {32, 64}
+
+    Fixed (not tuned):
+      Branch 1 dilations: [1, 2, 4]     (fine temporal scale)
+      Branch 2 dilations: [2, 4, 8]     (medium temporal scale)
+      Branch 3 dilations: [4, 8, 16]    (coarse temporal scale)
+      Blocks per branch:  3
+
+    Note: num_layers is absent from the M3 search space because the
+    multi-scale architecture derives its receptive field diversity
+    from the three parallel branches rather than from depth. Each
+    branch has exactly three CausalConvBlocks with fixed dilations.
+
+7.5 M4: Multi-Scale attention hyperparameter search space
+
+    The MultiScaleTCN backbone is instantiated from M3's best
+    hyperparameters (best_multiscale_params.json) and frozen for
+    the same reasons described in Section 7.3: ablation integrity,
+    search space efficiency, and backbone stability. Only the
+    temporal attention module and classification head are tuned.
+
+    Frozen from M3           Tuned (attention only)
+    ----------------------   -----------------------------------------
+    num_filters              attention_dim:     {32, 64, 128}
+    kernel_size              attention_dropout: [0.00, 0.40], step 0.05
+    dropout                  learning_rate:     [1e-4, 1e-2]  (log)
+    fusion                   weight_decay:      [1e-5, 1e-3]  (log)
+    Branch dilations         batch_size:        {16, 32, 64}
+
+    The search space is identical to M2's attention tuning, enabling
+    direct comparison of optimal attention configurations across
+    single-branch (M2) and multi-scale (M4) backbones.
+
+7.6 Final model training protocol
+
+    After hyperparameter optimisation, each model is trained from
+    scratch using the selected hyperparameters with the following
+    protocol:
+
+    Parameter               Value       Notes
+    ----------------------- ----------- -----------------------------------
+    Max epochs              100         Full cosine annealing cycle
+    Early stopping patience 10 epochs   Less aggressive than tuning
+    Training mode           Joint       ALL parameters unfrozen (backbone
+                                        + attention trained together)
+    Checkpoint strategy     latest.pt   Overwritten every epoch; contains
+                                        current + best-epoch weights
+    Mixed precision         AMP (FP16)  On CUDA; FP32 fallback on CPU
+
+    For M2 and M4, the backbone was frozen only during hyperparameter
+    tuning to isolate attention-specific search. During final training,
+    all parameters (backbone and attention) are trained jointly to
+    allow end-to-end gradient flow.
+
+References:
+    Akiba, T., Sano, S., Yanase, T., Ohta, T., & Koyama, M. (2019).
+        Optuna: A Next-generation Hyperparameter Optimization Framework.
+        Proceedings of the 25th ACM SIGKDD International Conference on
+        Knowledge Discovery and Data Mining, 2623-2631.
+    Bergstra, J. & Bengio, Y. (2012). Random Search for Hyper-Parameter
+        Optimization. JMLR, 13, 281-305.
+    Loshchilov, I. & Hutter, F. (2019). Decoupled Weight Decay
+        Regularization. Proceedings of the 7th International Conference
+        on Learning Representations (ICLR).
+
+--------------------------------------------------------------------------------
+8. DATASET STATISTICS
+--------------------------------------------------------------------------------
+
+8.1 Raw segment counts (prior to downsampling)
+
+    Partition   Ictal       Non-ictal       Total           Ictal (%)
+    ----------- ----------- --------------- --------------- ---------
+    Training    65,510      28,686,710      28,752,220      0.23
+    Validation  11,603      4,286,551       4,298,154       0.27
+    Test        (reserved)  (reserved)      (reserved)      --
+
+8.2 Class imbalance
+
+    The training partition exhibits a pronounced class imbalance, with a
+    1:438 ictal-to-non-ictal ratio. This degree of imbalance is
+    characteristic of continuous EEG monitoring paradigms in which
+    seizure events occupy less than 1% of total recording time
+    (Shoeb & Guttag, 2010) [VERIFY EXACT QUOTE BEFORE SUBMISSION].
+
+8.3 Excluded subjects
+
+    One subject (m254) was excluded from all training and tuning
+    procedures because its recording contained no annotated seizure
+    events (0 ictal segments, 308,995 non-ictal segments). A subject
+    lacking ictal representation cannot contribute to supervised seizure
+    detection learning and would introduce undefined behaviour in
+    stratified sampling routines.
+
+8.4 Data quality exclusions
+
+    A post-hoc amplitude audit identified six segments from five subjects
+    in which the maximum absolute amplitude exceeded the threshold of
+    1,000 standard units, far exceeding the expected range for z-scored
+    EEG. Investigation attributed these anomalies to incomplete
+    preprocessing resulting from interrupted batch jobs. The affected
+    segments were excluded from all training manifests.
+
+    Table 1. Segments excluded due to anomalous amplitude values.
+
+    Subject     Segments removed     Maximum |x|
+    ----------- -------------------- ----------------
+    m287        1                    8.56 x 10^15
+    m327        1                    3.89 x 10^17
+    m340        2                    4.36 x 10^17
+    m344        1                    8.84 x 10^16
+    m348        1                    2.86 x 10^17
+
+--------------------------------------------------------------------------------
+9. CLASS IMBALANCE MITIGATION
+--------------------------------------------------------------------------------
+
+9.1 Uniform random downsampling (baseline approach)
+
+    In the initial experimental configuration, non-ictal segments were
+    downsampled to a 1:4 ictal-to-non-ictal ratio using stratified
+    random sampling within each subject (random seed = 42). This
+    procedure yielded a training corpus of 65,510 ictal and 262,040
+    non-ictal segments (327,550 total). The binary cross-entropy loss
+    function (BCEWithLogitsLoss) was configured with pos_weight = 1.0,
+    as the offline downsampling served as the sole mechanism for class
+    imbalance correction.
+
+9.2 Proximity-aware downsampling (adopted approach)
+
+    To better exploit informative training examples, a proximity-aware
+    sampling strategy was subsequently adopted. Non-ictal segments were
+    partitioned into two categories based on their temporal distance to
+    the nearest annotated seizure boundary:
+
+    (a) Near-seizure segments (distance <= 60 s). All non-ictal segments
+        falling within a +/-60-second margin of any seizure onset or
+        offset were retained in full. These peri-ictal segments
+        encompass pre-ictal build-up activity, post-ictal suppression,
+        and transitional EEG patterns that are morphologically proximal
+        to ictal discharges (Litt & Echauz, 2002) [VERIFY EXACT QUOTE
+        BEFORE SUBMISSION]. As the most challenging examples for a
+        binary classifier, they contribute disproportionately to
+        gradient-based learning, consistent with the principle of
+        hard-example mining (Shrivastava et al., 2016) [VERIFY EXACT
+        QUOTE BEFORE SUBMISSION].
+
+    (b) Far-from-seizure segments (distance > 60 s). A random subsample
+        comprising 5% of the near-seizure count was drawn from the
+        remaining non-ictal pool. This preserves representational
+        diversity across background EEG states (e.g., quiet sleep,
+        active waking, grooming artefacts) while preventing the training
+        corpus from being dominated by easily classifiable examples
+        that yield diminishing gradient signal after the initial
+        training epochs (Bengio et al., 2009) [VERIFY EXACT QUOTE
+        BEFORE SUBMISSION].
+
+    The 60-second margin was chosen to capture the temporal extent of
+    peri-ictal phenomena observed in rodent models of epilepsy, where
+    pre-ictal electrographic changes and post-ictal depression typically
+    span tens of seconds (Luttjohann et al., 2009) [VERIFY EXACT QUOTE
+    BEFORE SUBMISSION].
+
+    The resulting balanced training manifest was generated once offline
+    and reused without modification across all hyperparameter tuning and
+    final model training runs. The binary cross-entropy loss pos_weight
+    remained at 1.0, with the offline sampling serving as the sole
+    imbalance correction mechanism.
+
+References:
+    Shoeb, A. & Guttag, J. (2010). Application of Machine Learning to
+        Epileptic Seizure Detection. Proceedings of the 27th
+        International Conference on Machine Learning (ICML).
+    Litt, B. & Echauz, J. (2002). Prediction of epileptic seizures.
+        The Lancet Neurology, 1(1), 22-30.
+    Shrivastava, A., Gupta, A., & Girshick, R. (2016). Training
+        Region-Based Object Detectors with Online Hard Example Mining.
+        Proceedings of the IEEE Conference on Computer Vision and
+        Pattern Recognition (CVPR), 761-769.
+    Bengio, Y., Louradour, J., Collobert, R., & Weston, J. (2009).
+        Curriculum Learning. Proceedings of the 26th International
+        Conference on Machine Learning (ICML), 41-48.
+    Luttjohann, A., Fabene, P. F., & van Luijtelaar, G. (2009). A
+        revised Racine's scale for PTZ-induced seizures in rats.
+        Physiology & Behavior, 98(5), 579-586.
+
+--------------------------------------------------------------------------------
+10. DATA PROCESSING PIPELINE
+--------------------------------------------------------------------------------
+
+The end-to-end data processing pipeline proceeds through four stages:
+
+Stage 1: Signal preprocessing and segmentation
+    Raw EDF recordings from 102 subjects are preprocessed (notch
+    filtering, baseline correction, robust z-score normalisation) and
+    segmented into 5-second windows with 50% overlap. Each segment is
+    labelled as ictal or non-ictal and saved as an individual .npy file.
+    Preprocessing is distributed across five parallel batch jobs.
+
+Stage 2: Partition manifest generation
+    All five training data directories, the validation directory, and
+    (when available) the test directory are scanned to produce a single
+    JSON manifest (data_splits.json) containing absolute file paths and
+    labels for all 33 million segments. A subject-level leakage check
+    is executed to verify partition integrity.
+
+Stage 3: Balanced corpus construction
+    The training partition of data_splits.json is processed by an
+    offline script (create_balanced_splits.py) that: (i) excludes
+    subject m254, (ii) removes six amplitude-anomalous segments,
+    (iii) classifies non-ictal segments as near-seizure or
+    far-from-seizure, and (iv) applies proximity-aware downsampling.
+    The output (data_splits_nonictal_sampled.json) serves as the
+    training manifest for all subsequent experiments. The validation
+    partition is passed through unmodified.
+
+Stage 4: Model development
+    Hyperparameter tuning (4 scripts) and final model training
+    (4 scripts) load the balanced manifest directly. No further
+    downsampling, filtering, or data manipulation is performed at
+    training time.
+
+--------------------------------------------------------------------------------
+11. STORAGE INFRASTRUCTURE
+--------------------------------------------------------------------------------
+
+All data reside on a shared parallel filesystem (/scratch) accessible
+from all compute nodes of the Slurm-managed HPC cluster. Preprocessed
+segments are distributed across five directories corresponding to the
+five parallel preprocessing batches:
+
+    Directory                       Contents
+    ------------------------------- ----------------------------------------
+    TRAIN_DATA/                     Training segments (batch 1)
+    TRAIN_DATA_2/                   Training segments (batch 2)
+    TRAIN_DATA_3/                   Training segments (batch 3)
+    TRAIN_DATA_4/                   Training segments (batch 4)
+    TRAIN_DATA_5/                   Training segments (batch 5)
+    VAL_DATA/                       Validation segments
+    TEST_DATA/                      Test segments (reserved)
+
+Each directory contains two subdirectories: seizure/ and non_seizure/.
+All file paths recorded in the JSON manifests are absolute, eliminating
+the need for path resolution at training time.
+
+Seizure annotation files are stored separately in a dedicated directory
+(seizure_times_updated/) and are accessed only during manifest generation,
+not during model training.
+
+--------------------------------------------------------------------------------
+12. REPRODUCIBILITY
+--------------------------------------------------------------------------------
+
+The following measures were implemented to ensure full reproducibility
+of all experimental results:
+
+(i)   Deterministic seeding. A fixed random seed (42) was set for
+      Python's random module, NumPy, and all PyTorch random number
+      generators (CPU and CUDA) at the start of every script.
+
+(ii)  Deterministic preprocessing. All preprocessing, segmentation,
+      and labelling operations are fully deterministic given identical
+      input EDF and annotation files.
+
+(iii) Partition integrity. The subject-level leakage check is enforced
+      programmatically at manifest generation time, ensuring no subject
+      appears in more than one partition.
+
+(iv)  Manifest-based sampling. All downsampling decisions are recorded
+      in JSON manifests generated once and reused across experiments.
+      The original .npy segment files are never modified, deleted, or
+      moved by any downstream script, preserving the complete dataset
+      for alternative analyses (e.g., self-supervised learning).
+
+(v)   Software environment. Experiments were conducted using PyTorch
+      2.5.1 with CUDA 11.8 on NVIDIA V100, A100, and L40S GPUs
+      managed by the Slurm workload scheduler.
+
+================================================================================
+ADDENDUM A: GLOSSARY OF DEEP LEARNING CONCEPTS
+================================================================================
+
+This addendum provides intuitive explanations of the deep learning
+concepts used throughout this report, aimed at readers who may be
+new to the field.
+
+A.1 Uniform vs weighted averaging (pooling vs attention)
+
+    After a convolutional network processes a 5-second EEG segment,
+    it produces a feature vector h_t at every time step t = 1, ..., T
+    (where T = 2,500 at 500 Hz). Think of each h_t as a summary
+    description of "what the EEG looks like" at that moment in time.
+
+    The problem: the classifier expects a single fixed-size input,
+    but we have 2,500 of these descriptions. We need to collapse
+    them into one.
+
+    GLOBAL AVERAGE POOLING (uniform averaging):
+        z = (h_1 + h_2 + ... + h_T) / T
+
+        Every time step contributes equally. Time step 1 counts as
+        much as time step 2,500. This is like reading a 5-second
+        EEG epoch and summarising it by averaging every moment
+        equally -- no moment is considered more important than
+        another.
+
+        Used in: M1 (TCN) and M3 (Multi-Scale TCN).
+
+    TEMPORAL ATTENTION (weighted averaging):
+        c = alpha_1*h_1 + alpha_2*h_2 + ... + alpha_T*h_T
+
+        Each time step gets its own learned weight alpha_t. The
+        model learns from the data which moments are most
+        informative for detecting seizures. If a seizure starts
+        at time step 1,500, the model might assign alpha_1500 = 0.3
+        (high attention) while giving alpha_100 = 0.001 (almost no
+        attention) to a quiet background period.
+
+        The weights alpha_t are non-negative and sum to 1 (enforced
+        by the softmax function), so this is a weighted average --
+        just not a uniform one.
+
+        Used in: M2 (TCN + Attention) and M4 (Multi-Scale TCN +
+        Attention).
+
+    WHY THIS MATTERS: if seizure-discriminative EEG patterns are
+    concentrated in a specific part of the 5-second window (e.g.,
+    the onset), uniform averaging dilutes that signal with 4 seconds
+    of uninformative background. Attention can amplify the onset and
+    suppress the background, producing a cleaner signal for the
+    classifier. The ablation study tests whether this learnable
+    focusing actually improves detection accuracy.
+
+A.2 Logit, sigmoid, and probability
+
+    A logit is the raw, unbounded output of the classification head
+    -- a single number that can range from negative infinity to
+    positive infinity. It represents the model's "unnormalised
+    confidence" that the input is a seizure.
+
+        logit = -3.0  ->  model is fairly confident: NOT a seizure
+        logit =  0.0  ->  model is uncertain (50/50)
+        logit = +5.0  ->  model is very confident: IS a seizure
+
+    The sigmoid function squashes the logit into the range [0, 1],
+    making it interpretable as a probability:
+
+        p = 1 / (1 + exp(-logit))
+
+        logit = -3.0  ->  p = 0.047  (4.7% chance of seizure)
+        logit =  0.0  ->  p = 0.500  (50% chance)
+        logit = +5.0  ->  p = 0.993  (99.3% chance)
+
+    A threshold (default 0.5) is then applied: if p >= 0.5, the
+    segment is classified as ictal; otherwise, non-ictal.
+
+A.3 Loss function
+
+    The loss function measures how wrong the model's prediction is
+    for a single training example, producing a number that the
+    optimiser tries to minimise.
+
+    Binary cross-entropy (BCE) is the standard loss for two-class
+    problems. Intuitively:
+
+        If the true label is SEIZURE (y=1) and the model predicts
+        p=0.95, the loss is small (the model is right).
+
+        If the true label is SEIZURE (y=1) and the model predicts
+        p=0.05, the loss is large (the model is very wrong).
+
+    The formula:
+        L = -[y * log(p) + (1-y) * log(1-p)]
+
+    BCEWithLogitsLoss combines the sigmoid and BCE into one step
+    for numerical stability -- it avoids computing log(sigmoid(x))
+    separately, which can produce infinity or NaN for very large
+    or very small logits.
+
+A.4 Gradient, backpropagation, and gradient clipping
+
+    GRADIENT: for each trainable parameter (e.g., a convolution
+    filter weight), the gradient tells the optimiser "if I increase
+    this weight slightly, how much does the loss change?" A positive
+    gradient means increasing the weight increases the loss (bad),
+    so the optimiser decreases it.
+
+    BACKPROPAGATION: the algorithm that computes gradients for all
+    parameters simultaneously by propagating the loss backward
+    through the network, layer by layer, using the chain rule of
+    calculus.
+
+    GRADIENT CLIPPING: in deep networks, gradients can occasionally
+    become very large ("exploding gradients"), causing the optimiser
+    to take a catastrophically large step that destabilises training.
+    Gradient clipping limits the total gradient magnitude to a
+    maximum norm (1.0 in this study): if the combined gradient
+    across all parameters exceeds 1.0, every gradient is scaled
+    down proportionally so the total norm equals exactly 1.0.
+
+A.5 Learning rate, weight decay, and AdamW
+
+    LEARNING RATE (lr): controls how large a step the optimiser
+    takes at each update. Too large and training becomes unstable
+    (the model overshoots good solutions); too small and training
+    is extremely slow or gets stuck.
+
+    WEIGHT DECAY (wd): a regularisation technique that penalises
+    large parameter values by adding a small fraction of each
+    weight's magnitude to the loss. This discourages overly
+    complex models and reduces overfitting. A weight decay of 1e-4
+    means "at each step, shrink every weight by 0.01%."
+
+    AdamW: an optimiser that adapts the learning rate individually
+    for each parameter based on the history of its gradients. The
+    "W" indicates decoupled weight decay (Loshchilov & Hutter,
+    2019), which applies weight decay directly to the parameters
+    rather than through the gradient, preventing the regularisation
+    strength from diminishing as the learning rate decays.
+
+    COSINE ANNEALING: the learning rate starts at its initial value
+    and smoothly decreases following a half-cosine curve over the
+    training budget (20 epochs for tuning, 100 for final training),
+    reaching a minimum of 1% of the initial value. This allows
+    aggressive exploration early in training and fine-grained
+    convergence later.
+
+A.6 Batch size and gradient noise
+
+    Training data is processed in batches (groups of segments).
+    The gradient computed from one batch is an approximation of the
+    true gradient over the entire dataset.
+
+    SMALL BATCHES (e.g., 16): noisier gradient estimates, but each
+    step is cheaper and the noise can help the optimiser escape
+    shallow local minima.
+
+    LARGE BATCHES (e.g., 64): smoother gradient estimates, but each
+    step is more expensive and the optimiser may converge to sharper
+    (potentially less generalisable) minima.
+
+    The batch size also affects GPU memory usage: larger batches
+    require more VRAM. Powers of 2 (16, 32, 64) are preferred
+    because GPU hardware is optimised for these sizes.
+
+A.7 Dropout and regularisation
+
+    REGULARISATION: any technique that prevents a model from
+    memorising the training data (overfitting) and encourages it
+    to learn general patterns that transfer to unseen data.
+
+    DROPOUT: during training, a random subset of neurons (or entire
+    channels) is temporarily set to zero at each forward pass. This
+    forces the network to learn redundant representations that do
+    not rely on any single neuron, improving generalisation.
+
+    SPATIAL DROPOUT (Dropout1d): instead of dropping individual
+    values, entire feature channels are dropped. For EEG data,
+    where adjacent time steps within a channel are highly
+    correlated, spatial dropout is more effective than element-wise
+    dropout because it prevents the network from simply recovering
+    a dropped value from its temporal neighbours.
+
+    The dropout rate (e.g., 0.30) specifies the probability that
+    each channel is dropped: at 0.30, roughly 30% of channels are
+    zeroed out in each training batch. Dropout is disabled during
+    evaluation (model.eval()), so all channels contribute to the
+    final prediction.
+
+A.8 Early stopping and patience
+
+    EARLY STOPPING: a technique to prevent overfitting by monitoring
+    a validation metric (macro F1-score in this study) after each
+    training epoch. Training is halted when the metric stops
+    improving.
+
+    PATIENCE: the number of consecutive epochs without improvement
+    before training is stopped. A patience of 5 means: "if the
+    validation F1 has not exceeded its best value for 5 epochs in
+    a row, stop training and keep the best model."
+
+    This prevents the model from training past its peak performance
+    into the overfitting regime, where training loss continues to
+    decrease but validation performance degrades.
+
+A.9 Mixed precision (AMP)
+
+    Automatic Mixed Precision (AMP) uses 16-bit floating-point
+    numbers (FP16) instead of 32-bit (FP32) for the forward and
+    backward passes through the network. This approximately halves
+    memory usage and can double throughput on GPUs with dedicated
+    FP16 hardware (Tensor Cores on V100, A100, L40S).
+
+    The GradScaler dynamically adjusts a scaling factor to prevent
+    the smaller FP16 number range from causing gradient underflow
+    (gradients too small to represent, rounded to zero). Weight
+    updates are always performed in FP32 to maintain precision
+    where it matters most.
+
+A.10 Receptive field
+
+    The receptive field of a convolutional network is the span of
+    input samples that can influence a single output value. In a
+    TCN with dilated convolutions, the receptive field grows
+    exponentially with depth:
+
+        Layer 1 (dilation 1):  each output sees 7 input samples (k=7)
+        Layer 2 (dilation 2):  each output sees 19 input samples
+        Layer 3 (dilation 4):  each output sees 43 input samples
+        ...
+        Layer 6 (dilation 32): each output sees 757 input samples
+
+    A receptive field of 757 samples at 500 Hz means the network
+    can "see" 1.514 seconds of EEG history when making a prediction
+    at any given time step. If the receptive field is too small
+    (e.g., 125 samples = 0.25 s), the network cannot capture
+    seizure patterns that evolve over longer timescales.
+
+================================================================================
+END OF STUDY REPORT
+================================================================================
