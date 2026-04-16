@@ -580,10 +580,14 @@ def main():
 
     logger.info("=" * 60)
     logger.info("FINAL TRAINING CORPUS")
-    logger.info("  Ictal          : %d", n_ictal_final)
-    logger.info("  Non-ictal      : %d", n_nonictal_final)
-    logger.info("  Total          : %d", len(final_train))
-    logger.info("  Ratio (non:ic) : %.2f", n_nonictal_final / max(n_ictal_final, 1))
+    logger.info("  Ictal                    : %d", n_ictal_final)
+    logger.info("  Non-ictal (total)        : %d", n_nonictal_final)
+    logger.info("    Near-seizure (<=%.0fs) : %d", MARGIN_SEC, len(kept_near))
+    logger.info("    Far sampled (>%.0fs)   : %d", MARGIN_SEC, len(kept_far))
+    logger.info("    Extreme removed        : %d", n_extreme)
+    logger.info("  Total                    : %d", len(final_train))
+    logger.info("  Ratio (ictal:non-ictal)  : 1:%.2f", n_nonictal_final / max(n_ictal_final, 1))
+    logger.info("  Ratio (non-ictal:ictal)  : %.2f:1", n_nonictal_final / max(n_ictal_final, 1))
     logger.info("=" * 60)
 
     # -- Step 8: Save output JSON ----------------------------------------------
