@@ -139,6 +139,9 @@ from datetime import datetime
 import numpy as np
 import mne
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")                               # non-interactive backend for cluster
+import matplotlib.pyplot as plt
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -274,6 +277,93 @@ def min_distance_to_seizure(seg_start_sec, seg_end_sec, seizure_intervals):
 
 
 # ---------------------------------------------------------------------------
+# Seizure segment verification plots
+# ---------------------------------------------------------------------------
+def plot_seizure_verification(splits, output_dir, n_samples=3, seed=42):
+    """Randomly select and plot seizure segments from train, val, and test.
+
+    For each partition that contains ictal segments, n_samples segments
+    are randomly drawn, loaded from disk, and plotted as time-domain
+    waveforms. This provides a visual sanity check that seizure segments
+    contain plausible ictal EEG morphology (rhythmic discharges, amplitude
+    changes) rather than artefacts, flat lines, or non-EEG data.
+
+    Plots are saved to output_dir and NOT displayed (Agg backend).
+
+    Parameters
+    ----------
+    splits : dict
+        The loaded data_splits.json with keys "train", "val", "test".
+    output_dir : Path
+        Directory to save the verification figures.
+    n_samples : int
+        Number of seizure segments to plot per partition (default 3).
+    seed : int
+        Random seed for reproducible segment selection.
+    """
+    rng = random.Random(seed)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    partitions = [
+        ("train", splits.get("train", [])),
+        ("val",   splits.get("val", [])),
+        ("test",  splits.get("test", [])),
+    ]
+
+    for part_name, records in partitions:
+        # Extract only ictal segments from this partition
+        ictal_recs = [r for r in records if r["label"] == 1]
+
+        if not ictal_recs:
+            logger.info("Seizure verification: %s -- no ictal segments, skipping", part_name)
+            continue
+
+        # Randomly sample n_samples (or fewer if partition is small)
+        k = min(n_samples, len(ictal_recs))
+        sampled = rng.sample(ictal_recs, k)
+
+        fig, axes = plt.subplots(k, 1, figsize=(14, 3 * k))
+        if k == 1:
+            axes = [axes]                              # ensure iterable for single subplot
+
+        for idx, (ax, rec) in enumerate(zip(axes, sampled)):
+            filepath = rec["filepath"]
+            fname = Path(filepath).stem                # e.g. m1_ictal_00001
+            mouse_id = fname.split("_", 1)[0]         # e.g. m1
+
+            try:
+                segment = np.load(filepath)
+                time_axis = np.arange(len(segment)) / FS  # seconds
+
+                ax.plot(time_axis, segment, color="#5A7DC8", linewidth=0.6)
+                ax.set_title(
+                    "%s | %s | shape=%s | min=%.2f | max=%.2f | std=%.2f" % (
+                        part_name.upper(), fname, segment.shape,
+                        segment.min(), segment.max(), segment.std()),
+                    fontsize=9)
+                ax.set_xlabel("Time (s)", fontsize=8)
+                ax.set_ylabel("Amplitude (z-scored)", fontsize=8)
+                ax.tick_params(labelsize=7)
+
+                # Shade the full segment as ictal (light red background)
+                ax.axvspan(0, time_axis[-1], alpha=0.08, color="#C85A5A",
+                           label="Ictal segment")
+                ax.legend(fontsize=7, loc="upper right")
+
+            except Exception as e:
+                ax.set_title("%s | %s | LOAD FAILED: %s" % (
+                    part_name.upper(), fname, e), fontsize=9, color="red")
+                logger.warning("Could not load %s: %s", filepath, e)
+
+        plt.tight_layout()
+        fig_path = output_dir / ("seizure_verification_%s.png" % part_name)
+        plt.savefig(fig_path, dpi=150, bbox_inches="tight")
+        plt.close()
+        logger.info("Seizure verification: %s -- %d segments plotted -> %s",
+                    part_name, k, fig_path)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
@@ -302,6 +392,13 @@ def main():
     train_records = splits["train"]
     val_records = splits["val"]
     logger.info("Loaded data_splits.json: %d train, %d val", len(train_records), len(val_records))
+
+    # -- Step 1b: Visual verification of seizure segments ----------------------
+    # Randomly plot 3 ictal segments from each partition (train, val, test)
+    # before any downsampling. This confirms that ictal .npy files contain
+    # plausible seizure EEG morphology and are not corrupted or mislabelled.
+    plot_seizure_verification(splits, OUTPUT_PATH.parent / "seizure_verification_plots",
+                              n_samples=3, seed=SEED)
 
     # -- Step 2: Group train records by mouse ----------------------------------
     # Mouse ID is extracted from the filename stem: m1_ictal_00001 -> m1

@@ -10,7 +10,7 @@
 
 module purge
 module load anaconda3
-conda activate uniqureSSLGA
+conda activate torch_v100_py310
 
 cd ~/TCN_SSL_GA
 
