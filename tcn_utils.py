@@ -577,18 +577,19 @@ def filter_extreme_segments(pairs, threshold=1000.0, logger=None):
 # ---------------------------------------------------------------------------
 # 8. downsample_val_stratified
 # ---------------------------------------------------------------------------
-def downsample_val_stratified(val_pairs, fraction=0.10, seed=42):
+def downsample_val_stratified(val_pairs, fraction=0.01, seed=42):
     """Draw a stratified subset of the validation partition for use
     during hyperparameter tuning.
 
     With 4.3 million validation segments, full validation per epoch
     during Optuna trials is computationally prohibitive (67K batches
-    per evaluation pass). A stratified 10% subset (~430K segments)
+    per evaluation pass). A stratified 1% subset (~43K segments)
     preserves the original ictal/non-ictal class ratio and provides
     a sufficiently accurate F1 proxy for ranking trials, consistent
     with established practice in neural architecture search and
     hyperparameter optimisation (Li et al., 2017; Falkner et al.,
-    2018; Jamieson & Talwalkar, 2016).
+    2018; Jamieson & Talwalkar, 2016). See STUDY_REPORT.txt
+    "Validation subset during tuning" for the timing computation.
 
     The subset is drawn once before tuning begins and held fixed
     across all trials and all tuning scripts, ensuring that
@@ -646,7 +647,7 @@ def downsample_val_stratified(val_pairs, fraction=0.10, seed=42):
 
 # -- RESEARCH REPORTING NOTE: downsample_val_stratified ------------------------
 # Methods description:
-#   During hyperparameter tuning, a stratified 10% subset of the
+#   During hyperparameter tuning, a stratified 1% subset of the
 #   validation partition was used to evaluate trial performance,
 #   preserving the original class ratio. The subset was drawn once
 #   with a fixed seed (42) and held constant across all trials and

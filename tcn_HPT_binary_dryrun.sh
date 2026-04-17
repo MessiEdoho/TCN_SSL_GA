@@ -1,5 +1,5 @@
 #!/bin/bash -l
-#SBATCH --job-name=tune_mstcn_dry
+#SBATCH --job-name=tcn_hpt_dry
 # One node with one GPU for PyTorch training + CPU cores for Optuna TPE
 #SBATCH -N 1
 # specify number of tasks/cores per node required
@@ -10,8 +10,9 @@
 #SBATCH --gres=gpu:1
 
 # Dry-run: TCN_HPT_DRY_RUN=1 caps N_TRIALS=2 and N_STARTUP=1 in the Python
-# script. With MAX_EPOCHS=20 and early stopping patience 5, each trial
-# runs ~8-20 epochs. 1-hour walltime is generous for two trials on a GPU.
+# script. With the 1% stratified val subset (~43K segments), train+val per
+# epoch is ~8.2K batches. Cold epoch ~24 min, warm epochs ~5-9 min. Two
+# trials with ~10 epochs each fit comfortably in 4 hours.
 #SBATCH -t 04:00:00
 
 # Email notifications at start, end, and failure
@@ -33,10 +34,10 @@ cd ~/TCN_SSL_GA
 
 # Enable dry-run mode: script reads this env var and caps N_TRIALS at 2.
 # Purpose: verify script starts, loads data, reaches training loop, and
-# writes all six outputs without consuming a full 50-trial budget.
+# writes all outputs without consuming a full 50-trial budget.
 export TCN_HPT_DRY_RUN=1
 
-python tune_multiscale_tcn.py
+python tcn_HPT_binary.py
 
 echo "===== DRY-RUN JOB END ====="
 date

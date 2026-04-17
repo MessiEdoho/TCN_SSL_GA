@@ -15,7 +15,7 @@ terminate between epochs 8-15. The reduced budget accelerates the search
 while retaining enough epochs for the cosine schedule to differentiate
 good from bad hyperparameter configurations (Li et al., 2017).
 
-Validation subset: a stratified 10% subset of the validation partition
+Validation subset: a stratified 1% subset of the validation partition
 is used during tuning to reduce per-epoch evaluation cost. The subset
 preserves the original class ratio and is fixed across all trials
 (Falkner et al., 2018).
@@ -804,9 +804,10 @@ def main():
     # train_pairs = filter_unpaired_subjects(train_pairs, logger=logger)
     logger.info("Training corpus: %d segments (from balanced manifest)", len(train_pairs))
 
-    # Stratified 10% validation subset for tuning speed.
-    val_pairs = downsample_val_stratified(val_pairs, fraction=0.10, seed=42)
-    logger.info("Val subset for tuning: %d segments (10%% stratified)", len(val_pairs))
+    # Stratified 1% validation subset for tuning speed. See STUDY_REPORT.txt
+    # Section on "Validation subset during tuning" for timing justification.
+    val_pairs = downsample_val_stratified(val_pairs, fraction=0.01, seed=SEED)
+    logger.info("Val subset for tuning: %d segments (1%% stratified)", len(val_pairs))
     # -- End corpus preparation ------------------------------------------------
 
     # -- Step 3: configure and run Optuna study --------------------------------

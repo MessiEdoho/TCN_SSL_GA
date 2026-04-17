@@ -12,7 +12,7 @@ terminate between epochs 8-15. The reduced budget accelerates the search
 while retaining enough epochs for the cosine schedule to differentiate
 good from bad hyperparameter configurations (Li et al., 2017).
 
-Validation subset: a stratified 10% subset of the validation partition
+Validation subset: a stratified 1% subset of the validation partition
 is used during tuning to reduce per-epoch evaluation cost from 67K
 batches to ~6.7K batches. The subset preserves the original class ratio
 and is fixed across all trials (Falkner et al., 2018).
@@ -191,9 +191,10 @@ if not val_pairs:
 # train_pairs = filter_unpaired_subjects(train_pairs, logger=log)
 log.info(f"Training corpus: {len(train_pairs)} segments (from balanced manifest)")
 
-# Stratified 10% validation subset for tuning speed.
-val_pairs = downsample_val_stratified(val_pairs, fraction=0.10, seed=SEED)
-log.info(f"Val subset for tuning: {len(val_pairs)} segments (10% stratified)")
+# Stratified 1% validation subset for tuning speed. See STUDY_REPORT.txt
+# Section on "Validation subset during tuning" for timing justification.
+val_pairs = downsample_val_stratified(val_pairs, fraction=0.01, seed=SEED)
+log.info(f"Val subset for tuning: {len(val_pairs)} segments (1% stratified)")
 # -- End corpus preparation ----------------------------------------------------
 
 # -- Class statistics (from pre-balanced manifest) -----------------------------
