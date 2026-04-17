@@ -2123,9 +2123,9 @@ class MultiScaleTCN(nn.Module):
     ------------
     Input: (batch, 1, SEGMENT_LEN)
         |
-        +-- Branch 1 dilations [1, 2, 4]   -- fine scale
-        +-- Branch 2 dilations [2, 4, 8]   -- medium scale
-        +-- Branch 3 dilations [4, 8, 16]  -- coarse scale
+        +-- Branch 1 dilations [1,  2,   4]    -- fine scale         (spike morphology)
+        +-- Branch 2 dilations [8,  16,  32]   -- intermediate scale (rhythmic bursts)
+        +-- Branch 3 dilations [32, 64, 128]   -- coarse scale       (seizure evolution)
         |  Each branch: CausalConvBlock x len(dilations)
         |  Each block: same two-conv structure as in TCN
         |  Output per branch: (batch, num_filters, T)
@@ -2152,9 +2152,9 @@ class MultiScaleTCN(nn.Module):
     branch1_dilations : list of int
         Dilation schedule for Branch 1. Default [1, 2, 4].
     branch2_dilations : list of int
-        Dilation schedule for Branch 2. Default [2, 4, 8].
+        Dilation schedule for Branch 2. Default [8, 16, 32].
     branch3_dilations : list of int
-        Dilation schedule for Branch 3. Default [4, 8, 16].
+        Dilation schedule for Branch 3. Default [32, 64, 128].
     fusion : str
         Branch fusion strategy: "concat" (default) or "average".
     return_embedding : bool
@@ -2182,9 +2182,9 @@ class MultiScaleTCN(nn.Module):
         if branch1_dilations is None:
             branch1_dilations = [1, 2, 4]
         if branch2_dilations is None:
-            branch2_dilations = [2, 4, 8]
+            branch2_dilations = [8, 16, 32]
         if branch3_dilations is None:
-            branch3_dilations = [4, 8, 16]
+            branch3_dilations = [32, 64, 128]
 
         if fusion not in ("concat", "average"):
             raise ValueError(
@@ -2266,11 +2266,12 @@ class MultiScaleTCN(nn.Module):
 # -- RESEARCH REPORTING NOTE: MultiScaleTCN ------------------------------------
 # Methods description:
 #   "A Multi-Scale TCN was constructed with three parallel branches of
-#   CausalConvBlocks using dilation schedules [1,2,4], [2,4,8], [4,8,16]
-#   to capture ictal activity at fine, medium, and coarse temporal scales
-#   simultaneously. Branch outputs were fused by [concat+1x1 projection /
-#   averaging] before global average pooling and linear classification.
-#   All hyperparameters were tuned independently from scratch using Optuna TPE."
+#   CausalConvBlocks using dilation schedules [1,2,4], [8,16,32],
+#   [32,64,128] to capture ictal activity at fine, intermediate, and
+#   coarse temporal scales simultaneously. Branch outputs were fused
+#   by [concat+1x1 projection / averaging] before global average
+#   pooling and linear classification. All hyperparameters were tuned
+#   independently from scratch using Optuna TPE."
 #
 # Parameters to report:
 #   num_filters, kernel_size, dropout -- tuned
@@ -2333,8 +2334,8 @@ class MultiScaleTCNWithAttention(nn.Module):
     attention_dropout : float
         Dropout on context vector c. Tuned by Optuna.
     branch1_dilations : list. Default [1, 2, 4].
-    branch2_dilations : list. Default [2, 4, 8].
-    branch3_dilations : list. Default [4, 8, 16].
+    branch2_dilations : list. Default [8, 16, 32].
+    branch3_dilations : list. Default [32, 64, 128].
 
     Notes
     -----
@@ -2473,7 +2474,7 @@ class MultiScaleTCNWithAttention(nn.Module):
 # Parameters to report:
 #   Backbone (fixed -- from best_multiscale_params.json):
 #     num_filters, kernel_size, dropout, fusion
-#     branch dilation schedules [1,2,4], [2,4,8], [4,8,16]
+#     branch dilation schedules [1,2,4], [8,16,32], [32,64,128]
 #   Attention (tuned -- from best_multiscale_attn_params.json):
 #     attention_dim, attention_dropout,
 #     learning_rate, weight_decay, batch_size

@@ -22,9 +22,9 @@ Hyperparameters loaded from TWO sources:
 
 Architecture: MultiScaleTCNWithAttention (tcn_utils.py)
   Backbone: three parallel CausalConvBlock branches
-    Branch 1: dilations [1, 2, 4]   -- fine scale
-    Branch 2: dilations [2, 4, 8]   -- medium scale
-    Branch 3: dilations [4, 8, 16]  -- coarse scale
+    Branch 1: dilations [1,  2,   4]   -- fine scale         (spike morphology)
+    Branch 2: dilations [8,  16,  32]  -- intermediate scale (rhythmic bursts)
+    Branch 3: dilations [32, 64, 128]  -- coarse scale       (seizure evolution)
   Attention: two-layer additive temporal attention
     (tanh + linear scorer) with tunable attention_dim
     and attention_dropout.
@@ -145,9 +145,10 @@ SPLITS_PATH = Path("/scratch/22206468/INPUT_DATA/data_splits_outputs/data_splits
 BACKBONE_ATTR = "backbone"
 
 # Fallback dilation schedules if branch_dilations not in JSON
+# (match M3 backbone: tune_multiscale_tcn.py)
 DEFAULT_BRANCH1 = [1, 2, 4]
-DEFAULT_BRANCH2 = [2, 4, 8]
-DEFAULT_BRANCH3 = [4, 8, 16]
+DEFAULT_BRANCH2 = [8, 16, 32]
+DEFAULT_BRANCH3 = [32, 64, 128]
 
 
 # ---------------------------------------------------------------------------

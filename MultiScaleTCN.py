@@ -13,9 +13,9 @@ report on the validation set.
 
 Architecture: MultiScaleTCN (tcn_utils.py)
 Three parallel CausalConvBlock branches:
-  Branch 1: dilations [1, 2, 4]   -- fine scale
-  Branch 2: dilations [2, 4, 8]   -- medium scale
-  Branch 3: dilations [4, 8, 16]  -- coarse scale
+  Branch 1: dilations [1,  2,   4]   -- fine scale         (spike morphology)
+  Branch 2: dilations [8,  16,  32]  -- intermediate scale (rhythmic bursts)
+  Branch 3: dilations [32, 64, 128]  -- coarse scale       (seizure evolution)
 Branch outputs fused then globally average-pooled.
 
 Hyperparameters loaded from:
@@ -146,9 +146,10 @@ SPLITS_PATH         = Path("/scratch/22206468/INPUT_DATA/data_splits_outputs/dat
 BEST_PARAMS_PATH    = Path("/home/people/22206468/scratch/OUTPUT/MODEL3_OUTPUT/MultiScaleTCNtuning_outputs") / "best_multiscale_params.json"
 
 # Fallback dilation schedules if branch_dilations not in JSON
-DEFAULT_BRANCH1 = [1, 2, 4]                            # fine temporal scale
-DEFAULT_BRANCH2 = [2, 4, 8]                            # medium temporal scale
-DEFAULT_BRANCH3 = [4, 8, 16]                           # coarse temporal scale
+# (match tune_multiscale_tcn.py)
+DEFAULT_BRANCH1 = [1, 2, 4]                            # fine:         spike morphology
+DEFAULT_BRANCH2 = [8, 16, 32]                          # intermediate: rhythmic bursts
+DEFAULT_BRANCH3 = [32, 64, 128]                        # coarse:       seizure evolution
 
 
 # ---------------------------------------------------------------------------
@@ -325,9 +326,9 @@ def build_model(hp, branch_dilations, device, logger):
         num_filters=int(hp["num_filters"]),              # channel width shared across all 3 branches
         kernel_size=int(hp["kernel_size"]),               # local temporal resolution per convolution
         dropout=float(hp["dropout"]),                     # spatial dropout rate (Dropout1d)
-        branch1_dilations=branch_dilations["branch1"],   # fine scale: e.g. [1, 2, 4]
-        branch2_dilations=branch_dilations["branch2"],   # medium scale: e.g. [2, 4, 8]
-        branch3_dilations=branch_dilations["branch3"],   # coarse scale: e.g. [4, 8, 16]
+        branch1_dilations=branch_dilations["branch1"],   # fine scale:         [1, 2, 4]
+        branch2_dilations=branch_dilations["branch2"],   # intermediate scale: [8, 16, 32]
+        branch3_dilations=branch_dilations["branch3"],   # coarse scale:       [32, 64, 128]
         fusion=str(hp["fusion"]),                         # "concat" (1x1 proj) or "average"
     )
     model = model.to(device)                              # move all parameters to GPU if available
@@ -1458,9 +1459,9 @@ if __name__ == "__main__":
 #
 # -- ARCHITECTURE (Methods) ------------------------------------------------
 # "The Multi-Scale TCN comprised three parallel branches of
-# CausalConvBlocks with dilation schedules [1,2,4], [2,4,8], and
-# [4,8,16], capturing ictal activity at fine, medium, and coarse
-# temporal scales simultaneously. Each branch contained three
+# CausalConvBlocks with dilation schedules [1,2,4], [8,16,32], and
+# [32,64,128], capturing ictal activity at fine, intermediate, and
+# coarse temporal scales simultaneously. Each branch contained three
 # CausalConvBlocks with the same two-convolution-per-block structure
 # as the single-branch TCN baseline (Bai et al., 2018). Branch
 # outputs were [concatenated and projected via 1x1 Conv1d / averaged]
@@ -1468,9 +1469,9 @@ if __name__ == "__main__":
 #
 # Receptive fields (from multiscale_tcn_training_log.json
 # under "receptive_field_per_branch"):
-#   Branch 1 [1,2,4]  -- report RF in samples and seconds
-#   Branch 2 [2,4,8]  -- report RF in samples and seconds
-#   Branch 3 [4,8,16] -- report RF in samples and seconds
+#   Branch 1 [1,2,4]       -- report RF in samples and seconds
+#   Branch 2 [8,16,32]     -- report RF in samples and seconds
+#   Branch 3 [32,64,128]   -- report RF in samples and seconds
 #
 # Parameters to report (from best_multiscale_params.json):
 #   num_filters   -- branch channel width (same per branch)
@@ -1623,9 +1624,10 @@ if __name__ == "__main__":
 #   for each segment.
 #
 # WHY BRANCH DILATIONS ARE FIXED (not tuned):
-#   The dilation schedules [1,2,4], [2,4,8], [4,8,16] were fixed by
-#   architectural design to ensure each branch covers a geometrically
-#   distinct temporal scale. Treating them as tunable would conflate
+#   The dilation schedules [1,2,4], [8,16,32], [32,64,128] were fixed
+#   by architectural design so each branch covers a geometrically
+#   distinct, physiologically meaningful temporal scale spanning the
+#   full 5-second segment. Treating them as tunable would conflate
 #   architectural design decisions with hyperparameter search, making
 #   the M1-vs-M3 ablation harder to interpret. The schedules follow
 #   an exponential progression that is standard in TCN literature.

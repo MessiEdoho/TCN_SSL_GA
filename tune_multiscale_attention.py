@@ -64,7 +64,7 @@ batch_size         : segments per gradient step
 Fixed (from best_multiscale_params.json)
 ----------------------------------------
 num_filters, kernel_size, dropout, fusion,
-branch dilation schedules [1,2,4], [2,4,8], [4,8,16]
+branch dilation schedules [1,2,4], [8,16,32], [32,64,128]
 
 Outputs (no model weights saved)
 ---------------------------------
@@ -160,9 +160,10 @@ WD_MAX            = 1e-3                               # weight decay upper boun
 BATCH_CHOICES     = [16, 32, 64]                       # batch size candidates
 
 # Dilation schedules -- for backbone reconstruction and JSON documentation
-BRANCH1_DILATIONS = [1, 2, 4]                          # fine scale
-BRANCH2_DILATIONS = [2, 4, 8]                          # medium scale
-BRANCH3_DILATIONS = [4, 8, 16]                         # coarse scale
+# (must match tune_multiscale_tcn.py so the M3 backbone loads correctly)
+BRANCH1_DILATIONS = [1, 2, 4]                          # fine:         spike morphology
+BRANCH2_DILATIONS = [8, 16, 32]                        # intermediate: rhythmic bursts
+BRANCH3_DILATIONS = [32, 64, 128]                      # coarse:       seizure evolution
 
 # MultiScaleTCNWithAttention stores backbone as self.backbone
 # named_parameters() produces names like "backbone.branch1.0.conv1.weight"

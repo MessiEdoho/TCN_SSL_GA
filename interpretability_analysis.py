@@ -129,9 +129,10 @@ BEST_ATTN_PATH      = Path("outputs") / "best_attention_params.json"   # attenti
 BEST_MS_ATTN_PATH   = Path("outputs") / "best_multiscale_attn_params.json"  # MS attention HPs from tune_multiscale_attention.py
 
 # Fallback dilation schedules if branch_dilations not found in JSON
-DEFAULT_BRANCH1 = [1, 2, 4]           # fine temporal scale (spike morphology)
-DEFAULT_BRANCH2 = [2, 4, 8]           # medium temporal scale (rhythmic bursts)
-DEFAULT_BRANCH3 = [4, 8, 16]          # coarse temporal scale (seizure envelope)
+# (must match tune_multiscale_tcn.py)
+DEFAULT_BRANCH1 = [1, 2, 4]           # fine:         spike morphology
+DEFAULT_BRANCH2 = [8, 16, 32]         # intermediate: rhythmic bursts
+DEFAULT_BRANCH3 = [32, 64, 128]       # coarse:       seizure evolution
 
 
 # ---------------------------------------------------------------------------

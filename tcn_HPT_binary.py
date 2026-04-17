@@ -192,7 +192,7 @@ if not val_pairs:
 log.info(f"Training corpus: {len(train_pairs)} segments (from balanced manifest)")
 
 # Stratified 10% validation subset for tuning speed.
-val_pairs = downsample_val_stratified(val_pairs, fraction=0.10, seed=42)
+val_pairs = downsample_val_stratified(val_pairs, fraction=0.10, seed=SEED)
 log.info(f"Val subset for tuning: {len(val_pairs)} segments (10% stratified)")
 # -- End corpus preparation ----------------------------------------------------
 

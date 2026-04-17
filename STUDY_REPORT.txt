@@ -560,9 +560,9 @@ building unit.
     operating at a different temporal resolution defined by its
     dilation schedule:
 
-        Branch 1 (fine):   dilations [1, 2, 4]   -- sub-second patterns
-        Branch 2 (medium): dilations [2, 4, 8]   -- 1-2 second patterns
-        Branch 3 (coarse): dilations [4, 8, 16]  -- 2-4 second patterns
+        Branch 1 (fine):         dilations [1,  2,   4]   -- spike morphology
+        Branch 2 (intermediate): dilations [8,  16,  32]  -- rhythmic bursts
+        Branch 3 (coarse):       dilations [32, 64, 128]  -- seizure evolution
 
     Each branch consists of three CausalConvBlocks arranged
     sequentially -- one block per dilation value. For example,
@@ -579,10 +579,33 @@ building unit.
     progressively larger dilation factor. This stacking within each
     branch provides a branch-local receptive field given by:
 
-        RF_branch = 1 + 2 * sum((k - 1) * d for d in dilations)
+        RF_branch = 1 + 2 * (k - 1) * sum(dilations)
 
-    For Branch 1 with k=3: RF = 1 + 2*(2*1 + 2*2 + 2*4) = 29 samples
-    For Branch 3 with k=3: RF = 1 + 2*(2*4 + 2*8 + 2*16) = 113 samples
+    At the maximum tuned kernel size k=7:
+        Branch 1:   RF =  85 samples =  170 ms at 500 Hz
+        Branch 2:   RF = 673 samples = 1.35 s
+        Branch 3:   RF = 2689 samples = 5.38 s (spans full 5-s segment)
+
+    The dilation schedules are selected so the three branches jointly
+    cover the physiological temporal scales of rodent EEG seizures:
+    sub-second spike complexes, ~0.4-1.4 s rhythmic bursts, and
+    full-segment ictal envelopes. The coarse branch's 5.38 s
+    receptive field guarantees that each segment is classified with
+    full temporal context available at fusion.
+
+    All three branches use a geometric doubling progression
+    (d_{i+1} = 2 * d_i). This follows the canonical TCN dilation
+    pattern established by Bai et al. (2018), under which each
+    added block approximately doubles the branch receptive field.
+    The progression is deliberately regular across all three
+    branches: the fine branch begins the series at d=1, and the
+    intermediate and coarse branches continue the same doubling
+    pattern starting from higher offsets (d=8 and d=32). This
+    uniformity is adopted for architectural and reporting clarity
+    rather than as a training-stability claim -- a single, regular
+    doubling rule applied across branches is simpler to describe,
+    reproduce, and compare against other TCN variants in the
+    literature than ad-hoc per-branch schedules would be.
 
     Branch outputs are fused (concatenation with 1x1 projection, or
     element-wise average), globally average-pooled, and classified.
@@ -592,9 +615,9 @@ building unit.
     +----------------+------------------+------------------+
     |                |                  |                  |
     | Branch 1       | Branch 2         | Branch 3         |
-    | Block d=1      | Block d=2        | Block d=4        |
-    | Block d=2      | Block d=4        | Block d=8        |
-    | Block d=4      | Block d=8        | Block d=16       |
+    | Block d=1      | Block d=8        | Block d=32       |
+    | Block d=2      | Block d=16       | Block d=64       |
+    | Block d=4      | Block d=32       | Block d=128      |
     | (3 blocks,     | (3 blocks,       | (3 blocks,       |
     |  6 conv layers)|  6 conv layers)  |  6 conv layers)  |
     |                |                  |                  |
@@ -632,8 +655,8 @@ building unit.
     |
     +--------+-----------+-----------+
     |        |           |           |
-    | Branch 1       Branch 2    Branch 3
-    | d=[1,2,4]      d=[2,4,8]   d=[4,8,16]
+    | Branch 1       Branch 2       Branch 3
+    | d=[1,2,4]      d=[8,16,32]    d=[32,64,128]
     |        |           |           |
     +--------+-----------+-----------+
     |
@@ -996,9 +1019,9 @@ ablation comparisons share identical backbone configurations.
     batch_size          Categorical   {32, 64}
 
     Fixed (not tuned):
-      Branch 1 dilations: [1, 2, 4]     (fine temporal scale)
-      Branch 2 dilations: [2, 4, 8]     (medium temporal scale)
-      Branch 3 dilations: [4, 8, 16]    (coarse temporal scale)
+      Branch 1 dilations: [1,  2,   4]    (fine scale:         spike morphology)
+      Branch 2 dilations: [8,  16,  32]   (intermediate scale: rhythmic bursts)
+      Branch 3 dilations: [32, 64, 128]   (coarse scale:       seizure evolution)
       Blocks per branch:  3
 
     Note: num_layers is absent from the M3 search space because the
