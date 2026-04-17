@@ -12,7 +12,7 @@
 # Dry-run: TCN_HPT_DRY_RUN=1 caps N_TRIALS=2 and N_STARTUP=1 in the Python
 # script. With MAX_EPOCHS=20 and early stopping patience 5, each trial
 # runs ~8-20 epochs. 1-hour walltime is generous for two trials on a GPU.
-#SBATCH -t 04:00:00
+#SBATCH -t 1-00:00:00
 
 # Email notifications at start, end, and failure
 #SBATCH --mail-type=ALL
