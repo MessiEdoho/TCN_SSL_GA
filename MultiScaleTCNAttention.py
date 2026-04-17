@@ -94,7 +94,7 @@ from tcn_utils import (
     set_seed,
     MultiScaleTCNWithAttention,
     make_loader,
-    filter_unpaired_subjects,
+    # filter_unpaired_subjects,  # handled offline by create_balanced_splits.py
     train_one_epoch,
     count_parameters,
     segment_predictions_to_events,
@@ -136,6 +136,9 @@ BACKBONE_PARAMS_PATH = Path("/home/people/22206468/scratch/OUTPUT/MODEL3_OUTPUT/
 ATTN_PARAMS_PATH     = Path("/home/people/22206468/scratch/OUTPUT/MODEL4_OUTPUT") / "best_multiscale_attn_params.json"
 
 # data_splits.json -- single source of truth (matches all other pipeline scripts)
+# Previous (uniform downsampling): data_splits.json
+# SPLITS_PATH = Path("/scratch/22206468/INPUT_DATA/data_splits_outputs/data_splits.json")
+# Current (proximity-aware downsampling): data_splits_nonictal_sampled.json
 SPLITS_PATH = Path("/scratch/22206468/INPUT_DATA/data_splits_outputs/data_splits_nonictal_sampled.json")
 
 # Backbone attribute prefix in MultiScaleTCNWithAttention (confirmed: self.backbone)
@@ -1100,8 +1103,10 @@ def main():
     # -- Corpus preparation ----------------------------------------------------
     # Downsampling and extreme-segment filtering are handled offline by
     # create_balanced_splits.py. The manifest is already clean.
-    # Safety check: filter_unpaired_subjects is a no-op on the clean manifest.
-    train_pairs = filter_unpaired_subjects(train_pairs, logger=logger)
+    # Subject exclusion (m254), 1:4 downsampling, and extreme-segment filtering
+    # are ALL handled offline by create_balanced_splits.py. The manifest is
+    # already clean and balanced -- no further corpus preparation is needed here.
+    # train_pairs = filter_unpaired_subjects(train_pairs, logger=logger)
     logger.info("Training corpus: %d segments (from balanced manifest)", len(train_pairs))
     pos_weight = torch.tensor([1.0], dtype=torch.float32)
     # -- End corpus preparation ------------------------------------------------

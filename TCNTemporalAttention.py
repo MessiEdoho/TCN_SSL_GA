@@ -98,7 +98,7 @@ from tcn_utils import (
     set_seed,                        # fix Python/NumPy/PyTorch seeds for reproducibility
     TCNWithAttention,                # M2 architecture: TCN backbone + two-layer additive attention
     make_loader,                     # build DataLoader (sequential for val, shuffled for train)
-    filter_unpaired_subjects,        # remove subjects with no ictal segments
+    # filter_unpaired_subjects,      # handled offline by create_balanced_splits.py
     train_one_epoch,                 # one epoch: forward + loss + backward + gradient clip + step
     count_parameters,                # sum of requires_grad=True parameter elements
     segment_predictions_to_events,   # post-processing: smooth -> merge -> min-duration filter
@@ -142,6 +142,9 @@ BACKBONE_PARAMS_PATH = Path("/home/people/22206468/scratch/OUTPUT/MODEL1_OUTPUT/
 ATTN_PARAMS_PATH     = Path("/home/people/22206468/scratch/OUTPUT/MODEL2_OUTPUT") / "best_attention_params.json"  # from tune_temporal_attention.py
 
 # data_splits.json -- single source of truth (matches all other pipeline scripts)
+# Previous (uniform downsampling): data_splits.json
+# SPLITS_PATH = Path("/scratch/22206468/INPUT_DATA/data_splits_outputs/data_splits.json")
+# Current (proximity-aware downsampling): data_splits_nonictal_sampled.json
 SPLITS_PATH = Path("/scratch/22206468/INPUT_DATA/data_splits_outputs/data_splits_nonictal_sampled.json")
 
 # Backbone attribute prefix in TCNWithAttention (confirmed: self.tcn)
@@ -1182,8 +1185,10 @@ def main():
     # -- Corpus preparation ----------------------------------------------------
     # Downsampling and extreme-segment filtering are handled offline by
     # create_balanced_splits.py. The manifest is already clean.
-    # Safety check: filter_unpaired_subjects is a no-op on the clean manifest.
-    train_pairs = filter_unpaired_subjects(train_pairs, logger=logger)
+    # Subject exclusion (m254), 1:4 downsampling, and extreme-segment filtering
+    # are ALL handled offline by create_balanced_splits.py. The manifest is
+    # already clean and balanced -- no further corpus preparation is needed here.
+    # train_pairs = filter_unpaired_subjects(train_pairs, logger=logger)
     logger.info("Training corpus: %d segments (from balanced manifest)", len(train_pairs))
     pos_weight = torch.tensor([1.0], dtype=torch.float32)
     # -- End corpus preparation ------------------------------------------------

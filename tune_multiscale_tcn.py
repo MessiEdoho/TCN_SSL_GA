@@ -142,7 +142,7 @@ from optuna.pruners import MedianPruner
 from tcn_utils import (
     set_seed,
     make_loader,
-    filter_unpaired_subjects,
+    # filter_unpaired_subjects,  # handled offline by create_balanced_splits.py
     downsample_val_stratified,
     MultiScaleTCN,
     count_parameters,
@@ -166,6 +166,9 @@ SEGMENT_SEC       = 5.0                                # segment duration in sec
 OUTPUT_DIR        = Path("/home/people/22206468/scratch/OUTPUT/MODEL3_OUTPUT/MultiScaleTCNtuning_outputs")
 LOG_DIR           = OUTPUT_DIR / "logs"
 FIGURE_DIR        = OUTPUT_DIR / "figures"
+# Previous (uniform downsampling): data_splits.json
+# SPLITS_PATH       = Path("/scratch/22206468/INPUT_DATA/data_splits_outputs/data_splits.json")
+# Current (proximity-aware downsampling): data_splits_nonictal_sampled.json
 SPLITS_PATH       = Path("/scratch/22206468/INPUT_DATA/data_splits_outputs/data_splits_nonictal_sampled.json")
 BEST_MS_PATH      = OUTPUT_DIR / "best_multiscale_params.json"
 STUDY_CSV         = OUTPUT_DIR / "multiscale_study_results.csv"
@@ -657,8 +660,10 @@ def main():
     # -- Corpus preparation ----------------------------------------------------
     # Downsampling and extreme-segment filtering are handled offline by
     # create_balanced_splits.py. The manifest is already clean.
-    # Safety check: filter_unpaired_subjects is a no-op on the clean manifest.
-    train_pairs = filter_unpaired_subjects(train_pairs, logger=logger)
+    # Subject exclusion (m254), 1:4 downsampling, and extreme-segment filtering
+    # are ALL handled offline by create_balanced_splits.py. The manifest is
+    # already clean and balanced -- no further corpus preparation is needed here.
+    # train_pairs = filter_unpaired_subjects(train_pairs, logger=logger)
     logger.info("Training corpus: %d segments (from balanced manifest)", len(train_pairs))
 
     # Stratified 10% validation subset for tuning speed.

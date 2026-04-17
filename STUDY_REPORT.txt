@@ -36,7 +36,7 @@ development:
 
     Partition       Subjects    Purpose
     --------------- ----------- -------------------------------------------
-    Training        ~82         Model fitting and hyperparameter tuning
+    Training        72          Model fitting and hyperparameter tuning
     Validation      ~10         Early stopping, threshold optimisation
     Test            ~10         Final held-out evaluation (reserved)
 
@@ -744,17 +744,34 @@ ablation comparisons share identical backbone configurations.
     ARCHITECTURAL HYPERPARAMETERS
     Hyperparameter      Type          Range / Choices     Justification
     ------------------- ------------- ------------------- -------------------
-    num_layers (L)      Integer       [5, 9]              Controls network
+    num_layers (L)      Integer       [6, 9]              Controls network
                                                           depth and receptive
                                                           field. Lower bound
-                                                          5 ensures minimum
-                                                          RF coverage; upper
+                                                          6 chosen because
+                                                          L=5 produces RF
+                                                          < 500 samples at
+                                                          every kernel size
+                                                          (RF_max = 373 at
+                                                          k=7), which is
+                                                          insufficient for
+                                                          1 s of EEG at
+                                                          500 Hz. Upper
                                                           bound 9 prevents
                                                           excessive depth
                                                           that risks gradient
                                                           degradation with
                                                           diminishing returns
                                                           in temporal context.
+                                                          Restricting the
+                                                          range to [6, 9]
+                                                          eliminates all
+                                                          three L=5 configs
+                                                          upfront so that
+                                                          TPE's 10 startup
+                                                          trials are not
+                                                          wasted on
+                                                          architecturally
+                                                          inadequate models.
 
     kernel_size (k)     Categorical   {3, 5, 7}           Determines local
                                                           temporal resolution
@@ -844,9 +861,11 @@ ablation comparisons share identical backbone configurations.
     are rejected before training begins (the trial is pruned
     immediately), avoiding the computational cost of a full
     20-epoch evaluation on an architecturally inadequate model.
-    For example, L = 5 with k = 3 yields RF = 125 samples
-    (0.25 s) and is rejected, whereas L = 6 with k = 7 yields
-    RF = 757 samples (1.51 s) and is accepted.
+    With num_layers restricted to [6, 9], only the single (L=6,
+    k=3) combination produces RF < 500 (RF = 253 samples, 0.51 s);
+    the other 11 of 12 (L, k) combinations pass, giving a 92%
+    acceptance rate at the sampling stage. For example, L = 6
+    with k = 7 yields RF = 757 samples (1.51 s) and is accepted.
 
 7.3 M2: Temporal attention hyperparameter search space
 
@@ -1142,6 +1161,43 @@ References:
     final model training runs. The binary cross-entropy loss pos_weight
     remained at 1.0, with the offline sampling serving as the sole
     imbalance correction mechanism.
+
+    9.3 Final balanced training corpus
+
+    Application of the proximity-aware strategy to the 72 training
+    subjects produced the following corpus:
+
+    Table 5. Final balanced training corpus composition.
+
+    Component                           Count       Proportion
+    ---------------------------------   ---------   -----------
+    Ictal segments (all retained)       65,510      29.7%
+    Non-ictal near-seizure (<=60s)      147,756     67.0%
+    Non-ictal far-sampled (5% of near)  7,388       3.3%
+    Extreme segments removed            1           --
+    ---------------------------------   ---------   -----------
+    Total training segments             220,653     100.0%
+
+    The final ictal-to-non-ictal ratio is 1:2.37 (compared to the
+    original 1:438 raw ratio and the 1:4 uniform-downsampling ratio).
+    The corpus is 33% smaller than the uniform-downsampling approach
+    (220,653 vs 327,550 segments), reducing training time while
+    increasing the concentration of informative hard negatives:
+    near-seizure segments now constitute 95.3% of the non-ictal class,
+    compared to an estimated 5-10% under uniform downsampling.
+
+    Across the 72 training subjects, 2,881 seizure events were
+    annotated (mean 40.0 seizures per subject, range 1-178). This
+    biological heterogeneity is preserved in the balanced manifest:
+    per-subject segment counts scale with seizure burden, ensuring
+    that high-seizure subjects contribute proportionally more
+    near-seizure hard negatives.
+
+    The manifest (data_splits_nonictal_sampled.json) is generated
+    once by create_balanced_splits.py and loaded by all tuning and
+    training scripts. The validation partition (4,298,154 segments)
+    is passed through unchanged; tuning scripts apply a separate
+    stratified 10% subset during per-epoch evaluation.
 
 References:
     Shoeb, A. & Guttag, J. (2010). Application of Machine Learning to

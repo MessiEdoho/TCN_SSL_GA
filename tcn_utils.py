@@ -1376,8 +1376,9 @@ def run_training(model, train_loader, val_loader, lr, weight_decay,
     """Full training loop with early stopping, cosine annealing, and optional Optuna pruning.
 
     pos_weight is fixed at 1.0 because class imbalance is handled by
-    offline stratified downsampling (filter_unpaired_subjects +
-    downsample_non_ictal) before DataLoader construction.
+    offline proximity-aware downsampling in create_balanced_splits.py,
+    which produces a pre-balanced manifest (data_splits_nonictal_sampled.json)
+    loaded before DataLoader construction.
 
     Parameters
     ----------
@@ -1415,8 +1416,8 @@ def run_training(model, train_loader, val_loader, lr, weight_decay,
     >>> f1 = run_training(model, train_ld, val_ld, 1e-3, 1e-4, 100, 10, device,
     ...                   trial=trial, logger=logger)
     """
-    # pos_weight = 1.0: the 1:4 offline downsampling is the sole imbalance
-    # correction. No additional upweighting is applied.
+    # pos_weight = 1.0: class imbalance is handled by create_balanced_splits.py
+    # (proximity-aware downsampling to 1:2.37 ratio). No loss reweighting.
     pw = torch.tensor([1.0], dtype=torch.float32).to(device)
 
     criterion = nn.BCEWithLogitsLoss(pos_weight=pw)
@@ -1460,12 +1461,11 @@ def run_training(model, train_loader, val_loader, lr, weight_decay,
         # For 100-epoch training scripts that use their own loop, this is not called.
         if logger is not None:
             ep = epoch + 1  # 1-indexed for display
-            if True:
-                logger.info(
-                    "  ep %3d/%d | loss=%.4f | f1=%.4f | best=%.4f | pat=%d/%d"
-                    " | train %.0fs | val %.0fs",
-                    ep, max_epochs, train_loss, val_f1,
-                    best_val_f1, epochs_no_improve, patience, train_sec, val_sec)
+            logger.info(
+                "  ep %3d/%d | loss=%.4f | f1=%.4f | best=%.4f | pat=%d/%d"
+                " | train %.0fs | val %.0fs",
+                ep, max_epochs, train_loss, val_f1,
+                best_val_f1, epochs_no_improve, patience, train_sec, val_sec)
 
         # Optuna integration (guarded: only runs if trial is provided)
         if trial is not None:
