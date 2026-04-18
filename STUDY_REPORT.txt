@@ -1116,24 +1116,361 @@ ablation comparisons share identical backbone configurations.
 
 7.6 Final model training protocol
 
-    After hyperparameter optimisation, each model is trained from
-    scratch using the selected hyperparameters with the following
-    protocol:
+    Each of the four ablation models (M1-M4) is trained from scratch
+    on the full training partition after hyperparameter optimisation.
+    The protocol is identical in structure across all four models;
+    differences arise only in (a) the hyperparameters loaded from the
+    corresponding tuning-output JSON and (b) the attention module
+    activation for M2 and M4. A single run produces the weights,
+    operating-threshold, evaluation report, and post-processing
+    configuration required for downstream analysis.
 
-    Parameter               Value       Notes
-    ----------------------- ----------- -----------------------------------
-    Max epochs              100         Full cosine annealing cycle
-    Early stopping patience 10 epochs   Less aggressive than tuning
-    Training mode           Joint       ALL parameters unfrozen (backbone
-                                        + attention trained together)
-    Checkpoint strategy     latest.pt   Overwritten every epoch; contains
-                                        current + best-epoch weights
-    Mixed precision         AMP (FP16)  On CUDA; FP32 fallback on CPU
+7.6.1 Hyperparameter source and protocol consistency
 
-    For M2 and M4, the backbone was frozen only during hyperparameter
-    tuning to isolate attention-specific search. During final training,
-    all parameters (backbone and attention) are trained jointly to
-    allow end-to-end gradient flow.
+    Each model loads its best hyperparameters from the Optuna study
+    conducted in Sections 7.2-7.5:
+
+      M1 (TCN)            : best_params.json
+      M2 (TCN + Attention): best_attention_params.json
+      M3 (MS-TCN)         : best_multiscale_params.json
+      M4 (MS-TCN + Attn)  : best_multiscale_attn_params.json
+
+    The hyperparameters used during training are a strict superset of
+    those tuned: every Optuna-selected value is applied verbatim. No
+    post-hoc hyperparameter manipulation is performed between tuning
+    and training. This ensures that the reported test-set metrics
+    reflect the hyperparameters selected by the validation-F1
+    objective, not a subsequent hand-tuned variant.
+
+    For reproducibility, the training scripts additionally record in
+    their output JSON: the full hyperparameter dictionary, the
+    training seed (42), the PyTorch and CUDA versions, the GPU model,
+    the training wall-clock duration, and the git commit hash (where
+    available) of the source tree at training time.
+
+7.6.2 Optimisation
+
+    Parameter updates use the decoupled-weight-decay variant of Adam
+    (AdamW; Loshchilov & Hutter, 2019):
+
+        theta_{t+1} = theta_t - lr * (m_hat / (sqrt(v_hat) + eps)
+                                      + weight_decay * theta_t)
+
+    Decoupled weight decay is preferred over L2 regularisation
+    embedded in the gradient because the latter interacts with
+    adaptive step sizes in ways that have been shown to degrade
+    generalisation on deep convolutional networks. Both lr and
+    weight_decay are Optuna-selected per-model.
+
+    Learning rate follows a cosine annealing schedule
+    (Loshchilov & Hutter, 2017) over the full 100-epoch budget:
+
+        lr(t) = eta_min + 0.5 * (lr_initial - eta_min) *
+                (1 + cos(pi * t / T_max))
+
+    with T_max = 100 and eta_min = 0.01 * lr_initial. The schedule is
+    stepped once per epoch. When early stopping terminates training
+    before epoch 100, the cosine cycle is necessarily truncated; the
+    best-F1 checkpoint (Section 7.6.6) captures the weights at the
+    peak of the realised trajectory rather than the schedule endpoint.
+
+7.6.3 Loss function and class imbalance treatment
+
+    Training minimises the binary cross-entropy loss with logits
+    (BCEWithLogitsLoss), computed on the raw pre-sigmoid output:
+
+        L = -[ pos_weight * y * log(sigma(z))
+               + (1 - y) * log(1 - sigma(z)) ]
+
+    with pos_weight = 1.0. Class imbalance is addressed exclusively
+    through offline proximity-aware downsampling of the training
+    partition (see Section 5 and create_balanced_splits.py) rather
+    than through loss reweighting. The resulting manifest has a
+    1:2.37 ictal-to-non-ictal ratio, which is balanced enough for
+    standard BCE optimisation without further correction.
+
+    Offline downsampling is preferred over online pos_weight
+    upweighting for two reasons: (i) it keeps the empirical gradient
+    variance well-conditioned, whereas large pos_weight values
+    amplify rare-class gradients disproportionately; (ii) it makes
+    hyperparameter tuning results directly comparable across models,
+    since the loss surface seen by Optuna is identical to the surface
+    seen at final training.
+
+7.6.4 Mixed-precision training
+
+    On CUDA devices, forward passes and backward passes are wrapped
+    in torch.amp.autocast("cuda") with FP16 arithmetic. Gradient
+    scaling is managed by torch.amp.GradScaler, which dynamically
+    adjusts a loss-scale factor to prevent FP16 gradient underflow
+    while preserving the numerics of parameter updates in FP32. The
+    BatchNorm statistics, softmax attention weights, and loss
+    accumulation remain in FP32 internally.
+
+    On the V100 (Volta), A100 (Ampere), and L40S (Ada) GPU nodes
+    available in the HPC allocation, FP16 autocast enables Tensor-
+    Core utilisation for matrix-multiply and convolution primitives,
+    which reduces training wall time at no accuracy cost on models
+    of this scale. On CPU fallbacks the autocast context is inactive
+    and all operations remain FP32, so evaluation numerics are
+    unchanged between cluster runs and any local debugging runs.
+
+7.6.5 Gradient regularisation
+
+    Gradient norms are clipped before each optimiser step using
+    torch.nn.utils.clip_grad_norm_ with max_norm = 1.0 and L2 norm:
+
+        if ||g||_2 > 1.0:  g <- g * (1.0 / ||g||_2)
+
+    The clip is applied after GradScaler unscaling and before the
+    optimiser step to prevent gradient explosion through the deeply
+    stacked dilated convolutions. This safeguard is particularly
+    relevant for M1 at high num_layers (up to 8) and M3/M4 with
+    kernel_size = 7 and dilation = 128 in the coarse branch, where
+    the effective depth along the coarse receptive field reaches
+    6 layers of rescaling.
+
+7.6.6 Early stopping and checkpoint selection
+
+    Early stopping is governed by validation macro F1-score evaluated
+    on the complete validation partition (4,298,154 segments), not
+    on the 1% tuning subset. After each epoch:
+
+        if val_macro_f1[t] > best_val_f1:
+            best_val_f1 = val_macro_f1[t]
+            best_epoch  = t
+            epochs_no_imp = 0
+            save weights to {model}_best_weights.pt
+        else:
+            epochs_no_imp += 1
+            if epochs_no_imp >= 10:
+                break
+
+    The patience of 10 epochs is intentionally less aggressive than
+    the patience of 5 used during tuning: during tuning the objective
+    was fast comparative ranking, whereas during final training the
+    goal is to give the cosine schedule sufficient time to anneal
+    through any intermediate plateaux in the loss landscape.
+
+    Two checkpoints are maintained:
+      - {model}_best_weights.pt: weights at the epoch of highest
+        validation macro F1. These weights are used for all reported
+        test-set evaluations (Section 9).
+      - {model}_latest_weights.pt: weights at the most recently
+        completed epoch, overwritten each epoch, used for crash
+        recovery and warm resume (not for reporting).
+
+    All reported metrics in Section 9 are derived from the
+    best-F1 weights, not the latest weights.
+
+7.6.7 Joint training for attention models (M2, M4)
+
+    During hyperparameter tuning of M2 and M4 (Sections 7.3, 7.5),
+    the backbone was frozen to isolate attention-specific search and
+    avoid confounding ablation results by re-tuning backbone weights
+    under a different loss landscape. For final training, the entire
+    parameter set - both backbone and attention heads - is unfrozen
+    and updated jointly. This permits the attention module and
+    backbone to co-adapt end-to-end, which is consistent with the
+    standard training regimen of attention-augmented CNNs in the
+    action-recognition and medical-imaging literature.
+
+    The decision to freeze only during tuning, not during final
+    training, is motivated by the search-efficiency / model-capacity
+    trade-off: frozen tuning reduces the search space to five
+    attention-specific hyperparameters (more efficient with a finite
+    50-trial budget), while joint training at convergence unlocks
+    the full representational capacity of the attention-augmented
+    model at test time.
+
+7.6.8 Deterministic reproducibility
+
+    Before each training run, reproducibility is enforced by:
+
+        random.seed(42)
+        numpy.random.seed(42)
+        torch.manual_seed(42)
+        torch.cuda.manual_seed_all(42)
+
+    DataLoader workers inherit worker-specific derived seeds through
+    the PyTorch worker_init_fn pattern. For the cuDNN backend,
+    benchmark mode is disabled and deterministic algorithms are
+    enabled where supported (torch.backends.cudnn.deterministic = True,
+    torch.backends.cudnn.benchmark = False). Non-deterministic atomic
+    operations in certain cuDNN primitives (e.g., dilated convolutions
+    with reverse-pass scatter operations) may introduce negligible
+    run-to-run variability at the 1e-6 level in gradients; this has
+    no measurable effect on validation F1 at the precision reported
+    in Section 9.
+
+7.6.9 Post-processing of predictions
+
+    Raw per-segment sigmoid probabilities are transformed into
+    event-level detections through three sequential stages applied
+    identically to all four model variants with fixed parameter
+    values. Only the decision threshold may differ between models
+    (Section 7.6.10); the smoothing window, refractory period, and
+    minimum duration are held constant across all comparisons, so
+    inter-model differences reported in Section 9 reflect model
+    architecture rather than post-processing tuning.
+
+    Stage 1 -- Probability smoothing
+    --------------------------------
+    A uniform moving-average kernel of width SMOOTHING_WIN = 3
+    segments is convolved with the raw sigmoid probability stream
+    BEFORE thresholding:
+
+        smoothed_probs = (1/3) * (p[t-1] + p[t] + p[t+1])
+        smoothed_preds = 1 if smoothed_probs >= tau else 0
+
+    The convolution uses mode="same" to preserve segment-to-segment
+    1:1 alignment. Smoothing suppresses isolated single-segment
+    probability spikes caused by transient artefacts (movement,
+    electrode noise), which produce a localised peak that is
+    averaged down by the low-probability neighbouring segments. A
+    W = 3 window was selected as the smallest odd-length kernel
+    that performs meaningful averaging while minimising temporal
+    smearing of genuine short-duration seizures.
+
+    Boundary uncertainty introduced by the smoothing stage is
+    bounded by floor(W/2) * step_sec = 1 * 2.5 s = +/- 2.5 s for
+    event onset and offset timing. This is clinically acceptable
+    for seizure detection, where onset-time resolution to the
+    nearest few seconds is sufficient for downstream clinical
+    interpretation.
+
+    Stage 2 -- Refractory-period merging
+    ------------------------------------
+    Pairs of detected event runs separated by gaps shorter than
+    REFRACTORY_SEC = 30.0 seconds are merged into a single event.
+    This corrects for transient probability dips during a single
+    underlying seizure (for example, a brief period of attenuated
+    ictal amplitude mid-event) that would otherwise be counted as
+    two distinct alarms. The 30-second threshold is consistent
+    with standard practice in automated seizure-detection
+    pipelines (Shoeb & Guttag, 2010).
+
+    Stage 3 -- Minimum duration filter
+    ----------------------------------
+    Events shorter than MIN_EVENT_SEC = 10.0 seconds after merging
+    are discarded. This threshold is motivated by the clinical
+    definition of a seizure, which typically requires sustained
+    ictal activity of at least several seconds; runs shorter than
+    10 s are overwhelmingly isolated false positives attributable
+    to transient noise, movement artefact, or brief sub-threshold
+    discharges.
+
+    Parameter summary
+    -----------------
+    Parameter              Value       Rationale
+    --------------------- ----------- -----------------------------
+    SMOOTHING_WIN          3 segments  Suppress isolated artefact spikes
+    REFRACTORY_SEC         30.0 s      Merge fragmented single-seizure runs
+    MIN_EVENT_SEC          10.0 s      Discard sub-clinical events
+
+    The three-stage pipeline converts segment-level predictions
+    (of which there can be many per minute due to 50% segment
+    overlap) into a clinician-facing alarm stream in which a single
+    alarm corresponds to a single contiguous detected event of
+    clinically plausible duration. This event-level view is the
+    quantity actually experienced by a monitoring clinician and is
+    the basis for the event-level false-alarm-rate metric reported
+    alongside segment-level metrics in Section 9.
+
+7.6.10 Operating-point selection (Youden's J)
+
+    Following training, three operating thresholds are evaluated
+    on the validation partition:
+
+        Threshold 0.5 (raw, no post-processing)
+        Threshold 0.5 (with post-processing from Section 7.6.9)
+        Optimal threshold (with post-processing)
+
+    The optimal threshold is selected to maximise Youden's J
+    statistic (Youden, 1950):
+
+        J(tau) = sensitivity(tau) + specificity(tau) - 1
+               = TPR(tau) - FPR(tau)
+
+    Youden's J is chosen as the selection criterion for three reasons:
+    (i) it is threshold-independent in its formulation but yields a
+    single-valued optimum; (ii) it weights sensitivity and specificity
+    equally, which is appropriate for seizure detection where both
+    missed seizures (clinical harm) and false alarms (clinician
+    fatigue) are costly; (iii) it is invariant to prevalence, so the
+    selected threshold generalises from the validation partition to
+    the held-out test partition despite their differing ictal ratios.
+
+    The selected threshold tau* and the underlying ROC traversal are
+    saved to {model}_optimal_threshold.json and re-used verbatim at
+    test time; no threshold re-selection occurs on the test set.
+
+7.6.11 Three-tier evaluation reporting
+
+    For each of the four models, Section 9 reports three rows of
+    metrics corresponding to the progressive application of the
+    decision rule:
+
+        Row 1: raw per-segment predictions at tau = 0.5
+               (isolates pure model output)
+        Row 2: post-processed predictions at tau = 0.5
+               (isolates post-processing contribution)
+        Row 3: post-processed predictions at tau = tau*
+               (final operating configuration)
+
+    This three-tier reporting allows reviewers to attribute observed
+    improvements to (a) the model architecture itself, (b) the
+    morphological post-processing, or (c) the calibrated operating
+    threshold, rather than conflating all three. Row 3 is the
+    configuration used for all inter-model comparisons in the
+    ablation analysis.
+
+7.6.12 Compute budget and wall-clock cost
+
+    Empirically observed on the HPC cluster (V100-PCIE-16GB and
+    NVIDIA L40S partitions):
+
+      Tuning (50 trials x ~10 epochs at 1% val subset):
+        M1: ~2.5 days on L40S (~8.1 min/epoch sustained)
+        M3: ~3.0 days on V100 (~10-12 min/epoch sustained)
+        M2/M4 attention-only tuning: ~1.0 day each
+
+      Final training (100 epochs, full val partition):
+        M1-M4: ~12-18 hours per model, dominated by full-val
+        evaluation at each epoch (4.3M segments)
+
+      Total end-to-end pipeline (all four models):
+        ~8-10 GPU-days on a single mid-range GPU. The pipeline is
+        embarrassingly parallel across models; with four concurrent
+        GPU allocations the elapsed wall time is ~2 days.
+
+    All scripts implement Optuna SQLite-backed study resumption so
+    that interrupted runs can restart without loss of completed
+    trials. Training scripts implement latest-weight checkpointing
+    (Section 7.6.6) for recovery from node failure.
+
+    Table 4. Summary of the final training protocol.
+
+    Parameter                Value
+    ------------------------ --------------------------------------------
+    Max epochs               100
+    Early stopping patience  10 epochs (val macro F1)
+    Optimiser                AdamW
+    Weight decay             Decoupled (Optuna-selected per model)
+    LR schedule              CosineAnnealingLR (eta_min = lr * 0.01)
+    Loss                     BCEWithLogitsLoss (pos_weight = 1.0)
+    Class balance mechanism  Offline proximity-aware downsampling
+    Gradient clipping        max_norm = 1.0 (L2)
+    Mixed precision          AMP FP16 (CUDA) / FP32 (CPU)
+    Training mode (M2, M4)   Joint (backbone + attention unfrozen)
+    Checkpoint selection     Best validation macro F1
+    Seed                     42 (all RNG streams)
+    cuDNN determinism        deterministic = True, benchmark = False
+    Post-processing          3-stage: smoothing (W=3) -> merging
+                             (30 s refractory) -> min duration (10 s)
+    Threshold selection      Youden's J on validation ROC
+    Evaluation rows          3 (raw / post-processed / optimal threshold)
+    Test-set access          Reserved for final_evaluation.py only
 
 References:
     Akiba, T., Sano, S., Yanase, T., Ohta, T., & Koyama, M. (2019).
@@ -1142,9 +1479,17 @@ References:
         Knowledge Discovery and Data Mining, 2623-2631.
     Bergstra, J. & Bengio, Y. (2012). Random Search for Hyper-Parameter
         Optimization. JMLR, 13, 281-305.
+    Loshchilov, I. & Hutter, F. (2017). SGDR: Stochastic Gradient Descent
+        with Warm Restarts. Proceedings of the 5th International
+        Conference on Learning Representations (ICLR).
     Loshchilov, I. & Hutter, F. (2019). Decoupled Weight Decay
         Regularization. Proceedings of the 7th International Conference
         on Learning Representations (ICLR).
+    Youden, W. J. (1950). Index for rating diagnostic tests. Cancer,
+        3(1), 32-35.
+    Shoeb, A. & Guttag, J. (2010). Application of Machine Learning to
+        Epileptic Seizure Detection. Proceedings of the 27th
+        International Conference on Machine Learning (ICML).
 
 --------------------------------------------------------------------------------
 8. DATASET STATISTICS
