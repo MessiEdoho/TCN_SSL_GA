@@ -7,7 +7,7 @@
 
 #SBATCH --partition=csgpu
 
-#SBATCH --exclude=sonicgpu20
+##SBATCH --exclude=sonicgpu20
 # Request 1 gpus
 #SBATCH --gres=gpu:1
 
