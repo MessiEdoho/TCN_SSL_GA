@@ -9,7 +9,7 @@
 
 #SBATCH --exclude=sonicgpu20
 # Request 1 gpus
-#SBATCH --gres=gpu:L40S:1
+#SBATCH --gres=gpu:1
 
 
 # 60 Optuna trials x up to 100 epochs each (early stopping typically fires ~30-50).
