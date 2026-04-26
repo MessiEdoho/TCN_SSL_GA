@@ -173,16 +173,32 @@ building unit.
     representational capacity.
 
     Each convolution is followed by layer normalisation applied across
-    the channel dimension, Gaussian Error Linear Unit (GELU) activation,
-    and spatial dropout (Dropout1d). Layer normalisation is employed in
-    place of batch normalisation to mitigate the effects of inter-subject
-    variability in EEG amplitude and the instability of batch statistics
-    under relatively small batch sizes (16-64). Spatial dropout is used
-    instead of element-wise dropout to provide structured, channel-wise
-    regularisation that better reflects the correlated nature of EEG
-    feature maps, while GELU activation is adopted to facilitate smoother
-    gradient propagation and improved modelling of continuous biosignal
-    dynamics. A 1x1 pointwise convolution is used to form the residual
+    the feature-map channel dimension, Gaussian Error Linear Unit (GELU)
+    activation, and spatial dropout (Dropout1d). Layer normalisation is
+    employed in place of batch normalisation to mitigate the effects of
+    inter-subject variability in EEG amplitude and the instability of
+    batch statistics under relatively small batch sizes (16-64). Spatial
+    dropout (nn.Dropout1d) is used instead of element-wise dropout
+    (nn.Dropout) to provide structured regularisation appropriate for
+    convolutional feature maps. For a tensor of shape
+    (batch, num_filters, time), spatial dropout zeros entire
+    feature-map channels across the full time dimension, whereas
+    element-wise dropout zeros individual (feature-map, time-step)
+    cells independently. Because adjacent time steps within a single
+    convolutional feature map are highly correlated (they share
+    overlapping receptive fields through the same filter), element-
+    wise dropout on a single cell is trivially recovered from its
+    temporal neighbours and produces weak regularisation. Spatial
+    dropout removes an entire feature map for a given forward pass,
+    forcing representational redundancy across the num_filters
+    channels (Tompson et al., 2015). Note that "channel" in this
+    context refers to a learned convolutional feature map, NOT to an
+    EEG recording electrode: the input EEG is single-channel (one
+    electrode per recording), so the input tensor has shape
+    (batch, 1, time); the num_filters dimension is introduced after
+    the first convolution. GELU activation is adopted to facilitate
+    smoother gradient propagation and improved modelling of
+    continuous biosignal dynamics. A 1x1 pointwise convolution is used to form the residual
     skip connection when required for dimensionality matching. Causal
     padding with right-side trimming is applied throughout to preserve
     temporal causality and prevent leakage of future information during
@@ -202,7 +218,7 @@ building unit.
     |       |                                                       |
     |       +--[ GELU ]                                             |
     |       |                                                       |
-    |       +--[ Dropout1d (spatial, channel-wise) ]                |
+    |       +--[ Dropout1d (spatial, feature-map-channel-wise) ]    |
     |                                                               |
     +--[ Conv1d(F_out, F_out, k, dilation=d, causal padding) ]     |
     |       |                                                       |
@@ -688,10 +704,14 @@ building unit.
         M4 vs M2        Attention design    Multi-scale branches
         M4 vs M1        --                  Combined contribution
 
-Reference:
+References:
     Bai, S., Kolter, J. Z., & Koltun, V. (2018). An Empirical
         Evaluation of Generic Convolutional and Recurrent Networks for
         Sequence Modeling. arXiv preprint arXiv:1803.01271.
+    Tompson, J., Goroshin, R., Jain, A., LeCun, Y., & Bregler, C.
+        (2015). Efficient Object Localization Using Convolutional
+        Networks. Proceedings of the IEEE Conference on Computer
+        Vision and Pattern Recognition (CVPR), 648-656.
 
 --------------------------------------------------------------------------------
 7. HYPERPARAMETER OPTIMISATION
@@ -1921,17 +1941,26 @@ A.7 Dropout and regularisation
     not rely on any single neuron, improving generalisation.
 
     SPATIAL DROPOUT (Dropout1d): instead of dropping individual
-    values, entire feature channels are dropped. For EEG data,
-    where adjacent time steps within a channel are highly
-    correlated, spatial dropout is more effective than element-wise
-    dropout because it prevents the network from simply recovering
-    a dropped value from its temporal neighbours.
+    values, entire convolutional feature-map channels are dropped
+    across the full time dimension. Because adjacent time steps
+    within a single feature map share overlapping receptive fields
+    (and are therefore highly correlated), element-wise dropout on
+    a single cell is easily recovered from its temporal neighbours;
+    spatial dropout avoids this by removing the entire feature map,
+    forcing the remaining feature maps to carry the signal.
+
+    Terminology note: "channel" here means a learned convolutional
+    feature map, not an EEG recording electrode. The recordings in
+    this study are single-electrode, so the input tensor has shape
+    (batch, 1, time) and the num_filters feature-map dimension is
+    introduced only after the first convolution. Dropping a feature
+    map does not drop a physical electrode.
 
     The dropout rate (e.g., 0.30) specifies the probability that
-    each channel is dropped: at 0.30, roughly 30% of channels are
-    zeroed out in each training batch. Dropout is disabled during
-    evaluation (model.eval()), so all channels contribute to the
-    final prediction.
+    each feature map is dropped: at 0.30, roughly 30% of the
+    num_filters feature maps are zeroed out in each training batch.
+    Dropout is disabled during evaluation (model.eval()), so all
+    feature maps contribute to the final prediction.
 
 A.8 Early stopping and patience
 

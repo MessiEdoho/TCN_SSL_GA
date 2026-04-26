@@ -133,14 +133,19 @@ FS                = 500                                # EEG sampling rate (Hz)
 SEGMENT_LEN       = 2500                               # samples per segment (5 s at 500 Hz)
 SEGMENT_SEC       = 5.0                                # segment duration in seconds
 
-OUTPUT_DIR        = Path("outputs")
+OUTPUT_DIR        = Path("/home/people/22206468/scratch/OUTPUT/MODEL4_OUTPUT")
 LOG_DIR           = OUTPUT_DIR / "logs"
 FIGURE_DIR        = OUTPUT_DIR / "figures"
 # Previous (uniform downsampling): data_splits.json
 # SPLITS_PATH       = Path("/scratch/22206468/INPUT_DATA/data_splits_outputs/data_splits.json")
 # Current (proximity-aware downsampling): data_splits_nonictal_sampled.json
 SPLITS_PATH       = Path("/scratch/22206468/INPUT_DATA/data_splits_outputs/data_splits_nonictal_sampled.json")
-BEST_MS_PATH      = OUTPUT_DIR / "best_multiscale_params.json"
+# Read-only input from the upstream M3 stage. best_multiscale_params.json is
+# produced by tune_multiscale_tcn.py and lives in the M3 output directory --
+# NOT in this M4 directory. Pointing inside OUTPUT_DIR (MODEL4_OUTPUT) here
+# would look for a file the M3 stage never writes there.
+BEST_MS_PATH      = Path("/home/people/22206468/scratch/OUTPUT/MODEL3_OUTPUT/MultiScaleTCNtuning_outputs/best_multiscale_params.json")
+# Write-only output for this M4 stage. Lives in MODEL4_OUTPUT.
 BEST_ATTN_PATH    = OUTPUT_DIR / "best_multiscale_attn_params.json"
 STUDY_CSV         = OUTPUT_DIR / "multiscale_attn_study_results.csv"
 SUMMARY_PATH      = OUTPUT_DIR / "multiscale_attn_tuning_summary.json"

@@ -151,11 +151,16 @@ if DRY_RUN:
 OUTPUT_DIR      = Path("/home/people/22206468/scratch/OUTPUT/MODEL2_OUTPUT")                      # all pipeline outputs
 LOG_DIR         = OUTPUT_DIR / "logs"                   # log file directory
 FIGURE_DIR      = OUTPUT_DIR / "figures"                # figure output directory
-BEST_TCN_PATH   = Path("/home/people/22206468/scratch/OUTPUT/MODEL1_OUTPUT/TCNtuning_outputs/best_params.json")  # fixed TCN backbone hyperparameters
+# Read-only input from the upstream M1 stage. best_params.json is produced by
+# tcn_HPT_binary.py and lives in the M1 output directory -- NOT in this M2
+# directory. Pointing inside OUTPUT_DIR (MODEL2_OUTPUT) here would look for a
+# file the M1 stage never writes there.
+BEST_TCN_PATH   = Path("/home/people/22206468/scratch/OUTPUT/MODEL1_OUTPUT/TCNtuning_outputs/best_params.json")
 # Previous (uniform downsampling): data_splits.json
 # SPLITS_PATH     = Path("/scratch/22206468/INPUT_DATA/data_splits_outputs/data_splits.json")
 # Current (proximity-aware downsampling): data_splits_nonictal_sampled.json
 SPLITS_PATH     = Path("/scratch/22206468/INPUT_DATA/data_splits_outputs/data_splits_nonictal_sampled.json")
+# Write-only output for this M2 stage. Lives in MODEL2_OUTPUT.
 BEST_ATTN_PATH  = OUTPUT_DIR / "best_attention_params.json"
 STUDY_CSV       = OUTPUT_DIR / "attention_study_results.csv"
 SUMMARY_PATH    = OUTPUT_DIR / "attention_tuning_summary.json"
