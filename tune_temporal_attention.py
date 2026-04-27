@@ -33,10 +33,18 @@ Falkner, S., Klein, A., & Hutter, F. (2018). BOHB: Robust and Efficient
     Hyperparameter Optimization at Scale. ICML 2018.
 Mattson, P. et al. (2020). MLPerf Training Benchmark. MLSys 2020.
 
-The TCN backbone is frozen. Only temporal attention
-parameters (TemporalAttention scorer, LayerNorm, and
-classification head) receive gradient updates during
-each trial.
+The TCN backbone hyperparameters (architecture, not weights)
+are inherited from M1's tuning study (best_params.json) and
+held fixed during this search. The backbone is instantiated
+with these inherited hyperparameters and made non-trainable
+for the duration of tuning. Only the temporal attention module
+and classification head receive gradient updates during each
+trial. Holding the backbone non-trainable during tuning is a
+search-efficiency choice, not an ablation device; the M1 vs M2
+ablation comparison itself is performed at the final-training
+stage (TCNTemporalAttention.py), where both models are trained
+from scratch under an identical protocol -- see STUDY_REPORT.txt
+Sections 7.3 and 7.6.7.
 
 This script produces tuning outputs only.
 It does NOT train a final model.

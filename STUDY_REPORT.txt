@@ -838,6 +838,119 @@ ablation comparisons share identical backbone configurations.
           analysis: a systematic review. Journal of Neural Engineering,
           16(5), 051001.
 
+7.1.2 Protocol parameter justifications
+
+    Three numerical choices in the common tuning protocol -- trial
+    budget (N = 50), pruner activation threshold (10 startup trials),
+    and trial-level early-stopping patience (5 epochs) -- merit
+    explicit justification because they jointly determine search
+    coverage, compute cost, and statistical reliability.
+
+    Trial budget (N = 50)
+    ---------------------
+    Two considerations bound this choice. From below, TPE-based
+    optimisation requires at least a few tens of completed trials
+    before the surrogate model develops a reliable preference
+    distribution over good and poor configurations; empirical
+    studies on similar-dimensional hyperparameter spaces report
+    diminishing returns beyond approximately 30-40 trials
+    (Bergstra & Bengio, 2012; Akiba et al., 2019). From above, the
+    available compute budget on a shared HPC partition (13-day
+    per-job walltime, mid-range GPUs) places a hard ceiling on the
+    number of trials that can complete within a single job
+    submission. At an empirical per-trial wall time of approximately
+    five hours on the L40S partition, 50 trials consume about ten
+    days of compute, which fits inside the walltime with a margin
+    sufficient for occasional pruner-induced acceleration. Choosing
+    fewer than 50 trials would leave the TPE sampler too close to
+    its random-search startup regime; choosing more would inflate
+    cost without commensurate F1 improvement.
+
+    Pruner activation threshold (n_startup_trials = 10)
+    ---------------------------------------------------
+    The MedianPruner classifies a trial as underperforming when its
+    intermediate validation F1 at a given epoch falls below the
+    median of all previously completed trials at the same epoch.
+    Reliable median estimation requires a non-trivial sample of
+    completed trials; with fewer than approximately ten observations,
+    the median is heavily influenced by early-trial outliers and
+    pruning decisions become unreliable. Setting the activation
+    threshold to ten matches the random-startup phase of the TPE
+    sampler exactly, so the pruner becomes active precisely when
+    the sampler begins to exploit promising regions. This avoids
+    two failure modes: pruning during random exploration, which
+    would discard informative observations from the search space;
+    and delayed activation, which would waste compute on weak
+    configurations that could have been terminated earlier. The
+    n_warmup_steps = 3 setting further protects against pruning at
+    epoch 1-2, when validation F1 has not yet stabilised
+    (Akiba et al., 2019).
+
+    Early-stopping patience (5 epochs within a 20-epoch budget)
+    -----------------------------------------------------------
+    Each trial trains for at most twenty epochs but terminates if
+    the validation macro F1 fails to improve for five consecutive
+    epochs. The patience value of five represents a quarter of the
+    epoch budget and is large enough to traverse the short
+    intermediate plateaux that arise during cosine-annealed training,
+    yet small enough to release compute promptly when a trial has
+    genuinely converged or is unable to make further progress.
+    Larger patience values (e.g. 10) would extend each trial's
+    average runtime substantially without producing meaningfully
+    better final F1 estimates, while smaller values (e.g. 3) risk
+    truncating trials before the cosine schedule has annealed the
+    learning rate sufficiently to reach the trial's true peak
+    performance. In the observed M3 study (Section 7.4.1), the
+    chosen patience permitted full-budget completion for trials
+    that genuinely improved across the schedule and prompt
+    termination for the rest, yielding a 48 percent prune rate
+    after the activation threshold.
+
+    Table 2A. Summary of protocol parameter justifications. Each
+    numerical choice is bounded from below by a statistical /
+    search-efficiency constraint and from above by a compute-cost
+    or operational constraint. The right-hand column gives the
+    primary supporting reference; complete arguments are in the
+    paragraphs above.
+
+    +-----------------------+--------+----------------------------+----------------------------+----------------------------+
+    | Parameter             | Value  | Lower-bound constraint     | Upper-bound constraint     | Primary reference          |
+    +-----------------------+--------+----------------------------+----------------------------+----------------------------+
+    | Trial budget (N)      |  50    | TPE convergence requires   | 13-day walltime / 5 hr     | Bergstra & Bengio (2012);  |
+    |                       |        | ~30-40 trials before       | per-trial gives ~50-60     | Akiba et al. (2019)        |
+    |                       |        | exploitation overtakes     | trials max per submission  |                            |
+    |                       |        | random sampling            |                            |                            |
+    +-----------------------+--------+----------------------------+----------------------------+----------------------------+
+    | Pruner activation     |  10    | Median estimator requires  | Aligning with TPE startup  | Akiba et al. (2019)        |
+    | threshold             |        | ~10 observations for       | avoids pruning during      |                            |
+    | (n_startup_trials)    |        | outlier-robust per-epoch   | random exploration phase   |                            |
+    |                       |        | F1 baseline                |                            |                            |
+    +-----------------------+--------+----------------------------+----------------------------+----------------------------+
+    | Pruner warm-up steps  |   3    | Validation F1 unstable     | Past epoch 3, intermediate | Akiba et al. (2019)        |
+    | (n_warmup_steps)      |        | during epochs 1-2 of       | F1 reflects model quality  |                            |
+    |                       |        | cosine-annealed training   | rather than initialisation |                            |
+    +-----------------------+--------+----------------------------+----------------------------+----------------------------+
+    | Early-stopping        |   5    | Sufficient to traverse     | Larger patience inflates   | Falkner et al. (2018);     |
+    | patience              | epochs | local plateaux of cosine-  | per-trial cost without     | Li et al. (2017)           |
+    | (ES_PATIENCE)         |        | annealed schedules         | improving final F1         |                            |
+    +-----------------------+--------+----------------------------+----------------------------+----------------------------+
+    | Max epochs per trial  |  20    | Sufficient for cosine      | Within tuning compute      | Li et al. (2017)           |
+    | (MAX_EPOCHS)          |        | schedule to differentiate  | budget; final training     |                            |
+    |                       |        | strong from weak configs   | uses 100-epoch budget      |                            |
+    +-----------------------+--------+----------------------------+----------------------------+----------------------------+
+    | Validation subset     |   1%   | 116 ictal positives give   | Reduces per-epoch eval     | See Section 7.1.1          |
+    | fraction              |        | SE on recall ~2.8% --      | cost from 134K to 1.3K     |                            |
+    |                       |        | adequate for trial ranking | batches at bs=32           |                            |
+    +-----------------------+--------+----------------------------+----------------------------+----------------------------+
+
+    The first three rows specify pruner behaviour (Optuna
+    MedianPruner); rows four and five specify trial-level training
+    behaviour; row six controls validation cost. Each value was
+    selected before tuning began and held constant across all four
+    models (M1-M4) to ensure that ablation comparisons isolate
+    architectural contributions rather than tuning-protocol
+    differences.
+
 7.2 M1: TCN hyperparameter search space
 
     All seven hyperparameters are tuned from scratch with no
@@ -977,31 +1090,41 @@ ablation comparisons share identical backbone configurations.
 
 7.3 M2: Temporal attention hyperparameter search space
 
-    The TCN backbone is instantiated from M1's best hyperparameters
-    (best_params.json) and its weights are frozen during attention
-    tuning. Only the temporal attention module and classification
-    head receive gradient updates.
+    The TCN backbone hyperparameters are inherited from M1's tuning
+    study (best_params.json) -- specifically num_layers, num_filters,
+    kernel_size, and dropout -- and held fixed during M2's attention
+    hyperparameter search. The backbone is instantiated with these
+    inherited hyperparameters and its parameters are made
+    non-trainable for the duration of tuning. Only the temporal
+    attention module and classification head receive gradient updates
+    during each trial.
 
-    Backbone freezing serves three purposes. (Ablation integrity)First, it preserves
-    the controlled ablation design: because M1 and M2 share an
-    identical, independently optimised backbone, any performance
-    difference between them can be attributed solely to the
-    temporal attention mechanism rather than to confounded changes
-    in backbone configuration. If backbone parameters were
-    co-tuned with attention hyperparameters, the search would
-    conflate backbone adaptation with attention contribution,
-    undermining the ablation. Second (search efficiency), freezing reduces the number
-    of trainable parameters from the full model (~80K-200K) to
-    the attention module alone (~4K-10K), which substantially
-    narrows the effective search space and allows the 50-trial
+    Holding the backbone non-trainable during attention tuning is a
+    search-efficiency choice, not an ablation device. It reduces the
+    trainable parameter count from the full model (~80K-200K) to the
+    attention module alone (~4K-10K), allowing the 50-trial Optuna
     budget to converge more efficiently on attention-specific
-    hyperparameters. Third (backbone stability), freezing eliminates the risk of
-    catastrophic drift in backbone representations during
-    attention tuning: without frozen weights, large attention
-    learning rates could destabilise the pre-optimised feature
-    extractor. Note that freezing applies only during this
-    hyperparameter search; during final model training (Section
-    7.6), all parameters are unfrozen and trained jointly.
+    hyperparameters, and it eliminates the risk that aggressive
+    attention learning rates destabilise the convolutional feature
+    extractor during a search where backbone state is irrelevant to
+    the question being answered.
+
+    The M1 vs M2 ablation comparison itself takes place at the
+    final-training stage (Section 7.6), not at the tuning stage.
+    Both models are trained from scratch using their respective
+    tuned hyperparameters under an identical training protocol
+    (same random seed, optimiser, learning-rate schedule, gradient
+    clipping, mixed precision, and epoch budget). Because M2
+    inherits its TCN backbone hyperparameters from M1, the only
+    architectural difference between the two final models at
+    evaluation time is the temporal attention module replacing
+    global average pooling. Backbone weights, optimised
+    independently for each model under the shared protocol, are
+    not weight-shared between M1 and M2 -- this matches the
+    standard convention for architectural ablations in the deep
+    learning literature, where architectures are compared after
+    independent end-to-end training rather than through frozen
+    feature-extractor transfer.
 
     Table 4. M2 (TCN + Temporal Attention) hyperparameter search space.
 
@@ -1114,13 +1237,124 @@ ablation comparisons share identical backbone configurations.
     from the three parallel branches rather than from depth. Each
     branch has exactly three CausalConvBlocks with fixed dilations.
 
+7.4.1 M3 tuning results
+
+    The M3 study completed in approximately eight days of wall
+    time on a shared NVIDIA L40S partition, beginning on
+    2026-04-18 and concluding on 2026-04-26. Of the fifty trials
+    requested, twenty-six ran to either early-stopping or budget
+    exhaustion, while twenty-four were terminated mid-run by the
+    MedianPruner once their per-epoch F1 trajectories fell below
+    the running median (a 48 percent prune rate). One additional
+    rejection at the receptive-field constraint check was excluded
+    from both counts. The overall TPE search returned a single
+    best trial (Trial 16) with a stratified validation macro
+    F1-score of 0.7835.
+
+    Best hyperparameter configuration (Trial 16)
+    --------------------------------------------
+    Hyperparameter        Value
+    --------------------- -----------------------------------
+    num_filters           64
+    kernel_size           7
+    dropout               0.10
+    fusion strategy       concat (with 1x1 projection)
+    learning_rate         2.90 x 10^{-4}
+    weight_decay          5.04 x 10^{-5}
+    batch_size            32
+    Trainable parameters  447,617
+
+    The selected configuration combines a moderate channel width
+    (64 filters per branch) with the largest available kernel
+    size (k = 7), which together produce a per-branch receptive
+    field of 85, 673, and 2689 samples for the fine, intermediate,
+    and coarse branches respectively. The coarse-branch receptive
+    field of 5.38 seconds matches the input segment length,
+    confirming that the selected configuration covers the full
+    temporal context at each prediction. The optimisation
+    hyperparameters (learning_rate near 3 x 10^{-4}, weight_decay
+    on the order of 5 x 10^{-5}) lie in the centre of the
+    log-uniform search ranges, indicating that neither bound was
+    saturated.
+
+    Reproducibility of the optimum
+    ------------------------------
+    The TPE sampler converged on the (num_filters = 64,
+    kernel_size = 7, fusion = concat, dropout in [0.10, 0.15])
+    region during the second half of the search and produced
+    nine trials in this neighbourhood with validation F1 values
+    of 0.7720, 0.7736, 0.7743, 0.7759, 0.7771, 0.7787, 0.7793,
+    0.7797, and 0.7835. The empirical spread of 0.012 F1 units
+    across these nine trials is substantially smaller than the
+    estimated standard error of the F1 statistic on the 116-positive
+    validation subset (approximately 0.020 F1 units), establishing
+    that the chosen optimum is reproducible up to validation noise
+    and is not the artefact of a single fortuitous trial.
+
+    Hyperparameter importance (fANOVA)
+    ----------------------------------
+    Optuna's fANOVA-based importance analysis (Hutter et al., 2014;
+    Akiba et al., 2019) attributes the variance in validation F1
+    across the search space to individual hyperparameters as
+    follows.
+
+    Hyperparameter        Relative importance
+    --------------------- -------------------
+    learning_rate         0.349
+    num_filters           0.303
+    weight_decay          0.187
+    kernel_size           0.098
+    batch_size            0.040
+    fusion                0.022
+    dropout               0.002
+
+    The optimisation hyperparameters (learning_rate, weight_decay)
+    together account for more than half of the explained variance,
+    while the architectural hyperparameter dropout has near-zero
+    influence. This pattern is consistent with the design intent of
+    the proximity-aware downsampling described in Section 5: by
+    constructing the training partition to include a substantial
+    fraction of near-seizure hard negatives, the data-side
+    regularisation already discourages the model from memorising
+    isolated artefacts, and additional dropout-based regularisation
+    becomes redundant. The low importance of fusion (0.022) reflects
+    that both the concatenation-with-projection and elementwise-
+    averaging strategies recover similar information at the chosen
+    width.
+
+    Compute cost and pruner contribution
+    ------------------------------------
+    Per-trial wall time varied from approximately 11 minutes
+    (small models pruned at epoch 3) to approximately 13.5 hours
+    (the deepest models with f = 128 and k = 7 running their full
+    13-epoch early-stopping schedule). Across the 50 trials
+    attempted, the MedianPruner saved an estimated 80-100 hours
+    of compute that would otherwise have been spent training
+    underperforming configurations to early-stopping completion.
+    All six declared output artefacts (best_multiscale_params.json,
+    multiscale_study_results.csv, multiscale_tuning_summary.json,
+    log file, F1-history figure, importance figure) were written
+    successfully and verified at the end of the run.
+
+    References:
+      Akiba, T., Sano, S., Yanase, T., Ohta, T., & Koyama, M.
+          (2019). Optuna: A Next-generation Hyperparameter
+          Optimization Framework. KDD 2019.
+      Hutter, F., Hoos, H., & Leyton-Brown, K. (2014). An Efficient
+          Approach for Assessing Hyperparameter Importance. ICML 2014.
+
 7.5 M4: Multi-Scale attention hyperparameter search space
 
-    The MultiScaleTCN backbone is instantiated from M3's best
-    hyperparameters (best_multiscale_params.json) and frozen for
-    the same reasons described in Section 7.3: ablation integrity,
-    search space efficiency, and backbone stability. Only the
-    temporal attention module and classification head are tuned.
+    The MultiScaleTCN backbone hyperparameters are inherited from
+    M3's tuning study (best_multiscale_params.json) -- specifically
+    num_filters, kernel_size, dropout, fusion strategy, and the three
+    branch dilation schedules -- and held fixed during M4's attention
+    hyperparameter search. The backbone is held non-trainable during
+    tuning for the search-efficiency reasons given in Section 7.3.
+    Only the temporal attention module and classification head
+    receive gradient updates during each trial. The M3 vs M4
+    ablation comparison itself takes place at the final-training
+    stage (Section 7.6) under the protocol described in Section 7.3.
 
     Frozen from M3           Tuned (attention only)
     ----------------------   -----------------------------------------
@@ -1286,22 +1520,33 @@ ablation comparisons share identical backbone configurations.
 7.6.7 Joint training for attention models (M2, M4)
 
     During hyperparameter tuning of M2 and M4 (Sections 7.3, 7.5),
-    the backbone was frozen to isolate attention-specific search and
-    avoid confounding ablation results by re-tuning backbone weights
-    under a different loss landscape. For final training, the entire
-    parameter set - both backbone and attention heads - is unfrozen
-    and updated jointly. This permits the attention module and
-    backbone to co-adapt end-to-end, which is consistent with the
-    standard training regimen of attention-augmented CNNs in the
-    action-recognition and medical-imaging literature.
+    the backbone was held non-trainable to reduce the Optuna search
+    space to attention-specific parameters. During final model
+    training, the entire parameter set -- both backbone and
+    attention -- is unfrozen and updated jointly from a fresh random
+    initialisation. This is the standard training regimen for
+    attention-augmented convolutional networks in the action-
+    recognition and medical-imaging literature, and it allows the
+    attention module and backbone to co-adapt end-to-end at the
+    full representational capacity of the model.
 
-    The decision to freeze only during tuning, not during final
-    training, is motivated by the search-efficiency / model-capacity
-    trade-off: frozen tuning reduces the search space to five
-    attention-specific hyperparameters (more efficient with a finite
-    50-trial budget), while joint training at convergence unlocks
-    the full representational capacity of the attention-augmented
-    model at test time.
+    Joint training is also what makes the ablation comparison
+    meaningful for this study. The research question targeted by
+    M1 vs M2 (and equivalently M3 vs M4) is whether the
+    architecture as a whole -- backbone plus attention versus
+    backbone plus global average pooling -- generalises better to
+    held-out subjects, not whether attention can extract additional
+    signal from a frozen, pre-optimised feature extractor. To
+    answer the architecture-level question, both models in each
+    pair must be free to converge to their natural optima under
+    identical conditions. They are therefore trained from scratch
+    using shared seed, optimiser, learning-rate schedule, gradient
+    clipping, AMP settings, and epoch budget; the only difference
+    between paired models is the architectural variable being
+    ablated. Backbone weights are not weight-shared across pairs;
+    fairness is enforced through identical training protocol rather
+    than identical post-training weights, matching the convention
+    of contemporary deep-learning ablation studies.
 
 7.6.8 Deterministic reproducibility
 
@@ -1891,25 +2136,119 @@ A.5 Learning rate, weight decay, and AdamW
     (the model overshoots good solutions); too small and training
     is extremely slow or gets stuck.
 
-    WEIGHT DECAY (wd): a regularisation technique that penalises
-    large parameter values by adding a small fraction of each
-    weight's magnitude to the loss. This discourages overly
-    complex models and reduces overfitting. A weight decay of 1e-4
-    means "at each step, shrink every weight by 0.01%."
+    WEIGHT DECAY (wd)
+    -----------------
+    A regularisation technique that penalises large parameter
+    values by shrinking every weight slightly at each optimiser
+    step. A weight decay of 1e-4 means "at each step, multiply
+    every weight by (1 - 1e-4)" before applying the gradient
+    update; over thousands of steps this accumulates into a
+    meaningful pressure that keeps weight magnitudes bounded.
 
-    AdamW: an optimiser that adapts the learning rate individually
-    for each parameter based on the history of its gradients. The
-    "W" indicates decoupled weight decay (Loshchilov & Hutter,
-    2019), which applies weight decay directly to the parameters
-    rather than through the gradient, preventing the regularisation
-    strength from diminishing as the learning rate decays.
+    Why weight decay is needed:
+      Neural networks have many more parameters than there are
+      independent training samples (in this study: ~80K-1.2M
+      parameters for ~220K training segments). Without any
+      regularisation, the optimiser can drive individual weights
+      to large absolute values that exactly fit the training set
+      including its noise -- a model that memorises rather than
+      generalises. Two failure modes follow:
+        (i) Test-time predictions become brittle: a small input
+            change causes large output swings because some
+            weights are doing extreme work.
+        (ii) Validation F1 plateaus or declines mid-training even
+            as training loss continues to fall -- the classic
+            signature of overfitting.
+      Weight decay opposes both by imposing a continuous,
+      direction-agnostic shrinkage that the optimiser must "earn
+      back" through gradient signal from the data. Weights that
+      contribute meaningfully to reducing loss survive the
+      shrinkage; weights that fit only noise are pulled toward
+      zero. Mathematically, weight decay is equivalent to placing
+      a Gaussian prior on the parameters with mean zero and a
+      fixed variance set by 1/wd.
 
-    COSINE ANNEALING: the learning rate starts at its initial value
-    and smoothly decreases following a half-cosine curve over the
-    training budget (20 epochs for tuning, 100 for final training),
-    reaching a minimum of 1% of the initial value. This allows
-    aggressive exploration early in training and fine-grained
-    convergence later.
+    AdamW
+    -----
+    An optimiser that adapts the learning rate individually for
+    each parameter based on the running history of its gradients
+    (mean and variance). The "W" indicates decoupled weight decay
+    (Loshchilov & Hutter, 2019), which applies the shrinkage
+    directly to the parameters rather than mixing it into the
+    gradient. The decoupling matters because Adam's adaptive
+    step-size scales the gradient term but should not scale the
+    regularisation term -- when the two are coupled (the original
+    Adam-with-L2 formulation), the effective regularisation
+    weakens whenever Adam's adaptive denominator is large,
+    breaking the intended regularisation strength. AdamW
+    preserves the configured weight decay magnitude regardless
+    of gradient history and is now the default optimiser for
+    most modern deep learning workloads.
+
+    COSINE ANNEALING
+    -----------------
+    A learning-rate schedule in which the lr starts at its
+    initial value and smoothly decreases along a half-cosine
+    curve over the training budget, reaching a minimum of 1%
+    of the initial value at the final epoch:
+
+        lr(t) = eta_min + 0.5 * (lr_initial - eta_min) *
+                (1 + cos(pi * t / T_max))
+
+    where T_max is the epoch budget (20 for tuning, 100 for
+    final training) and eta_min = 0.01 * lr_initial.
+
+    Why a learning-rate schedule is needed:
+      Training a neural network is most efficient with two
+      qualitatively different phases. Early in training the
+      weights are far from any good configuration and the
+      gradient field is steep; large steps make rapid progress
+      but small steps would crawl. Late in training the weights
+      are near a local optimum and the gradient field is shallow;
+      large steps now overshoot the optimum and oscillate
+      around it, while small steps allow fine-grained settling.
+      A constant learning rate is a compromise that is too large
+      late in training (final loss plateaus higher than
+      necessary) and not always large enough early on. A
+      schedule -- decreasing over time -- handles both phases.
+
+    Why cosine specifically (rather than step decay or
+    exponential decay):
+      Cosine annealing was introduced by Loshchilov & Hutter
+      (2017) and has three properties that suit deep convolutional
+      networks: (i) the decay is continuous, so there are no
+      abrupt jumps that can momentarily destabilise training;
+      (ii) the curve is gentle near the start (preserving high
+      lr while exploration is still useful) and steepest near
+      the end (allowing rapid convergence in the final phase);
+      and (iii) the final lr is non-zero (1% of initial),
+      preventing complete optimiser stagnation while still being
+      small enough for fine-grained refinement. Step-decay
+      schedules require manually choosing the milestone epochs
+      and often produce visible loss-plateau steps; exponential
+      schedules decay too fast in the middle phase. Cosine
+      annealing has become the de facto standard for vision and
+      time-series convolutional networks.
+
+    Why this study uses cosine annealing with eta_min =
+    0.01 x lr_initial:
+      The 1% floor guarantees that even at epoch 100 the
+      optimiser is still making non-trivial parameter updates.
+      A lower floor (e.g. eta_min = 0) would freeze training in
+      the final epochs, while a higher floor (e.g. 10%) would
+      leave too much oscillation around the optimum. The 1%
+      setting is the standard choice in the cosine annealing
+      literature and matches the behaviour observed in our
+      tuning logs, where validation F1 typically reaches its
+      peak between epochs 8-15 of a 20-epoch budget and the
+      gentle late-stage decay confirms rather than disturbs
+      the trajectory.
+
+    References:
+      Loshchilov, I. & Hutter, F. (2017). SGDR: Stochastic
+          Gradient Descent with Warm Restarts. ICLR 2017.
+      Loshchilov, I. & Hutter, F. (2019). Decoupled Weight
+          Decay Regularization. ICLR 2019.
 
 A.6 Batch size and gradient noise
 

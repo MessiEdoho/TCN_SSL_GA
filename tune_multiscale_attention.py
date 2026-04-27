@@ -33,25 +33,31 @@ Falkner, S., Klein, A., & Hutter, F. (2018). BOHB: Robust and Efficient
     Hyperparameter Optimization at Scale. ICML 2018.
 Mattson, P. et al. (2020). MLPerf Training Benchmark. MLSys 2020.
 
-The MultiScaleTCN backbone parameters are transferred
-from outputs/best_multiscale_params.json and frozen.
-Only the temporal attention module and classification
-head receive gradient updates during tuning.
+The MultiScaleTCN backbone hyperparameters (architecture,
+not weights) are inherited from M3's tuning study
+(best_multiscale_params.json) and held fixed during this
+search. The backbone is instantiated with these inherited
+hyperparameters and made non-trainable for the duration of
+tuning. Only the temporal attention module and classification
+head receive gradient updates during each trial.
+
+Holding the backbone non-trainable during tuning is a
+search-efficiency choice, not an ablation device. The M3 vs
+M4 ablation comparison itself is performed at the final-
+training stage (MultiScaleTCNAttention.py), where both models
+are trained from scratch under an identical protocol -- see
+STUDY_REPORT.txt Sections 7.5 and 7.6.7.
 
 This design mirrors tune_temporal_attention.py:
-  TCN         -> frozen backbone -> tune attention
-  MultiScaleTCN -> frozen backbone -> tune attention
-
-The M3 (MultiScaleTCN) vs M4 (MultiScaleTCNWithAttention)
-ablation is therefore controlled -- both models share
-identical backbone weights. The only architectural
-difference is the temporal attention module.
+  TCN          -> inherit M1 backbone HPs, freeze, tune attn
+  MultiScaleTCN -> inherit M3 backbone HPs, freeze, tune attn
 
 Architecture: MultiScaleTCNWithAttention
-  Frozen : MultiScaleTCN backbone
-           (weights from best_multiscale_params.json)
-  Tuned  : attention_fc, attention_v,
-           attention_drop, classifier
+  Held fixed (non-trainable during tuning):
+           MultiScaleTCN backbone, instantiated with
+           hyperparameters from best_multiscale_params.json
+  Tuned  : attention_fc, attention_v, attention_drop,
+           classification head
 
 Hyperparameters tuned (attention only)
 ---------------------------------------
