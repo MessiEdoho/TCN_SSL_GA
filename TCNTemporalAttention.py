@@ -88,8 +88,10 @@ from sklearn.metrics import (        # scikit-learn metrics for comprehensive ev
     precision_recall_curve,          # precision vs recall arrays for PR plot
     average_precision_score,         # area under PR curve (summary statistic)
     classification_report,           # per-class precision, recall, F1 as dict
-    calibration_curve,               # reliability diagram: predicted prob vs true fraction
 )
+# calibration_curve lives in sklearn.calibration, not sklearn.metrics
+# (since scikit-learn 0.21+). Prior versions placed it under metrics.
+from sklearn.calibration import calibration_curve  # reliability diagram: predicted prob vs true fraction
 
 # tcn_utils imports -- exact names confirmed from reading tcn_utils.py.
 # run_training() exists but is not used here; an explicit training loop

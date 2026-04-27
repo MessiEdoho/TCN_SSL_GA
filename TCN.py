@@ -59,8 +59,11 @@ from sklearn.metrics import (
     f1_score, roc_auc_score, confusion_matrix,
     roc_curve, precision_recall_curve,
     average_precision_score,
-    classification_report, calibration_curve,
+    classification_report,
 )
+# calibration_curve lives in sklearn.calibration, not sklearn.metrics
+# (since scikit-learn 0.21+). Prior versions placed it under metrics.
+from sklearn.calibration import calibration_curve
 
 # tcn_utils imports -- exact names confirmed from reading tcn_utils.py
 # run_training() exists but is not used here; an explicit training loop
