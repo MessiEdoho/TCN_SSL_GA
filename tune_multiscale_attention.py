@@ -152,7 +152,7 @@ if DRY_RUN:
     N_TRIALS = 2
     N_STARTUP = 1
 
-OUTPUT_DIR        = Path("/home/people/22206468/scratch/OUTPUT/MODEL4_OUTPUT")
+OUTPUT_DIR        = Path("/home/people/22206468/scratch/OUTPUT/MODEL4_OUTPUT") / "multiscale_attention_tuning_outputs"
 LOG_DIR           = OUTPUT_DIR / "logs"
 FIGURE_DIR        = OUTPUT_DIR / "figures"
 # Previous (uniform downsampling): data_splits.json

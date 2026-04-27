@@ -66,6 +66,7 @@ import csv                           # write epoch metrics and three-row summary
 import time                          # per-epoch train/val timing
 import datetime                      # ISO timestamps for JSON records and elapsed time
 import shutil                        # reserved for potential file copy operations
+import random                        # pre-flight file sampling
 from pathlib import Path             # cross-platform path handling throughout the script
 
 import numpy as np                   # array operations for metrics, predictions, attention weights
@@ -117,6 +118,7 @@ SEED              = 42                                 # global seed (Python, Nu
 # (patience=10) terminates well before 100 if converged.
 MAX_EPOCHS        = 100                                # max training epochs (upper bound)
 ES_PATIENCE       = 10                                 # epochs without val F1 improvement before stopping
+GRAD_CLIP         = 1.0                                # maximum gradient norm for clipping (consistent with tuning)
 CHECKPOINT_FREQ   = 5                                  # save periodic checkpoint every N epochs
 KEEP_CKPTS        = 3                                  # disk-space cap: keep only 3 most recent periodic ckpts
 FS                = 500                                # native EDF sampling rate (Hz)
@@ -288,7 +290,7 @@ def load_best_params(logger):
 # load_splits
 # ---------------------------------------------------------------------------
 def load_splits(logger):
-    """Load train and val file-label pairs from data_splits.json.
+    """Load train and val file-label pairs from data_splits_nonictal_sampled.json.
 
     Mirror of TCN.py load_splits() -- no differences. Never loads test pairs.
 
@@ -297,8 +299,10 @@ def load_splits(logger):
     tuple of (train_pairs, val_pairs)
     """
     if not SPLITS_PATH.exists():
-        logger.error("data_splits.json not found at %s. "
-                     "Run generate_data_splits.py first.", SPLITS_PATH)
+        logger.error("data_splits_nonictal_sampled.json not found at %s. "
+                     "Run create_balanced_splits.py first (which itself "
+                     "requires data_splits.json from generate_data_splits.py).",
+                     SPLITS_PATH)
         raise FileNotFoundError(str(SPLITS_PATH))
 
     logger.info("Loading splits from: %s", SPLITS_PATH)
@@ -404,8 +408,9 @@ def build_training_components(model, pos_weight, attn_hp, device, logger):
     (best_attention_params.json) because these were optimised during attention
     tuning. Optimiser covers ALL parameters (backbone + attention jointly).
 
-    Imbalance strategy: offline stratified downsampling to 1:4 ratio with
-    pos_weight=1.0.
+    Imbalance strategy: offline proximity-aware downsampling to a 1:2.37
+    ictal-to-non-ictal ratio (29.7% ictal in the training partition) with
+    pos_weight=1.0. See STUDY_REPORT.txt Section 5 and Section 7.6.3.
 
     Returns (optimiser, scheduler, criterion).
     """
@@ -419,7 +424,8 @@ def build_training_components(model, pos_weight, attn_hp, device, logger):
         optimiser,
         T_max=MAX_EPOCHS,
         eta_min=float(attn_hp["learning_rate"]) * 0.01)   # floor at 1% of initial LR
-    # Imbalance handled by offline stratified downsampling to 1:4 ratio; pos_weight=1.0
+    # Imbalance handled by offline proximity-aware downsampling to a 1:2.37
+    # ictal-to-non-ictal ratio; pos_weight=1.0 (no additional loss reweighting).
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight.to(device))
     logger.info("Optimiser: AdamW (lr=%.2e, wd=%.2e) -- from attention tuning",
                 attn_hp["learning_rate"], attn_hp["weight_decay"])
@@ -484,9 +490,14 @@ def cleanup_checkpoints(ckpt_dir, keep_last_n, logger):
 def train_epoch(model, loader, optimiser, criterion, device, scaler=None):
     """Run one training epoch. Delegates to train_one_epoch with optional AMP scaler.
 
+    Gradient clipping is applied at norm GRAD_CLIP (= 1.0) to stabilise training
+    of the joint backbone + attention model and to match the explicit clipping
+    used in the M2 tuning script (tune_temporal_attention.py).
+
     Returns mean training loss.
     """
-    return train_one_epoch(model, loader, optimiser, criterion, device, scaler=scaler)
+    return train_one_epoch(model, loader, optimiser, criterion, device,
+                           max_grad_norm=GRAD_CLIP, scaler=scaler)
 
 
 # ---------------------------------------------------------------------------
@@ -1174,6 +1185,21 @@ def main():
         logger.info("GPU  : %s", torch.cuda.get_device_name(0))
         logger.info("VRAM : %.2f GB", torch.cuda.get_device_properties(0).total_memory / 1e9)
         logger.info("CUDA : %s", torch.version.cuda)
+        # Pre-flight GPU memory check: warn if another job is already on this
+        # GPU or if VRAM is fragmented. Does not abort -- the user may still
+        # want to run on a partially-occupied GPU at reduced batch size.
+        try:
+            _free_bytes, _total_bytes = torch.cuda.mem_get_info(0)
+            _free_gb = _free_bytes / 1e9
+            _total_gb = _total_bytes / 1e9
+            logger.info("GPU memory free: %.2f / %.2f GB", _free_gb, _total_gb)
+            if _free_gb < 8.0:
+                logger.warning("GPU has only %.2f GB free (< 8 GB threshold). "
+                               "Another process may be sharing this GPU, or VRAM "
+                               "is fragmented. Training may fail with CUDA OOM.",
+                               _free_gb)
+        except Exception as _e:
+            logger.warning("Could not query GPU memory: %s", _e)
     else:
         logger.info("Device: CPU")
     logger.info("PyTorch: %s", torch.__version__)
@@ -1185,15 +1211,34 @@ def main():
     train_pairs, val_pairs = load_splits(logger)
 
     # -- Corpus preparation ----------------------------------------------------
-    # Downsampling and extreme-segment filtering are handled offline by
-    # create_balanced_splits.py. The manifest is already clean.
-    # Subject exclusion (m254), 1:4 downsampling, and extreme-segment filtering
-    # are ALL handled offline by create_balanced_splits.py. The manifest is
-    # already clean and balanced -- no further corpus preparation is needed here.
+    # Subject exclusion (m254), proximity-aware non-ictal downsampling to a
+    # 1:2.37 ictal-to-non-ictal ratio, and extreme-segment filtering are ALL
+    # handled offline by create_balanced_splits.py. The manifest is already
+    # clean and balanced -- no further corpus preparation is needed here.
     # train_pairs = filter_unpaired_subjects(train_pairs, logger=logger)
     logger.info("Training corpus: %d segments (from balanced manifest)", len(train_pairs))
     pos_weight = torch.tensor([1.0], dtype=torch.float32)
     # -- End corpus preparation ------------------------------------------------
+
+    # -- Pre-flight check: verify a small sample of .npy files is readable -----
+    # Fail fast if the manifest's paths are stale or /scratch is inaccessible,
+    # rather than discovering this N retries per file into the first epoch.
+    # Probe 5 files per partition (train + val) to cover both mounts in case
+    # the partitions live on different storage (e.g. TRAIN_DATA_* vs VAL_DATA).
+    _preflight_rng = random.Random(SEED)
+    _probe_paths = [_preflight_rng.choice(train_pairs)[0] for _ in range(5)]
+    _probe_paths += [_preflight_rng.choice(val_pairs)[0] for _ in range(5)]
+    for _probe_path in _probe_paths:
+        try:
+            _ = np.load(_probe_path)
+        except Exception as _e:
+            raise RuntimeError(
+                "Pre-flight check failed: cannot read %s. "
+                "Check that /scratch is accessible and the manifest is current. "
+                "Underlying error: %s" % (_probe_path, _e))
+    logger.info("Pre-flight .npy read OK (%d probes, train+val): %s, ...",
+                len(_probe_paths), _probe_paths[0])
+    del _probe_path, _probe_paths, _preflight_rng
 
     # -- Step 4: Build model ---------------------------------------------------
     model = build_model(backbone_hp, attn_hp, DEVICE, logger)
@@ -1289,13 +1334,14 @@ def main():
         history["val_f1"].append(val_f1)
         history["lr"].append(current_lr)
 
-        # Lightweight logging: first, every 10th, early-stop, and new-best epochs
-        if epoch == start_epoch or epoch % 10 == 0 or epochs_no_imp >= ES_PATIENCE or val_f1 > best_val_f1:
-            logger.info(
-                "Epoch %3d/%d | loss=%.4f | val_f1=%.4f | lr=%.2e | best=%.4f | patience=%d/%d"
-                " | train %.0fs | val %.0fs",
-                epoch, MAX_EPOCHS, train_loss, val_f1, current_lr,
-                best_val_f1, epochs_no_imp, ES_PATIENCE, train_sec, val_sec)
+        # Log every epoch -- 100-epoch budget is short enough for full visibility
+        # in the .log file. Per-epoch CSV (..._epoch_metrics.csv) remains the
+        # primary source for downstream analysis.
+        logger.info(
+            "Epoch %3d/%d | loss=%.4f | val_f1=%.4f | lr=%.2e | best=%.4f | patience=%d/%d"
+            " | train %.0fs | val %.0fs",
+            epoch, MAX_EPOCHS, train_loss, val_f1, current_lr,
+            best_val_f1, epochs_no_imp, ES_PATIENCE, train_sec, val_sec)
 
         if val_f1 > best_val_f1:                        # new best model found
             best_val_f1 = val_f1                       # update best F1 tracker
