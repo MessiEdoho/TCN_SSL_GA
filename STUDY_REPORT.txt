@@ -1487,8 +1487,12 @@ ablation comparisons share identical backbone configurations.
 7.6.6 Early stopping and checkpoint selection
 
     Early stopping is governed by validation macro F1-score evaluated
-    on the complete validation partition (4,298,154 segments), not
-    on the 1% tuning subset. After each epoch:
+    on a 5% stratified subset of the validation partition
+    (approximately 214,908 segments: 580 ictal and 214,328 non-ictal,
+    preserving the natural ictal:non-ictal prevalence of 0.27%). The
+    full validation partition (4,298,154 segments) is reserved for
+    the post-training pass described in Section 7.6.6a; it is not
+    used for any per-epoch decision. After each epoch:
 
         if val_macro_f1[t] > best_val_f1:
             best_val_f1 = val_macro_f1[t]
@@ -1500,6 +1504,19 @@ ablation comparisons share identical backbone configurations.
             if epochs_no_imp >= 10:
                 break
 
+    The 5% subset is constructed once at the start of each training
+    run from a deterministically seeded RNG (SEED + 1) so that the
+    monitor sample is identical across SLURM resubmissions. Stratified
+    sampling preserves the natural class prevalence so that the
+    monitor F1 reflects the deployment-relevant operating regime: a
+    model selected on this subset is selected against the same
+    precision-recall trade-off it will face at test time. Validation
+    on the full 4.3M-segment partition is I/O-bound at approximately
+    11 hours per epoch on the working storage tier, which would
+    inflate per-model final-training wall time from ~6 days to ~50
+    days; the 5% subset reduces per-epoch validation cost by a factor
+    of approximately twenty without altering the prevalence regime.
+
     The patience of 10 epochs is intentionally less aggressive than
     the patience of 5 used during tuning: during tuning the objective
     was fast comparative ranking, whereas during final training the
@@ -1508,14 +1525,48 @@ ablation comparisons share identical backbone configurations.
 
     Two checkpoints are maintained:
       - {model}_best_weights.pt: weights at the epoch of highest
-        validation macro F1. These weights are used for all reported
-        test-set evaluations (Section 9).
+        monitor-subset macro F1. These weights are used for all
+        reported test-set evaluations (Section 9).
       - {model}_latest_weights.pt: weights at the most recently
         completed epoch, overwritten each epoch, used for crash
         recovery and warm resume (not for reporting).
 
     All reported metrics in Section 9 are derived from the
     best-F1 weights, not the latest weights.
+
+7.6.6a Final evaluation on the full validation partition
+
+    After training completes (either by reaching 100 epochs or by
+    early stopping), the best-epoch weights are restored and two
+    additional evaluation passes are performed:
+
+      (a) Sanity-check pass on the same 5% monitor subset. This
+          re-computes macro F1 on the identical stratified sample
+          used during training and compares it to best_val_f1
+          recorded in the latest checkpoint. Both numbers come from
+          the same subset, so a mismatch beyond floating-point
+          tolerance (1e-3) signals a weight-restoration failure
+          (e.g., device mismatch, state-dict corruption). This pass
+          is fast (~33 minutes) because it operates on the same
+          ~215K-segment subset.
+
+      (b) Full-validation pass on the complete 4,298,154-segment
+          partition. This is the only pass that touches the full
+          validation set during training; its outputs (y_true,
+          y_prob arrays) are the inputs to all post-training
+          analyses: the three-row evaluation table (Section 7.6.11),
+          smoothing/refractory/min-duration post-processing
+          (Section 7.6.9), Youden's-J threshold optimisation
+          (Section 7.6.10), the events-per-24-h false-alarm rate,
+          and -- for M2 and M4 -- the temporal-attention saliency
+          visualisations.
+
+    All metrics reported in Section 9 (precision, recall, macro F1,
+    AUROC, AUPRC, calibration, FAR, three-row table) are computed
+    from the full-validation pass, not from the monitor subset. The
+    monitor subset is used solely for early-stopping decisions during
+    training and for the post-training weight-restoration sanity
+    check; it does not appear in any reported number.
 
 7.6.7 Joint training for attention models (M2, M4)
 
@@ -1700,14 +1751,24 @@ ablation comparisons share identical backbone configurations.
         M3: ~3.0 days on V100 (~10-12 min/epoch sustained)
         M2/M4 attention-only tuning: ~1.0 day each
 
-      Final training (100 epochs, full val partition):
-        M1-M4: ~12-18 hours per model, dominated by full-val
-        evaluation at each epoch (4.3M segments)
+      Final training (100 epochs, 5% stratified per-epoch monitor +
+      single full-val pass at the end, see Section 7.6.6):
+        M1-M4: ~5-6 days per model on a single A100/V100. Per-epoch
+        cost is dominated by data-loader I/O on the 220K-segment
+        training partition (~42 min) plus 5% monitor evaluation
+        (~33 min); the single post-training full-validation pass
+        adds ~11 hours.
+
+        For comparison, validating on the full 4.3M-segment partition
+        every epoch would have inflated per-model wall time from
+        ~6 days to ~50 days, exceeding any realistic compute budget.
 
       Total end-to-end pipeline (all four models):
-        ~8-10 GPU-days on a single mid-range GPU. The pipeline is
+        ~20-25 GPU-days on a single mid-range GPU. The pipeline is
         embarrassingly parallel across models; with four concurrent
-        GPU allocations the elapsed wall time is ~2 days.
+        GPU allocations the elapsed wall time is ~6 days. SLURM
+        wall-time limits (3 days per submission) are handled by
+        latest-weight checkpoint resumption (Section 7.6.6).
 
     All scripts implement Optuna SQLite-backed study resumption so
     that interrupted runs can restart without loss of completed
@@ -1719,7 +1780,10 @@ ablation comparisons share identical backbone configurations.
     Parameter                Value
     ------------------------ --------------------------------------------
     Max epochs               100
-    Early stopping patience  10 epochs (val macro F1)
+    Early stopping patience  10 epochs (val macro F1, 5% strat. subset)
+    Per-epoch val monitor    5% stratified subset (~215K segments,
+                             natural prevalence preserved)
+    Final-eval val partition Full (4,298,154 segments, single pass)
     Optimiser                AdamW
     Weight decay             Decoupled (Optuna-selected per model)
     LR schedule              CosineAnnealingLR (eta_min = lr * 0.01)

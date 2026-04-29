@@ -10,6 +10,17 @@ Trains for exactly 100 epochs with early stopping
 on validation macro F1 (patience 10). ALL parameters
 (backbone and attention) are trained jointly.
 
+Validation strategy
+-------------------
+Per-epoch monitoring uses a 5% stratified subset of
+the validation set (preserving the natural ictal:
+non-ictal prevalence). This keeps the early-stopping
+signal cheap. The full validation set is used only
+once after training, for the post-training pass:
+three-row evaluation, smoothing/refractory/min-
+duration post-processing, Youden's-J threshold
+optimisation, and events/24h false-alarm rate.
+
 Hyperparameters loaded from TWO sources:
   outputs/best_params.json
     -> TCN backbone: num_layers, kernel_size,
@@ -121,6 +132,13 @@ ES_PATIENCE       = 10                                 # epochs without val F1 i
 GRAD_CLIP         = 1.0                                # maximum gradient norm for clipping (consistent with tuning)
 CHECKPOINT_FREQ   = 5                                  # save periodic checkpoint every N epochs
 KEEP_CKPTS        = 3                                  # disk-space cap: keep only 3 most recent periodic ckpts
+# Per-epoch validation monitor fraction. The full val set has ~4.3M segments
+# (~11h/epoch I/O bound) so per-epoch validation on the full set is
+# prohibitive. We monitor on a 5% stratified subset (preserves natural
+# ictal:non-ictal prevalence) for early-stopping decisions and re-evaluate
+# on the full val set once after training for the three-row report,
+# post-processing, and threshold optimisation.
+VAL_MONITOR_FRACTION = 0.05                            # 5% stratified per-epoch monitor
 FS                = 500                                # native EDF sampling rate (Hz)
 SEGMENT_LEN       = 2500                               # samples per segment: 5 s * 500 Hz
 SEGMENT_SEC       = 5.0                                # segment duration in seconds
@@ -1244,13 +1262,39 @@ def main():
     model = build_model(backbone_hp, attn_hp, DEVICE, logger)
     n_params = count_parameters(model)
 
+    # -- Build 5% stratified val subset for per-epoch monitoring ---------------
+    # Validating on the full val set every epoch is I/O-bound (~11h/epoch on
+    # 4.3M segments). For early-stopping decisions we only need a representative
+    # F1 estimate, so we monitor on a stratified subset that preserves the
+    # natural ictal:non-ictal prevalence. The full val set is reserved for the
+    # post-training pass (three-row evaluation, smoothing/refractory/min-
+    # duration post-processing, Youden's-J threshold optimisation, events/24h
+    # false-alarm rate, and attention saliency visualisation). Seeded from
+    # SEED+1 so the monitor subset is identical across SLURM resubmissions,
+    # keeping the early-stop signal stable.
+    _monitor_rng = random.Random(SEED + 1)
+    _ictal_val = [p for p in val_pairs if p[1] == 1]
+    _nonictal_val = [p for p in val_pairs if p[1] == 0]
+    _n_ictal_mon = max(1, int(round(len(_ictal_val) * VAL_MONITOR_FRACTION)))
+    _n_nonictal_mon = max(1, int(round(len(_nonictal_val) * VAL_MONITOR_FRACTION)))
+    val_monitor_pairs = (_monitor_rng.sample(_ictal_val, _n_ictal_mon) +
+                         _monitor_rng.sample(_nonictal_val, _n_nonictal_mon))
+    _monitor_rng.shuffle(val_monitor_pairs)
+    logger.info("Val monitor subset (%.0f%% stratified): %d segments | "
+                "%d ictal + %d non-ictal | full val reserved for final eval",
+                VAL_MONITOR_FRACTION * 100, len(val_monitor_pairs),
+                _n_ictal_mon, _n_nonictal_mon)
+    del _ictal_val, _nonictal_val, _n_ictal_mon, _n_nonictal_mon, _monitor_rng
+
     # -- Step 5: Build data loaders --------------------------------------------
     # batch_size comes from attention tuning (attn_hp), not backbone tuning
     batch_size = int(attn_hp["batch_size"])
     train_loader = make_loader(train_pairs, batch_size, True, DEVICE)
+    val_monitor_loader = make_loader(val_monitor_pairs, batch_size, False, DEVICE)
     val_loader = make_loader(val_pairs, batch_size, False, DEVICE)
-    logger.info("Train loader: %d batches | batch_size=%d", len(train_loader), batch_size)
-    logger.info("Val loader  : %d batches", len(val_loader))
+    logger.info("Train loader       : %d batches | batch_size=%d", len(train_loader), batch_size)
+    logger.info("Val monitor loader : %d batches (per-epoch early-stop)", len(val_monitor_loader))
+    logger.info("Full val loader    : %d batches (post-training eval only)", len(val_loader))
 
     # -- Step 6: Build training components -------------------------------------
     # lr, wd come from attn_hp (optimised during attention tuning)
@@ -1323,7 +1367,9 @@ def main():
         train_sec = time.time() - t0_train
 
         t0_val = time.time()
-        val_f1, _, _, _ = evaluate_model(model, val_loader, DEVICE, logger, use_amp=use_amp)
+        # Per-epoch monitor on the 5% stratified subset (early-stopping signal).
+        # Full val is run only once after training, in the final eval step.
+        val_f1, _, _, _ = evaluate_model(model, val_monitor_loader, DEVICE, logger, use_amp=use_amp)
         val_sec = time.time() - t0_val
 
         current_lr = scheduler.get_last_lr()[0]        # capture LR before scheduler.step() updates it
@@ -1396,15 +1442,28 @@ def main():
     model.to(DEVICE)                                    # move back to GPU for final evaluation
 
     # -- Step 11: Final evaluation ---------------------------------------------
-    # Re-evaluate to produce y_true, y_prob arrays needed for post-processing
-    # and all 13 figures. Also serves as a consistency check on weight restoration.
-    logger.info("Running final validation evaluation...")
-    val_f1_final, y_true, y_pred_05, y_prob = evaluate_model(model, val_loader, DEVICE, logger, use_amp=use_amp)
-    tol = 1e-3                                          # tolerance for floating-point rounding
-    if abs(val_f1_final - best_val_f1) > tol:           # F1 should match best-epoch value
-        logger.warning("F1 mismatch: best=%.6f final=%.6f.", best_val_f1, val_f1_final)
+    # Two passes after weight restoration:
+    #   (a) Monitor-subset re-evaluation -- a sanity check that compares the
+    #       restored model's F1 on the same 5% subset against best_val_f1.
+    #       Both numbers come from the identical subset, so a mismatch beyond
+    #       floating-point tolerance signals a weight-restoration failure.
+    #   (b) Full-val pass -- produces the y_true and y_prob arrays consumed by
+    #       run_postprocessing_evaluations() for the three-row report,
+    #       smoothing/refractory/min-duration filtering, Youden's-J threshold
+    #       optimisation, events/24h FAR, and attention saliency. This is the
+    #       only pass that uses the full 4.3M-segment val set.
+    logger.info("Sanity-check on monitor subset (verifies weight restoration)...")
+    val_f1_monitor, _, _, _ = evaluate_model(model, val_monitor_loader, DEVICE, logger, use_amp=use_amp)
+    tol = 1e-3
+    if abs(val_f1_monitor - best_val_f1) > tol:
+        logger.warning("F1 mismatch on monitor subset: best=%.6f restored=%.6f. "
+                       "Weight restoration may have failed.", best_val_f1, val_f1_monitor)
     else:
-        logger.info("F1 consistency check: PASS")
+        logger.info("F1 consistency check (monitor subset): PASS (%.4f)", val_f1_monitor)
+
+    logger.info("Running full-val final evaluation (post-processing inputs)...")
+    val_f1_final, y_true, y_pred_05, y_prob = evaluate_model(model, val_loader, DEVICE, logger, use_amp=use_amp)
+    logger.info("Full-val F1 (raw @ 0.5): %.4f", val_f1_final)
 
     # -- Step 12: Post-processing evaluations ----------------------------------
     (row1_metrics, row2_metrics, row3_metrics,
