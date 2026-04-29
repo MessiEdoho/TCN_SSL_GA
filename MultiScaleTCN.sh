@@ -17,7 +17,7 @@
 # dilation schedules [1,2,4], [8,16,32], [32,64,128]. Produces
 # multiscale_tcn_final_weights.pt and the three-row evaluation report on
 # the validation partition (test set reserved for final_evaluation.py).
-#SBATCH -t 3-00:00:00
+#SBATCH -t 13-00:00:00
 
 # Email notifications at start, end, and failure
 #SBATCH --mail-type=ALL
