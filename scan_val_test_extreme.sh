@@ -2,14 +2,16 @@
 #SBATCH --job-name=scan_extreme
 # CPU-only diagnostic scan: count NaN/Inf and |x|>1000 segments in val
 # and test partitions. No GPU required.
+# speficity number of nodes 
 #SBATCH -N 1
-#SBATCH --ntasks-per-node 16
-#SBATCH --partition=csserial
 
-# Conservative wall-time. Empirical estimate: ~5-15 min for 4.3M val
-# segments at 16 workers; allow headroom for slow Lustre/GPFS.
-#SBATCH -t 10:00:00
+# specify number of tasks/cores per node required
+#SBATCH --ntasks-per-node 3
 
+# specify the walltime e.g 10 days 
+#SBATCH -t 10-00:00:00
+
+# set to email at start,end and failed jobs
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=mercy.edoho@ucdconnect.ie
 
