@@ -28,15 +28,20 @@ conda activate torch_v100_py310
 
 cd ~/TCN_SSL_GA
 
-# Run the scan with 16 parallel workers, threshold = 1000.0 (matches the
-# offline filter applied to TRAIN in create_balanced_splits.py).
-# Outputs scan_results.json in the working directory.
+# Run the scan. Threshold = 1000.0 matches the offline filter applied to
+# TRAIN in create_balanced_splits.py. Both the JSON summary and the .log
+# file are written to the Data_diagnostic directory so audit-trail outputs
+# are kept separate from training output trees.
+DIAG_DIR=/home/people/22206468/scratch/INPUT_DATA/Data_diagnostic
+mkdir -p "$DIAG_DIR"
+
 python scan_val_test_extreme.py \
     --manifest /scratch/22206468/INPUT_DATA/data_splits_outputs/data_splits_nonictal_sampled.json \
     --alt-manifest /scratch/22206468/INPUT_DATA/data_splits_outputs/data_splits.json \
     --workers 16 \
     --threshold 1000.0 \
-    --output scan_results.json
+    --output "$DIAG_DIR/scan_results.json" \
+    --log-path "$DIAG_DIR/scan_val_test_extreme.log"
 
 echo "===== JOB END ====="
 date

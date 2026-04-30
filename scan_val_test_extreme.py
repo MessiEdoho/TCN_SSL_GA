@@ -58,7 +58,12 @@ DEFAULT_MANIFEST     = "/scratch/22206468/INPUT_DATA/data_splits_outputs/data_sp
 DEFAULT_ALT_MANIFEST = "/scratch/22206468/INPUT_DATA/data_splits_outputs/data_splits.json"
 DEFAULT_WORKERS      = 16
 DEFAULT_THRESHOLD    = 1000.0
-DEFAULT_OUTPUT       = "scan_results.json"
+# All diagnostic artefacts (log + JSON summary) live in the Data_diagnostic
+# directory so audit-trail outputs are kept separate from training output
+# trees and from the splits-manifest input data.
+DEFAULT_DIAGNOSTIC_DIR = "/home/people/22206468/scratch/INPUT_DATA/Data_diagnostic"
+DEFAULT_LOG_PATH       = DEFAULT_DIAGNOSTIC_DIR + "/scan_val_test_extreme.log"
+DEFAULT_OUTPUT         = DEFAULT_DIAGNOSTIC_DIR + "/scan_results.json"
 MAX_BAD_RECORDS_KEPT = 500          # cap memory / output JSON size
 
 # Subject-id pattern in filepaths (e.g. "/scratch/.../m338/...")
@@ -68,15 +73,32 @@ _SUBJECT_RE = re.compile(r"\bm\d{3,4}\b")
 # ---------------------------------------------------------------------------
 # Logger
 # ---------------------------------------------------------------------------
-def setup_logging():
+def setup_logging(log_path):
+    """Configure the scan logger with both stdout and a persistent file.
+
+    The file handler is opened in append mode so re-runs accumulate context
+    rather than overwriting prior diagnostic history. Parent directories are
+    created if they do not already exist.
+    """
     log = logging.getLogger("scan")
     log.setLevel(logging.INFO)
     log.handlers.clear()
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(logging.Formatter(
+
+    fmt = logging.Formatter(
         "%(asctime)s | %(levelname)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S"))
-    log.addHandler(handler)
+        datefmt="%Y-%m-%d %H:%M:%S")
+
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(fmt)
+    log.addHandler(sh)
+
+    log_path = Path(log_path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    fh = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+    fh.setFormatter(fmt)
+    log.addHandler(fh)
+
+    log.info("Log file: %s", log_path.resolve())
     return log
 
 
@@ -242,15 +264,21 @@ def main():
                         help="Amplitude threshold |x|>thr flagged as extreme")
     parser.add_argument("--output", default=DEFAULT_OUTPUT,
                         help="Where to write JSON summary")
+    parser.add_argument("--log-path", default=DEFAULT_LOG_PATH,
+                        help="Where to write the persistent .log file")
     args = parser.parse_args()
 
-    log = setup_logging()
+    # Ensure the diagnostic directory exists before opening either output
+    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+
+    log = setup_logging(args.log_path)
     log.info("Scan: extreme/NaN/Inf segments")
     log.info("  manifest     : %s", args.manifest)
     log.info("  alt manifest : %s", args.alt_manifest)
     log.info("  threshold    : %.1f", args.threshold)
     log.info("  workers      : %d", args.workers)
     log.info("  output       : %s", args.output)
+    log.info("  log path     : %s", args.log_path)
 
     # -- Load primary manifest ----------------------------------------------
     manifest_path = Path(args.manifest)
