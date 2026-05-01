@@ -158,11 +158,14 @@ THREE_ROW_CSV     = OUTPUT_ROOT / "ms_attn_three_row_summary.csv"
 BACKBONE_PARAMS_PATH = Path("/home/people/22206468/scratch/OUTPUT/MODEL3_OUTPUT/MultiScaleTCNtuning_outputs") / "best_multiscale_params.json"
 ATTN_PARAMS_PATH     = Path("/home/people/22206468/scratch/OUTPUT/MODEL4_OUTPUT") / "best_multiscale_attn_params.json"
 
-# data_splits.json -- single source of truth (matches all other pipeline scripts)
-# Previous (uniform downsampling): data_splits.json
-# SPLITS_PATH = Path("/scratch/22206468/INPUT_DATA/data_splits_outputs/data_splits.json")
-# Current (proximity-aware downsampling): data_splits_nonictal_sampled.json
-SPLITS_PATH = Path("/scratch/22206468/INPUT_DATA/data_splits_outputs/data_splits_nonictal_sampled.json")
+# Splits manifest -- single source of truth (matches all other pipeline scripts)
+#   Previous (uniform downsampling)             : data_splits.json
+#   Train-side proximity-aware downsampling     : data_splits_nonictal_sampled.json
+#   + val/test filtered (apply_val_test_filter) : data_splits_nonictal_sampled_filtered.json
+# Use the fully-filtered manifest so the |x|>1000 / NaN / Inf criterion is
+# applied uniformly across train, val, and test partitions. Eliminates the
+# FP16-overflow NaN failure mode observed in the M3 final-eval pass.
+SPLITS_PATH = Path("/scratch/22206468/INPUT_DATA/data_splits_outputs/data_splits_nonictal_sampled_filtered.json")
 
 # Backbone attribute prefix in MultiScaleTCNWithAttention (confirmed: self.backbone)
 BACKBONE_ATTR = "backbone"
@@ -306,13 +309,15 @@ def load_best_params(logger):
 # load_splits
 # ---------------------------------------------------------------------------
 def load_splits(logger):
-    """Load train and val file-label pairs from data_splits_nonictal_sampled.json.
+    """Load train and val file-label pairs from data_splits_nonictal_sampled_filtered.json.
 
     Never loads test pairs. Returns (train_pairs, val_pairs).
     """
     if not SPLITS_PATH.exists():
-        logger.error("data_splits_nonictal_sampled.json not found at %s. "
-                     "Run create_balanced_splits.py first.", SPLITS_PATH)
+        logger.error("data_splits_nonictal_sampled_filtered.json not found at %s. "
+                     "Pipeline: generate_data_splits.py -> create_balanced_splits.py -> "
+                     "apply_val_test_filter.py. Run apply_val_test_filter.py to produce "
+                     "this manifest.", SPLITS_PATH)
         raise FileNotFoundError(str(SPLITS_PATH))
 
     logger.info("Loading splits from: %s", SPLITS_PATH)
@@ -592,8 +597,11 @@ def run_postprocessing_evaluations(y_true, y_prob, logger):
     row1_metrics["postprocessed"] = False
 
     # -- Find optimal threshold ------------------------------------------------
-    # Always compute fresh from current model predictions.
-    thresh_result = find_optimal_threshold(y_true, y_prob, objective="youden")
+    # Macro F1 selected over Youden's J after the M3 final-eval revealed
+    # Youden picks degenerate low thresholds at this prevalence (~0.27%
+    # ictal): tau* = 0.10 -> F1 = 0.56, precision = 7.4%. Always compute
+    # fresh from current model predictions.
+    thresh_result = find_optimal_threshold(y_true, y_prob, objective="f1")
     optimal_threshold = thresh_result["optimal_threshold"]
     with open(THRESH_PATH, "w", encoding="utf-8") as f:
         json.dump({

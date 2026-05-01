@@ -163,11 +163,14 @@ THREE_ROW_CSV     = OUTPUT_ROOT / "tcn_attention_three_row_summary.csv"
 BACKBONE_PARAMS_PATH = Path("/home/people/22206468/scratch/OUTPUT/MODEL1_OUTPUT/TCNtuning_outputs") / "best_params.json"            # from tcn_HPT_binary.ipynb
 ATTN_PARAMS_PATH     = Path("/home/people/22206468/scratch/OUTPUT/MODEL2_OUTPUT") / "best_attention_params.json"  # from tune_temporal_attention.py
 
-# data_splits.json -- single source of truth (matches all other pipeline scripts)
-# Previous (uniform downsampling): data_splits.json
-# SPLITS_PATH = Path("/scratch/22206468/INPUT_DATA/data_splits_outputs/data_splits.json")
-# Current (proximity-aware downsampling): data_splits_nonictal_sampled.json
-SPLITS_PATH = Path("/scratch/22206468/INPUT_DATA/data_splits_outputs/data_splits_nonictal_sampled.json")
+# Splits manifest -- single source of truth (matches all other pipeline scripts)
+#   Previous (uniform downsampling)             : data_splits.json
+#   Train-side proximity-aware downsampling     : data_splits_nonictal_sampled.json
+#   + val/test filtered (apply_val_test_filter) : data_splits_nonictal_sampled_filtered.json
+# Use the fully-filtered manifest so the |x|>1000 / NaN / Inf criterion is
+# applied uniformly across train, val, and test partitions. Eliminates the
+# FP16-overflow NaN failure mode observed in the M3 final-eval pass.
+SPLITS_PATH = Path("/scratch/22206468/INPUT_DATA/data_splits_outputs/data_splits_nonictal_sampled_filtered.json")
 
 # Backbone attribute prefix in TCNWithAttention (confirmed: self.tcn)
 BACKBONE_ATTR = "tcn"                                  # for parameter counting
@@ -308,7 +311,7 @@ def load_best_params(logger):
 # load_splits
 # ---------------------------------------------------------------------------
 def load_splits(logger):
-    """Load train and val file-label pairs from data_splits_nonictal_sampled.json.
+    """Load train and val file-label pairs from data_splits_nonictal_sampled_filtered.json.
 
     Mirror of TCN.py load_splits() -- no differences. Never loads test pairs.
 
@@ -317,10 +320,10 @@ def load_splits(logger):
     tuple of (train_pairs, val_pairs)
     """
     if not SPLITS_PATH.exists():
-        logger.error("data_splits_nonictal_sampled.json not found at %s. "
-                     "Run create_balanced_splits.py first (which itself "
-                     "requires data_splits.json from generate_data_splits.py).",
-                     SPLITS_PATH)
+        logger.error("data_splits_nonictal_sampled_filtered.json not found at %s. "
+                     "Pipeline: generate_data_splits.py -> create_balanced_splits.py -> "
+                     "apply_val_test_filter.py. Run apply_val_test_filter.py to produce "
+                     "this manifest.", SPLITS_PATH)
         raise FileNotFoundError(str(SPLITS_PATH))
 
     logger.info("Loading splits from: %s", SPLITS_PATH)
@@ -625,12 +628,15 @@ def run_postprocessing_evaluations(y_true, y_prob, logger):
     row1_metrics["threshold"] = 0.5                    # record threshold used
     row1_metrics["postprocessed"] = False               # flag: no post-processing applied
 
-    # -- Find optimal threshold using Youden J statistic ----------------------
-    # Youden J = sensitivity + specificity - 1. Chosen because it treats missed
-    # seizures and false alarms symmetrically and is prevalence-independent.
-    # Always compute fresh from current model predictions — a cached threshold
-    # from a previous run would be stale if the model weights changed.
-    thresh_result = find_optimal_threshold(y_true, y_prob, objective="youden")
+    # -- Find optimal threshold using macro F1 --------------------------------
+    # Macro F1 was selected over Youden's J after the M3 final-eval revealed
+    # that Youden's J picks degenerate low thresholds on this prevalence
+    # (~0.27% ictal): tau* = 0.10 -> F1 = 0.56, precision = 7.4%. F1
+    # weights precision and recall equally and keeps the optimum on the
+    # clinically usable region of the ROC. Always compute fresh from
+    # current model predictions -- a cached threshold from a previous run
+    # would be stale if model weights changed.
+    thresh_result = find_optimal_threshold(y_true, y_prob, objective="f1")
     optimal_threshold = thresh_result["optimal_threshold"]
     with open(THRESH_PATH, "w", encoding="utf-8") as f:
         json.dump({

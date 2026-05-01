@@ -1974,17 +1974,21 @@ def compute_event_level_far(
 def find_optimal_threshold(
         y_true,
         y_prob,
-        objective="youden",
+        objective="f1",
         thresholds=None
 ):
     """Select the optimal classification threshold on the validation set.
 
-    The Youden J statistic (J = sensitivity + specificity - 1) is the
-    recommended objective because it treats sensitivity and specificity
-    symmetrically, penalising missed seizures and false alarms equally.
-    F1, by contrast, weights false negatives more heavily than false
-    positives via the precision term, which may not reflect clinical
-    priorities where both under- and over-detection carry significant cost.
+    Default objective is macro F1. Youden's J (J = sensitivity + specificity - 1)
+    is also supported via objective='youden' but is no longer the default
+    because, on highly imbalanced data (~0.27% ictal in this dataset), the
+    ROC curve has a sharp knee where Youden's J selects very low thresholds
+    that maximise sensitivity at the cost of catastrophic precision loss --
+    e.g., M3 final-eval observed a Youden-optimal tau* = 0.10 that produced
+    F1 = 0.56 with precision = 7.4%, far worse than the default tau = 0.5
+    operating point (F1 = 0.83, precision = 62%). Macro F1 weights precision
+    and recall on equal footing, producing operating points that remain
+    clinically usable at the natural prevalence of seizure detection.
 
     IMPORTANT: This function must only be called on the validation set —
     never on the test set. The returned threshold should be saved to
@@ -1997,8 +2001,10 @@ def find_optimal_threshold(
         Ground-truth binary labels (0 or 1).
     y_prob : array-like, shape (n_samples,)
         Predicted sigmoid probabilities (float in [0, 1]).
-    objective : str, default 'youden'
-        Objective function to maximise: 'youden' or 'f1'.
+    objective : str, default 'f1'
+        Objective function to maximise: 'f1' (macro F1, recommended) or
+        'youden' (sensitivity + specificity - 1, retained for backwards
+        compatibility but degenerate on highly imbalanced data).
     thresholds : array-like or None, default None
         Threshold values to evaluate. If None, uses
         np.linspace(0.1, 0.9, 81) (step = 0.01).
@@ -2013,9 +2019,11 @@ def find_optimal_threshold(
     Example
     -------
     >>> from tcn_utils import find_optimal_threshold
-    >>> opt = find_optimal_threshold(val_true, val_probs, objective='youden')
+    >>> opt = find_optimal_threshold(val_true, val_probs)            # F1 (default)
     >>> print(f"Optimal threshold: {opt['optimal_threshold']}")
-    >>> print(f"Youden J: {opt['youden_j_at_opt']}")
+    >>> print(f"Macro F1 at opt: {opt['optimal_score']}")
+    >>> opt_y = find_optimal_threshold(val_true, val_probs, objective='youden')
+    >>> print(f"Youden J at opt: {opt_y['youden_j_at_opt']}")
     """
     import numpy as np
     from sklearn.metrics import confusion_matrix

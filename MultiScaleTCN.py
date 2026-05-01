@@ -161,11 +161,14 @@ EVAL_REPORT_PATH  = OUTPUT_ROOT / "multiscale_tcn_evaluation_report.json"  # thr
 THRESH_PATH       = OUTPUT_ROOT / "multiscale_tcn_optimal_threshold.json"  # Youden-optimal threshold
 EPOCH_CSV         = OUTPUT_ROOT / "multiscale_tcn_epoch_metrics.csv"     # per-epoch loss, F1, LR
 THREE_ROW_CSV     = OUTPUT_ROOT / "multiscale_tcn_three_row_summary.csv" # paper Table (M3 block)
-# data_splits.json -- single source of truth (matches all other pipeline scripts)
-# Previous (uniform downsampling): data_splits.json
-# SPLITS_PATH         = Path("/scratch/22206468/INPUT_DATA/data_splits_outputs/data_splits.json")
-# Current (proximity-aware downsampling): data_splits_nonictal_sampled.json
-SPLITS_PATH         = Path("/scratch/22206468/INPUT_DATA/data_splits_outputs/data_splits_nonictal_sampled.json")
+# Splits manifest -- single source of truth (matches all other pipeline scripts)
+#   Previous (uniform downsampling)             : data_splits.json
+#   Train-side proximity-aware downsampling     : data_splits_nonictal_sampled.json
+#   + val/test filtered (apply_val_test_filter) : data_splits_nonictal_sampled_filtered.json
+# Use the fully-filtered manifest so the |x|>1000 / NaN / Inf criterion is
+# applied uniformly across train, val, and test partitions. Eliminates the
+# FP16-overflow NaN failure mode observed in the M3 final-eval pass.
+SPLITS_PATH         = Path("/scratch/22206468/INPUT_DATA/data_splits_outputs/data_splits_nonictal_sampled_filtered.json")
 BEST_PARAMS_PATH    = Path("/home/people/22206468/scratch/OUTPUT/MODEL3_OUTPUT/MultiScaleTCNtuning_outputs") / "best_multiscale_params.json"
 
 # Fallback dilation schedules if branch_dilations not in JSON
@@ -279,7 +282,7 @@ def load_best_params(logger):
 # load_splits
 # ---------------------------------------------------------------------------
 def load_splits(logger):
-    """Load train and val file-label pairs from data_splits_nonictal_sampled.json.
+    """Load train and val file-label pairs from data_splits_nonictal_sampled_filtered.json.
 
     Mirror of TCN.py load_splits() -- no differences.
     Never loads test pairs.
@@ -289,10 +292,10 @@ def load_splits(logger):
     tuple of (train_pairs, val_pairs)
     """
     if not SPLITS_PATH.exists():
-        logger.error("data_splits_nonictal_sampled.json not found at %s. "
-                     "Run create_balanced_splits.py first (which itself "
-                     "requires data_splits.json from generate_data_splits.py).",
-                     SPLITS_PATH)
+        logger.error("data_splits_nonictal_sampled_filtered.json not found at %s. "
+                     "Pipeline: generate_data_splits.py -> create_balanced_splits.py -> "
+                     "apply_val_test_filter.py. Run apply_val_test_filter.py to produce "
+                     "this manifest.", SPLITS_PATH)
         raise FileNotFoundError(str(SPLITS_PATH))
 
     logger.info("Loading splits from: %s", SPLITS_PATH)
@@ -581,24 +584,16 @@ def run_postprocessing_evaluations(y_true, y_prob, logger):
     row1_metrics["postprocessed"] = False
 
     # -- Find optimal threshold ------------------------------------------------
-    # Youden J statistic (J = sensitivity + specificity - 1) is chosen as the
-    # threshold selection objective for three reasons:
-    #   1. Symmetry: it penalises missed seizures (low sensitivity) and false
-    #      alarms (low specificity) equally, which matches the clinical priority
-    #      of seizure detection where both under- and over-detection carry cost.
-    #   2. Geometric meaning: J is the vertical distance from the ROC diagonal
-    #      to the operating point, so maximising J selects the point on the ROC
-    #      curve farthest from chance.
-    #   3. Independence from prevalence: unlike F1, J does not depend on the
-    #      positive predictive value, which is inflated or deflated by class
-    #      imbalance. This makes it stable across datasets with different
-    #      seizure-to-background ratios.
-    # The alternative (F1) weights false negatives more heavily than false
-    # positives via the precision term, which may not reflect the clinical
-    # balance required in continuous EEG monitoring.
-    # Always compute fresh from current model predictions — a cached threshold
-    # from a previous run would be stale if the model weights changed.
-    thresh_result = find_optimal_threshold(y_true, y_prob, objective="youden")
+    # Macro F1 is the threshold-selection objective. Youden's J was the
+    # original choice (symmetry between sensitivity and specificity) but
+    # produced degenerate operating points on this dataset's ~0.27% ictal
+    # prevalence: M3 final-eval picked Youden tau* = 0.10, yielding F1 = 0.56
+    # with precision = 7.4% (vs F1 = 0.83, precision = 62% at tau = 0.5).
+    # Macro F1 weights precision and recall on equal footing, which keeps
+    # the optimum on the clinically usable region of the ROC curve. Always
+    # compute fresh from current model predictions -- a cached threshold
+    # from a previous run would be stale if model weights changed.
+    thresh_result = find_optimal_threshold(y_true, y_prob, objective="f1")
     optimal_threshold = thresh_result["optimal_threshold"]
     with open(THRESH_PATH, "w", encoding="utf-8") as f:
         json.dump({
