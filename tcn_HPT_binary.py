@@ -313,22 +313,42 @@ def trial_callback(study, trial):
 
 
 # -- Create study --------------------------------------------------------------
-sampler = TPESampler(seed=SEED, n_startup_trials=N_STARTUP)  # TPE with N_STARTUP random starts
-pruner  = MedianPruner(n_startup_trials=N_STARTUP, n_warmup_steps=3)   # prune below median after epoch 3
-
 # SQLite storage enables resume after crash: re-running the script picks up
 # from the last completed trial. load_if_exists=True loads the existing study
 # if the database already contains one with the same study_name.
 STUDY_DB = OUTPUT_DIR / "tcn_hpt.db"
+STORAGE_URL = "sqlite:///" + str(STUDY_DB.resolve())
+
+# Resume-safety: the TPE sampler's startup phase is a deterministic random
+# sequence governed by `seed`. Across Python sessions, the sampler's RNG
+# state is NOT persisted, so a fresh sampler with the same seed restarts
+# the sequence from position 0. If a tuning run is resumed during the
+# startup phase (n_existing < N_STARTUP), the next proposed trial would
+# duplicate trial 0's hyperparameters, wasting compute on a re-run. We
+# offset the sampler seed by the number of trials already in the storage
+# so each resumption starts the sequence from a fresh position. After the
+# startup phase, TPE samples from storage history and the offset is harmless.
+n_prior = 0
+if STUDY_DB.exists():
+    try:
+        _existing = optuna.load_study(study_name=STUDY_NAME, storage=STORAGE_URL)
+        n_prior = len(_existing.trials)
+    except Exception:
+        n_prior = 0                                    # treat as fresh start
+
+sampler = TPESampler(seed=SEED + n_prior, n_startup_trials=N_STARTUP)
+pruner  = MedianPruner(n_startup_trials=N_STARTUP, n_warmup_steps=3)   # prune below median after epoch 3
+
 study = optuna.create_study(
     study_name=STUDY_NAME,
     direction="maximize",        # maximise validation macro F1
     sampler=sampler,
     pruner=pruner,
-    storage="sqlite:///" + str(STUDY_DB.resolve()),
+    storage=STORAGE_URL,
     load_if_exists=True,
 )
-log.info(f"Optuna storage: {STUDY_DB} | completed trials so far: {len(study.trials)}")
+log.info(f"Optuna storage: {STUDY_DB} | completed trials so far: {len(study.trials)} | "
+         f"sampler seed offset: {n_prior}")
 
 log.info(f"Starting Optuna study: {N_TRIALS} trials, TPE sampler, MedianPruner")
 log.info(f"Training device: {DEVICE.type}")

@@ -936,18 +936,40 @@ def main():
     # SQLite storage enables resume after crash. load_if_exists=True loads
     # the existing study so completed trials are not re-run.
     study_db = OUTPUT_DIR / "tune_temporal_attention.db"
+    storage_url = "sqlite:///" + str(study_db.resolve())
+
+    # Resume-safety: the TPE sampler's startup phase is a deterministic
+    # random sequence governed by `seed`. Across Python sessions, the
+    # sampler's RNG state is NOT persisted, so a fresh sampler with the
+    # same seed restarts the sequence from position 0. If a tuning run
+    # is resumed during the startup phase (n_existing < N_STARTUP), the
+    # next proposed trial would duplicate trial 0's hyperparameters,
+    # wasting compute on a re-run. We offset the sampler seed by the
+    # number of trials already in the storage so each resumption starts
+    # the sequence from a fresh position. After the startup phase, TPE
+    # samples from storage history and the offset is harmless.
+    n_prior = 0
+    if study_db.exists():
+        try:
+            _existing = optuna.load_study(
+                study_name="temporal_attention_tuning", storage=storage_url)
+            n_prior = len(_existing.trials)
+        except Exception:
+            n_prior = 0                                # treat as fresh start
+
     study = optuna.create_study(
         study_name="temporal_attention_tuning",
         direction="maximize",
-        sampler=TPESampler(seed=SEED, n_startup_trials=N_STARTUP),
+        sampler=TPESampler(seed=SEED + n_prior, n_startup_trials=N_STARTUP),
         pruner=MedianPruner(n_startup_trials=N_STARTUP, n_warmup_steps=3),
-        storage="sqlite:///" + str(study_db.resolve()),
+        storage=storage_url,
         load_if_exists=True,
     )
     _prior_completed = sum(
         1 for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE)
-    logger.info("Optuna storage: %s | trials in study: %d (completed: %d)",
-                study_db, len(study.trials), _prior_completed)
+    logger.info("Optuna storage: %s | trials in study: %d (completed: %d) | "
+                "sampler seed offset: %d",
+                study_db, len(study.trials), _prior_completed, n_prior)
 
     logger.info(
         "Starting Optuna study | %d trials | %d random startup",

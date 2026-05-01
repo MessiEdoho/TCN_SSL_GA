@@ -105,7 +105,17 @@ SEED              = 42                                 # global reproducibility 
 # 2018; Yildirim et al., 2020) and balances compute cost against the
 # risk of premature termination when validation F1 plateaus temporarily.
 MAX_EPOCHS        = 100                                # max training epochs (upper bound)
-ES_PATIENCE       = 10                                 # epochs without val F1 improvement before stopping
+ES_PATIENCE       = 15                                 # epochs without val F1 improvement before stopping
+# Min-epochs gate before ES can fire. The cosine schedule (T_max=100) starts
+# almost flat -- by epoch 17 the LR has decayed only ~7% from its initial
+# value. ES firing in this Regime A (high-LR exploration) phase produces
+# under-converged models because the schedule's fine-tuning phase (Regime B,
+# epochs ~30-80, where LR drops below ~50% of initial) is never reached.
+# Setting MIN_EPOCHS_BEFORE_ES = 40 forces training through the high-LR
+# phase unconditionally; ES can only fire from epoch 40 onward, when the
+# LR is at ~36% of its initial value and the model is genuinely fine-tuning.
+# After the gate, ES_PATIENCE = 15 applies as before.
+MIN_EPOCHS_BEFORE_ES = 40                              # ES disabled until this epoch
 GRAD_CLIP         = 1.0                                # maximum gradient norm for clipping (consistent with tuning)
 CHECKPOINT_FREQ   = 5                                  # save periodic checkpoint every N epochs for crash recovery
 KEEP_CKPTS        = 3                                  # disk-space cap: keep only the 3 most recent periodic checkpoints
@@ -1263,6 +1273,7 @@ def main():
     logger.info("  Start epoch : %d", start_epoch)
     logger.info("  Max epochs  : %d", MAX_EPOCHS)
     logger.info("  ES patience : %d", ES_PATIENCE)
+    logger.info("  ES gate     : disabled until epoch %d (Regime B gate)", MIN_EPOCHS_BEFORE_ES)
     logger.info("  Ckpt freq   : every %d", CHECKPOINT_FREQ)
     logger.info("  Mixed prec  : %s", "AMP (FP16)" if use_amp else "FP32")
     logger.info("=" * 65)
@@ -1323,8 +1334,12 @@ def main():
         if epoch % CHECKPOINT_FREQ == 0:
             cleanup_checkpoints(CKPT_DIR, KEEP_CKPTS, logger)
 
-        if epochs_no_imp >= ES_PATIENCE:
-            logger.info("Early stopping at epoch %d.", epoch)
+        # Regime B gate: ES is disabled until epoch >= MIN_EPOCHS_BEFORE_ES so
+        # that the cosine LR schedule reaches the fine-tuning phase before
+        # early termination becomes possible.
+        if epoch >= MIN_EPOCHS_BEFORE_ES and epochs_no_imp >= ES_PATIENCE:
+            logger.info("Early stopping at epoch %d (ES gate open since epoch %d).",
+                        epoch, MIN_EPOCHS_BEFORE_ES)
             break
 
     # -- Step 8: Restore best weights ------------------------------------------
