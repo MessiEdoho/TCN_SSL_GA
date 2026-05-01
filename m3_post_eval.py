@@ -51,11 +51,19 @@ Inputs (paths inherited from MultiScaleTCN.py)
 
 Outputs (under OUTPUT_ROOT = /scratch/.../MODEL3_OUTPUT/MultiScaleTCN/)
 ----------------------------------------------------------------------
-  multiscale_tcn_evaluation_report.json   -- three-row metrics + meta
-  multiscale_tcn_three_row_summary.csv    -- compact tabular form
-  multiscale_tcn_optimal_threshold.json   -- Youden's-J threshold
-  figures/                                -- 13 figures (ROC/PR/...)
-  logs/m3_post_eval.log                   -- persistent log
+  multiscale_tcn_evaluation_report.json    -- three-row metrics + meta
+  multiscale_tcn_three_row_summary.csv     -- compact tabular form
+  multiscale_tcn_optimal_threshold.json    -- F1-optimal threshold
+  multiscale_tcn_predictions_raw.npz       -- y_true, y_prob (insurance copy
+                                              saved immediately after eval)
+  multiscale_tcn_predictions.npz           -- full bundle: y_true, y_prob,
+                                              y_pred_row{1,2,3}, optimal
+                                              threshold, post-processing
+                                              config; load with np.load()
+                                              for offline post-processing
+                                              experimentation
+  figures/                                 -- 13 figures (ROC/PR/...)
+  logs/m3_post_eval.log                    -- persistent log
 
 Usage
 -----
@@ -382,6 +390,26 @@ def main():
     logger.info("Layer 2 caught  : %d segments needed in-loader sanitisation",
                 SafeEEGSegmentDataset.n_sanitised)
 
+    # -- Step 6.5: Save raw y_true and y_prob (insurance) -------------------
+    # Persist the raw arrays IMMEDIATELY after the forward pass and before
+    # any downstream post-processing. If anything later in the pipeline
+    # crashes (e.g., metrics computation, plotting, I/O), the >5-hour FP32
+    # eval is not lost -- post-processing experimentation can resume offline
+    # by loading this file. y_prob is the most valuable artefact: any new
+    # smoothing/refractory/min-duration scheme can be developed and
+    # evaluated against y_true without re-running the model.
+    raw_npz_path = OUTPUT_ROOT / "multiscale_tcn_predictions_raw.npz"
+    np.savez_compressed(
+        raw_npz_path,
+        y_true=y_true.astype(np.int8),                  # binary labels, 4.3M x 1 byte
+        y_prob=y_prob.astype(np.float32),               # raw sigmoid probs, 4.3M x 4 bytes
+        segment_sec=np.float32(SEGMENT_SEC),
+        n_filtered=np.int64(n_val_filtered),
+        n_filter_removed=np.int64(n_filter_removed),
+    )
+    logger.info("Saved raw arrays: %s (%.2f MB)",
+                raw_npz_path, raw_npz_path.stat().st_size / 1e6)
+
     # -- Step 7: Three-row post-processing ----------------------------------
     logger.info("-" * 65)
     logger.info("Step 7: Run three-row post-processing evaluation")
@@ -396,6 +424,33 @@ def main():
     y_pred_row1 = (y_prob >= 0.5).astype(int)
     y_pred_row2 = post_row2["smoothed_preds"]
     y_pred_row3 = post_row3["smoothed_preds"]
+
+    # -- Step 8a: Save comprehensive predictions bundle ---------------------
+    # One npz containing everything a post-processing study needs:
+    #   y_true, y_prob -- for any new threshold / smoothing technique
+    #   y_pred_row{1,2,3} -- so the three published rows can be recomputed
+    #                        without re-running post-processing
+    #   optimal_threshold -- F1-optimal tau* used for Row 3
+    # See multiscale_tcn_predictions_raw.npz for the insurance copy of just
+    # y_true and y_prob saved immediately after the eval pass.
+    bundle_npz_path = OUTPUT_ROOT / "multiscale_tcn_predictions.npz"
+    np.savez_compressed(
+        bundle_npz_path,
+        y_true=y_true.astype(np.int8),
+        y_prob=y_prob.astype(np.float32),
+        y_pred_row1=y_pred_row1.astype(np.int8),
+        y_pred_row2=y_pred_row2.astype(np.int8),
+        y_pred_row3=y_pred_row3.astype(np.int8),
+        optimal_threshold=np.float32(optimal_threshold),
+        segment_sec=np.float32(SEGMENT_SEC),
+        smoothing_win=np.int64(SMOOTHING_WIN),
+        refractory_sec=np.float32(REFRACTORY_SEC),
+        min_event_sec=np.float32(MIN_EVENT_SEC),
+        threshold_objective=np.array("f1", dtype="U8"),
+        n_segments=np.int64(len(y_true)),
+    )
+    logger.info("Saved predictions bundle: %s (%.2f MB)",
+                bundle_npz_path, bundle_npz_path.stat().st_size / 1e6)
 
     # The original training run's per-epoch history was lost when the post-
     # processing crashed. The SLURM .out file documents the trajectory; here
