@@ -20,10 +20,15 @@ This script re-runs the full-validation pass and the entire post-
 processing pipeline using the saved final weights, with FOUR layered
 protections so the failure cannot recur:
 
-  Layer 1 -- input filter:
-    filter_extreme_segments(val_pairs, threshold=1000.0) is applied
-    after load_splits() so that no segment with |x| > 1000 reaches
-    the model.
+  Layer 1 -- input filter (manifest-level):
+    Extreme-amplitude (|x| > 1000) and NaN/Inf segments are removed
+    from val/test by apply_val_test_filter.py as a one-shot upstream
+    pipeline step. This script verifies at startup that the loaded
+    manifest's meta.filter_history block records that step; if absent,
+    the script fails loudly to prevent silently running on unfiltered
+    data. Pre-Option-A versions of this script ran the filter inline
+    (~2 h per re-run); the manifest-level move keeps the same
+    protection while reducing wall time.
 
   Layer 2 -- dataset hardening (defence-in-depth):
     SafeEEGSegmentDataset replaces NaN/Inf with 0.0 via np.nan_to_num
@@ -74,6 +79,7 @@ python m3_post_eval.py
 # Imports
 # ---------------------------------------------------------------------------
 import datetime
+import json
 import logging
 import sys
 import time
@@ -101,8 +107,7 @@ from MultiScaleTCN import (
     run_postprocessing_evaluations, save_all_results, plot_all_figures,
 )
 from tcn_utils import (
-    set_seed, count_parameters, filter_extreme_segments,
-    EEGSegmentDataset,
+    set_seed, count_parameters, EEGSegmentDataset,
 )
 
 
@@ -191,6 +196,63 @@ class SafeEEGSegmentDataset(EEGSegmentDataset):
         x = torch.from_numpy(x).unsqueeze(0)            # (1, segment_len)
         y = torch.tensor(label, dtype=torch.float32)
         return x, y
+
+
+def verify_manifest_filtered(splits_path, logger):
+    """Verify the manifest's meta block records an apply_val_test_filter step.
+
+    Layer 1 protection lives at the manifest level: apply_val_test_filter.py
+    is the single upstream pipeline step that scrubs the val and test
+    partitions of segments with NaN/Inf values or |x| > 1000. This function
+    reads the manifest's meta.filter_history block and confirms that step
+    was run, returning the recorded statistics for downstream logging and
+    npz audit trail.
+
+    Fails loudly (sys.exit(1)) if the entry is missing -- this prevents
+    silently running on an unfiltered manifest, which would re-introduce
+    the FP16 overflow / NaN failure mode the four-layer protection was
+    designed to eliminate.
+
+    Returns
+    -------
+    dict
+        Keys: 'step', 'timestamp', 'threshold', 'val_after', 'val_removed'.
+        Values come from the matching entry in meta.filter_history.
+    """
+    with open(splits_path, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+    meta = manifest.get("meta", {}) or {}
+    filter_history = meta.get("filter_history", []) or []
+
+    apply_step = None
+    for step in filter_history:
+        if step.get("step") == "apply_val_test_filter":
+            apply_step = step
+            break
+
+    if apply_step is None:
+        logger.error(
+            "Layer 1 verification FAILED: manifest %s does not record an "
+            "'apply_val_test_filter' step in meta.filter_history. Run "
+            "apply_val_test_filter.py first to produce a properly filtered "
+            "manifest, or point SPLITS_PATH at a manifest that records this "
+            "filtering step.", splits_path)
+        sys.exit(1)
+
+    val_block = apply_step.get("val") or {}
+    info = {
+        "step": apply_step.get("step", "apply_val_test_filter"),
+        "timestamp": apply_step.get("timestamp", "unknown"),
+        "threshold": float(apply_step.get("threshold", AMPLITUDE_THRESHOLD)),
+        "val_after": int(val_block.get("after", 0)),
+        "val_removed": int(val_block.get("removed", 0)),
+    }
+    logger.info(
+        "Layer 1 verification PASSED: manifest filtered by %s at %s "
+        "(threshold=%.1f). Val: %d retained, %d removed.",
+        info["step"], info["timestamp"], info["threshold"],
+        info["val_after"], info["val_removed"])
+    return info
 
 
 def make_safe_loader(file_label_pairs, batch_size, device,
@@ -315,7 +377,8 @@ def main():
     logger.info("Splits          : %s", SPLITS_PATH)
     logger.info("Output dir      : %s", OUTPUT_ROOT)
     logger.info("Eval log path   : %s", EVAL_LOG_PATH)
-    logger.info("Layer 1 (filter): threshold=%.1f", AMPLITUDE_THRESHOLD)
+    logger.info("Layer 1 (filter): manifest-level (apply_val_test_filter) -- "
+                "verified at startup")
     logger.info("Layer 2 (dataset): SafeEEGSegmentDataset (nan_to_num + clip)")
     logger.info("Layer 3 (FP32)  : use_amp=%s", USE_AMP_FOR_EVAL)
     logger.info("Layer 4 (assert): torch.isfinite(logits).all() per batch")
@@ -356,18 +419,18 @@ def main():
     n_val_raw = len(val_pairs)
     logger.info("Raw val pairs   : %d", n_val_raw)
 
-    # -- Step 4: Layer 1 -- filter extreme segments -------------------------
+    # -- Step 4: Layer 1 -- verify manifest was filtered upstream -----------
+    # Layer 1 (extreme-segment removal) now lives in apply_val_test_filter.py
+    # as a one-shot pipeline step. We verify here that the loaded manifest
+    # records that step in its meta.filter_history block. This replaces the
+    # ~2-hour inline filter scan with a ~1-second metadata check while
+    # preserving the same protection level: if the manifest was not produced
+    # by apply_val_test_filter.py, the script fails loudly rather than
+    # silently running on potentially-unfiltered data.
     logger.info("-" * 65)
-    logger.info("Step 4: Layer 1 -- filter_extreme_segments(threshold=%.1f)",
-                AMPLITUDE_THRESHOLD)
-    t0 = time.time()
-    val_pairs = filter_extreme_segments(
-        val_pairs, threshold=AMPLITUDE_THRESHOLD, logger=logger)
-    n_val_filtered = len(val_pairs)
-    n_filter_removed = n_val_raw - n_val_filtered
-    logger.info("Filtered val    : %d  (%d removed in %.1f s | %.4f%%)",
-                n_val_filtered, n_filter_removed, time.time() - t0,
-                100 * n_filter_removed / max(n_val_raw, 1))
+    logger.info("Step 4: Layer 1 -- verify manifest filter (metadata check)")
+    manifest_filter = verify_manifest_filtered(SPLITS_PATH, logger)
+    n_val_segments = len(val_pairs)        # already filtered at manifest step
 
     # -- Step 5: Layer 2 -- hardened DataLoader -----------------------------
     logger.info("-" * 65)
@@ -404,8 +467,12 @@ def main():
         y_true=y_true.astype(np.int8),                  # binary labels, 4.3M x 1 byte
         y_prob=y_prob.astype(np.float32),               # raw sigmoid probs, 4.3M x 4 bytes
         segment_sec=np.float32(SEGMENT_SEC),
-        n_filtered=np.int64(n_val_filtered),
-        n_filter_removed=np.int64(n_filter_removed),
+        n_segments=np.int64(n_val_segments),
+        manifest_filter_step=np.array(manifest_filter["step"], dtype="U64"),
+        manifest_filter_timestamp=np.array(manifest_filter["timestamp"], dtype="U32"),
+        manifest_filter_threshold=np.float32(manifest_filter["threshold"]),
+        manifest_val_after=np.int64(manifest_filter["val_after"]),
+        manifest_val_removed=np.int64(manifest_filter["val_removed"]),
     )
     logger.info("Saved raw arrays: %s (%.2f MB)",
                 raw_npz_path, raw_npz_path.stat().st_size / 1e6)
@@ -448,6 +515,13 @@ def main():
         min_event_sec=np.float32(MIN_EVENT_SEC),
         threshold_objective=np.array("f1", dtype="U8"),
         n_segments=np.int64(len(y_true)),
+        # Manifest-level Layer 1 audit trail (no inline filter; verified
+        # against meta.filter_history at startup)
+        manifest_filter_step=np.array(manifest_filter["step"], dtype="U64"),
+        manifest_filter_timestamp=np.array(manifest_filter["timestamp"], dtype="U32"),
+        manifest_filter_threshold=np.float32(manifest_filter["threshold"]),
+        manifest_val_after=np.int64(manifest_filter["val_after"]),
+        manifest_val_removed=np.int64(manifest_filter["val_removed"]),
     )
     logger.info("Saved predictions bundle: %s (%.2f MB)",
                 bundle_npz_path, bundle_npz_path.stat().st_size / 1e6)
@@ -479,11 +553,13 @@ def main():
     # -- Final summary ------------------------------------------------------
     logger.info("=" * 65)
     logger.info("M3 POST-EVAL COMPLETE")
-    logger.info("  Val pairs (raw)        : %d", n_val_raw)
-    logger.info("  Val pairs (post-filter): %d", n_val_filtered)
-    logger.info("  Layer 1 removed        : %d (%.4f%%)",
-                n_filter_removed, 100 * n_filter_removed / max(n_val_raw, 1))
-    logger.info("  Layer 2 sanitised      : %d (in-loader, post-filter)",
+    logger.info("  Val pairs (manifest)   : %d", n_val_segments)
+    logger.info("  Layer 1 (manifest)     : %s @ %s | threshold=%.1f | "
+                "val %d retained / %d removed",
+                manifest_filter["step"], manifest_filter["timestamp"],
+                manifest_filter["threshold"],
+                manifest_filter["val_after"], manifest_filter["val_removed"])
+    logger.info("  Layer 2 sanitised      : %d (in-loader, defence-in-depth)",
                 SafeEEGSegmentDataset.n_sanitised)
     logger.info("  Layer 3 (FP32 eval)    : enabled (use_amp=%s)", USE_AMP_FOR_EVAL)
     logger.info("  Layer 4 (assert)       : never fired => all logits finite")

@@ -22,6 +22,12 @@
 # Lustre/GPFS I/O.
 #SBATCH -t 3-00:00:00
 
+# SLURM stdout / stderr routed to the home directory (NOT under any
+# individual output folder). %j expands to the job ID at submission time
+# so re-runs do not overwrite each other.
+#SBATCH --output=/home/people/22206468/slurm-m3_post_eval-%j.out
+##SBATCH --error=/home/people/22206468/slurm-m3_post_eval-%j.err
+
 # Email notifications at start, end, and failure
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=mercy.edoho@ucdconnect.ie
