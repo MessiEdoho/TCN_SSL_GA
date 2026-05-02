@@ -642,8 +642,15 @@ def run_postprocessing_evaluations(y_true, y_prob, logger):
         step_sec=STEP_SEC, segment_len_sec=SEGMENT_SEC)
 
     y_pred_row2 = post_row2["smoothed_preds"]
-    row2_metrics = compute_all_metrics(y_true, y_pred_row2, y_prob, SEGMENT_SEC, logger,
-                                       label="Row2_postproc_0.5")
+    # Pass smoothed_probs so AUROC and PRAUC reflect the post-processed pipeline.
+    # Stage 1 of post-processing applies a moving-average smoothing kernel to
+    # y_prob (window = SMOOTHING_WIN); the smoothed continuous probabilities
+    # are what the threshold is applied to. Reporting AUROC/PRAUC on raw
+    # y_prob would understate the effective discrimination of the deployed
+    # system because the smoothing reduces single-segment noise spikes.
+    row2_metrics = compute_all_metrics(
+        y_true, y_pred_row2, post_row2["smoothed_probs"], SEGMENT_SEC, logger,
+        label="Row2_postproc_0.5")
     row2_metrics["threshold"] = 0.5
     row2_metrics["postprocessed"] = True
     row2_metrics["far_per_hour_event"] = round(float(far_row2["far_per_hour"]), 6)
@@ -662,8 +669,11 @@ def run_postprocessing_evaluations(y_true, y_prob, logger):
         step_sec=STEP_SEC, segment_len_sec=SEGMENT_SEC)
 
     y_pred_row3 = post_row3["smoothed_preds"]
-    row3_metrics = compute_all_metrics(y_true, y_pred_row3, y_prob, SEGMENT_SEC, logger,
-                                       label="Row3_postproc_opt%.3f" % optimal_threshold)
+    # See Row 2 comment above: AUROC/PRAUC are computed on smoothed_probs so
+    # they reflect the post-processed pipeline's continuous score.
+    row3_metrics = compute_all_metrics(
+        y_true, y_pred_row3, post_row3["smoothed_probs"], SEGMENT_SEC, logger,
+        label="Row3_postproc_opt%.3f" % optimal_threshold)
     row3_metrics["threshold"] = optimal_threshold
     row3_metrics["postprocessed"] = True
     row3_metrics["far_per_hour_event"] = round(float(far_row3["far_per_hour"]), 6)
@@ -704,9 +714,9 @@ def save_all_results(history, row1_metrics, row2_metrics, row3_metrics,
         "attention_hyperparameters": attn_hp,
         "backbone_params_source": str(BACKBONE_PARAMS_PATH),
         "attention_params_source": str(ATTN_PARAMS_PATH),
-        "training_note": ("All parameters (backbone + attention) trained jointly for 100 epochs. "
-                          "Backbone was frozen only during attention tuning "
-                          "(tune_multiscale_attention.py), not during this final training run."),
+        "training_note": ("All parameters (backbone + attention) trained jointly end-to-end for "
+                          "100 epochs. Tuning (tune_multiscale_attention.py) is also end-to-end "
+                          "with backbone architecture HPs fixed from best_multiscale_params.json."),
         "branch_receptive_fields": branch_rfs,
         "trainable_params": n_params,
         "device": str(device),
@@ -795,12 +805,23 @@ def save_all_results(history, row1_metrics, row2_metrics, row3_metrics,
     logger.info("Saved: %s", THREE_ROW_CSV)
 
     # -- e. Per-row classification reports -------------------------------------
-    for y_pred_row, row_label in [
-        (y_pred_row1, "row1"), (y_pred_row2, "row2"), (y_pred_row3, "row3"),
+    # The base sklearn report covers per-class precision/recall/F1/support and
+    # macro/weighted averages. We augment it with three top-level keys --
+    # auroc, prauc, specificity -- so each row's JSON is self-contained and a
+    # reader does not need to cross-reference the three-row CSV. For Row 2 and
+    # Row 3, AUROC/PRAUC reflect the post-processing-smoothed continuous score
+    # (see run_postprocessing_evaluations comment).
+    for y_pred_row, row_metrics, row_label in [
+        (y_pred_row1, row1_metrics, "row1"),
+        (y_pred_row2, row2_metrics, "row2"),
+        (y_pred_row3, row3_metrics, "row3"),
     ]:
         report_dict = classification_report(
             y_true, y_pred_row, target_names=["Non-ictal", "Ictal"],
             output_dict=True, zero_division=0)
+        report_dict["auroc"]       = row_metrics.get("auroc")
+        report_dict["prauc"]       = row_metrics.get("average_precision")
+        report_dict["specificity"] = row_metrics.get("specificity")
         rpath = OUTPUT_ROOT / ("ms_attn_classification_report_%s.json" % row_label)
         with open(rpath, "w", encoding="utf-8") as f:
             json.dump(report_dict, f, indent=2)

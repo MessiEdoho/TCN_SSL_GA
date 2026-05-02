@@ -33,14 +33,16 @@ Falkner, S., Klein, A., & Hutter, F. (2018). BOHB: Robust and Efficient
     Hyperparameter Optimization at Scale. ICML 2018.
 Mattson, P. et al. (2020). MLPerf Training Benchmark. MLSys 2020.
 
-The TCN backbone hyperparameters (architecture, not weights)
-are inherited from M1's tuning study (best_params.json) and
-held fixed during this search. The backbone is instantiated
-with these inherited hyperparameters and made non-trainable
-for the duration of tuning. Only the temporal attention module
-and classification head receive gradient updates during each
-trial. Holding the backbone non-trainable during tuning is a
-search-efficiency choice, not an ablation device; the M1 vs M2
+The TCN backbone *hyperparameters* (architecture only -- not
+trained weights) are inherited from M1's tuning study
+(best_params.json) and held fixed during this search. The
+backbone is instantiated from those hyperparameters with
+random weights and trained end-to-end alongside the attention
+module in every trial: no parameters are frozen, and no prior
+.pt checkpoint is loaded. Restricting the Optuna search space
+to attention and standard training hyperparameters keeps
+optimisation tractable in N_TRIALS while still allowing proper
+feature learning across the whole network. The M1 vs M2
 ablation comparison itself is performed at the final-training
 stage (TCNTemporalAttention.py), where both models are trained
 from scratch under an identical protocol -- see STUDY_REPORT.txt
@@ -190,10 +192,6 @@ WD_MIN            = 1e-5                               # weight decay lower boun
 WD_MAX            = 1e-3                               # weight decay upper bound
 BATCH_CHOICES     = [16, 32, 64]                       # batch size candidates (powers of 2)
 
-# TCN backbone attribute prefix in TCNWithAttention (confirmed from tcn_utils.py)
-# TCNWithAttention stores its backbone as self.tcn = nn.Sequential(...)
-BACKBONE_PREFIX = "tcn."
-
 
 # ---------------------------------------------------------------------------
 # setup_logging
@@ -238,8 +236,10 @@ def setup_logging():
 def load_best_tcn_params(logger):
     """Load the best TCN hyperparameters from outputs/best_params.json.
 
-    These parameters define the frozen TCN backbone and must not be
-    included in the Optuna search space.
+    These hyperparameters define the TCN backbone architecture only. They
+    are held fixed for every trial (not searched), but the backbone weights
+    are initialised randomly and trained end-to-end alongside the attention
+    module in each trial -- no .pt checkpoint is loaded.
 
     Parameters
     ----------
@@ -354,21 +354,21 @@ def load_splits(logger):
 def optuna_objective(trial, train_pairs, val_pairs, tcn_hp, device, logger):
     """Optuna objective function for temporal attention tuning.
 
-    The TCN backbone is instantiated with fixed parameters from tcn_hp
-    and its weights are frozen immediately after the model is moved to
-    device. Only the temporal attention parameters (attention_fc,
-    attention_v, attention_drop, classifier head) receive gradient updates.
+    The TCN backbone is instantiated from tcn_hp (architecture only) with
+    random weights and trained end-to-end alongside the attention module.
+    No parameters are frozen and no prior checkpoint is loaded. Only
+    attention and standard training hyperparameters are sampled by Optuna.
 
     Sampled hyperparameters:
       Architecture (attention-specific):
         attention_dim     : categorical [32, 64, 128]
         attention_dropout : float [0.0, 0.4] step 0.05
-      Training (for attention + head params only):
+      Training:
         learning_rate     : float [1e-4, 1e-2] log scale
         weight_decay      : float [1e-5, 1e-3] log scale
         batch_size        : categorical [16, 32, 64]
 
-    Fixed parameters (TCN backbone -- not sampled):
+    Fixed parameters (TCN backbone architecture -- not sampled):
         num_layers, num_filters, kernel_size, dropout
 
     Parameters
@@ -425,24 +425,12 @@ def optuna_objective(trial, train_pairs, val_pairs, tcn_hp, device, logger):
         )
         model = model.to(device)
 
-        # -- d. Freeze TCN backbone parameters ---------------------------------
-        # TCNWithAttention stores the backbone as self.tcn (nn.Sequential)
-        # All parameters with names starting with "tcn." belong to the backbone
-        for name, param in model.named_parameters():
-            if name.startswith(BACKBONE_PREFIX):
-                param.requires_grad = False                 # freeze backbone weights
-
-        # Log parameter audit on first trial to confirm freezing worked
+        # -- d. Parameter audit on first trial ---------------------------------
+        # All parameters (backbone + attention + head) are trainable.
         if trial.number == 0:
-            n_frozen = sum(
-                p.numel() for p in model.parameters()
-                if not p.requires_grad)
-            n_trainable = sum(
-                p.numel() for p in model.parameters()
-                if p.requires_grad)
+            n_trainable = sum(p.numel() for p in model.parameters())
             logger.info("Trial 0 -- parameter audit:")
-            logger.info("  Frozen    : %s", f"{n_frozen:,}")
-            logger.info("  Trainable : %s", f"{n_trainable:,}")
+            logger.info("  Trainable (end-to-end) : %s", f"{n_trainable:,}")
 
         # -- e. Log trial header with all sampled hyperparameters --------------
         n_params = count_parameters(model)
@@ -459,12 +447,9 @@ def optuna_objective(trial, train_pairs, val_pairs, tcn_hp, device, logger):
             val_pairs, batch_size=batch_size,
             train=False, device=device)
 
-        # -- g. Build optimiser on trainable parameters only -------------------
-        trainable_params = [
-            p for p in model.parameters()
-            if p.requires_grad]                             # excludes frozen backbone
+        # -- g. Build optimiser on all parameters (end-to-end training) --------
         optimiser = torch.optim.AdamW(
-            trainable_params,
+            model.parameters(),
             lr=learning_rate,
             weight_decay=weight_decay)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -854,7 +839,8 @@ def main():
     logger.info("tune_temporal_attention.py")
     logger.info("Timestamp       : %s", datetime.datetime.now().isoformat())
     logger.info("Ablation role   : M2 -- TCN + Temporal Attention")
-    logger.info("Params source   : best_params.json (backbone, frozen)")
+    logger.info("Params source   : best_params.json (backbone HPs fixed; "
+                "weights trained end-to-end)")
     logger.info("Purpose         : Tune attention HPs (no final model)")
     logger.info("N_TRIALS        : %d%s", N_TRIALS, "  [DRY-RUN]" if DRY_RUN else "")
     logger.info("MAX_EPOCHS      : %d", MAX_EPOCHS)
@@ -1094,27 +1080,21 @@ if __name__ == "__main__":
 #   Optimiser     : AdamW with CosineAnnealingLR (eta_min = lr * 0.01)
 #   Mixed precision : AMP FP16 on CUDA, FP32 fallback on CPU
 #
-# Backbone-freezing protocol (Methods)
-# ------------------------------------
-# The TCN backbone weights are inherited unchanged from M1's Optuna
-# search and held frozen throughout M2 hyperparameter tuning: every
-# parameter whose name starts with "tcn." (i.e. every parameter in
-# the backbone nn.Sequential) has requires_grad set to False before
-# the optimiser is constructed. The optimiser is built over the
-# complement set -- attention_fc, attention_v, attention_drop, and
-# the classification head -- so only attention-side parameters
-# receive gradient updates during the 50 Optuna trials. This enforces
-# ablation integrity: because M1 and M2 share an identical backbone
-# (same architecture AND same hyperparameters), the tuning signal
-# reflects only the contribution of temporal attention. The backbone
-# is unfrozen for final model training (see STUDY_REPORT.txt
-# Section 7.6.7), where backbone and attention are co-adapted
-# end-to-end.
-#
-# No batch-norm / running-stat concern:
-#   CausalConvBlock uses nn.LayerNorm, not BatchNorm1d. LayerNorm
-#   has no running statistics, so requires_grad=False is sufficient
-#   to freeze the backbone; there is no need to call self.tcn.eval().
+# Backbone protocol (Methods)
+# ---------------------------
+# The TCN backbone *architecture hyperparameters* (num_layers, num_filters,
+# kernel_size, dropout) are inherited unchanged from M1's Optuna search
+# (best_params.json) and held fixed across all M2 trials. Backbone
+# *weights*, however, are NOT loaded from any prior checkpoint: every
+# trial initialises the full TCNWithAttention model with random weights
+# (set_seed(SEED) for reproducibility) and trains all parameters --
+# backbone, attention (attention_fc, attention_v, attention_drop), and
+# classification head -- end-to-end through AdamW. The Optuna search
+# space is restricted to attention-side hyperparameters (attention_dim,
+# attention_dropout) and standard training hyperparameters (learning_rate,
+# weight_decay, batch_size). This keeps the search tractable in N_TRIALS
+# while letting the backbone weights co-adapt with the attention module
+# in every trial.
 #
 # Interpretability note (Results)
 # -------------------------------

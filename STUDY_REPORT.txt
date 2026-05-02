@@ -721,9 +721,17 @@ Hyperparameters were optimised using the Tree-structured Parzen
 Estimator (TPE) algorithm implemented in Optuna (Akiba et al., 2019).
 A two-stage tuning strategy was employed: backbone architectural and
 training hyperparameters were tuned first, and attention-specific
-hyperparameters were tuned subsequently with the backbone weights
-frozen. This sequential design ensures that the M1-vs-M2 and M3-vs-M4
-ablation comparisons share identical backbone configurations.
+hyperparameters were tuned subsequently with the backbone architecture
+hyperparameters held fixed at the values selected by the first stage.
+Backbone weights were not transferred between stages: every Optuna
+trial in the attention-tuning stage initialised the full network with
+random weights and trained all parameters end-to-end (no freezing, no
+checkpoint load). Restricting the search space to attention and
+training hyperparameters keeps the second stage tractable while
+allowing the backbone to co-adapt with the attention module in every
+trial. This sequential design ensures that the M1-vs-M2 and M3-vs-M4
+ablation comparisons share identical backbone architecture
+configurations.
 
 7.1 Common tuning protocol
 
@@ -1094,20 +1102,23 @@ ablation comparisons share identical backbone configurations.
     study (best_params.json) -- specifically num_layers, num_filters,
     kernel_size, and dropout -- and held fixed during M2's attention
     hyperparameter search. The backbone is instantiated with these
-    inherited hyperparameters and its parameters are made
-    non-trainable for the duration of tuning. Only the temporal
-    attention module and classification head receive gradient updates
-    during each trial.
+    inherited architectural hyperparameters and random weights at the
+    start of every trial, and the entire network (backbone + attention
+    + classification head) is trained end-to-end through AdamW. No
+    parameters are frozen and no prior backbone checkpoint is loaded.
+    Only attention-related and standard training hyperparameters are
+    sampled by Optuna; the backbone architecture hyperparameters are
+    not part of the search space.
 
-    Holding the backbone non-trainable during attention tuning is a
-    search-efficiency choice, not an ablation device. It reduces the
-    trainable parameter count from the full model (~80K-200K) to the
-    attention module alone (~4K-10K), allowing the 50-trial Optuna
-    budget to converge more efficiently on attention-specific
-    hyperparameters, and it eliminates the risk that aggressive
-    attention learning rates destabilise the convolutional feature
-    extractor during a search where backbone state is irrelevant to
-    the question being answered.
+    Restricting the Optuna search space to attention and training
+    hyperparameters is a search-efficiency choice, not an ablation
+    device. It reduces the dimensionality of the search from the
+    full M1+attention space to five hyperparameters
+    (attention_dim, attention_dropout, learning_rate, weight_decay,
+    batch_size), allowing the 50-trial budget to converge more
+    efficiently on attention-specific configurations, while leaving
+    every trainable weight free to adapt to the attention mechanism
+    in each trial.
 
     The M1 vs M2 ablation comparison itself takes place at the
     final-training stage (Section 7.6), not at the tuning stage.
@@ -1128,11 +1139,14 @@ ablation comparisons share identical backbone configurations.
 
     Table 4. M2 (TCN + Temporal Attention) hyperparameter search space.
 
-    FROZEN (from M1 best_params.json -- not tuned)
-    -----------------------------------------------
+    FIXED (from M1 best_params.json -- not searched; weights random-init each trial)
+    --------------------------------------------------------------------------------
     num_layers, num_filters, kernel_size, dropout
     These four architectural hyperparameters are inherited from M1
-    to preserve the controlled ablation design (see above).
+    to preserve the controlled ablation design (see above). The
+    associated weights are NOT loaded from any M1 checkpoint --
+    every Optuna trial trains the full network end-to-end from a
+    fresh random initialisation.
 
     TUNED: ARCHITECTURAL (attention module)
     Hyperparameter        Type          Range / Choices    Justification
@@ -1189,26 +1203,25 @@ ablation comparisons share identical backbone configurations.
                                                            parameters.
 
     batch_size            Categorical   {16, 32, 64}      Includes 16 (absent
-                                                           from M1) because
-                                                           the frozen backbone
-                                                           reduces per-sample
-                                                           gradient cost,
-                                                           making smaller
-                                                           batches with
-                                                           noisier gradients
-                                                           computationally
-                                                           feasible.
+                                                           from M1) to allow
+                                                           the search to
+                                                           explore noisier
+                                                           per-step gradient
+                                                           regimes that may
+                                                           benefit the
+                                                           attention module's
+                                                           training dynamics.
 
     The two architectural hyperparameters (attention_dim,
     attention_dropout) define the capacity and regularisation of
     the temporal attention mechanism, while the three training
     hyperparameters (learning_rate, weight_decay, batch_size)
-    govern the optimisation of the attention weights. Only five
-    hyperparameters are tuned (versus seven for M1), reflecting
-    the reduced search space after backbone freezing. The same
-    partitioning applies to M4 (Section 7.5), which tunes the
-    identical five attention and training hyperparameters over the
-    Multi-Scale TCN backbone.
+    govern the optimisation of the full end-to-end network in each
+    trial. Only five hyperparameters are tuned (versus seven for M1),
+    reflecting the reduced search space after backbone architecture
+    HPs are inherited from M1. The same partitioning applies to M4
+    (Section 7.5), which tunes the identical five attention and
+    training hyperparameters over the Multi-Scale TCN backbone.
 
 7.4 M3: Multi-Scale TCN hyperparameter search space
 
@@ -1365,15 +1378,19 @@ ablation comparisons share identical backbone configurations.
     M3's tuning study (best_multiscale_params.json) -- specifically
     num_filters, kernel_size, dropout, fusion strategy, and the three
     branch dilation schedules -- and held fixed during M4's attention
-    hyperparameter search. The backbone is held non-trainable during
-    tuning for the search-efficiency reasons given in Section 7.3.
-    Only the temporal attention module and classification head
-    receive gradient updates during each trial. The M3 vs M4
+    hyperparameter search. As in M2 (Section 7.3), the backbone is
+    instantiated with these inherited architectural hyperparameters
+    and random weights at the start of every trial, and the entire
+    network is trained end-to-end. No parameters are frozen and no
+    prior backbone checkpoint is loaded. Only attention and standard
+    training hyperparameters are sampled by Optuna. The M3 vs M4
     ablation comparison itself takes place at the final-training
     stage (Section 7.6) under the protocol described in Section 7.3.
 
-    Frozen from M3           Tuned (attention only)
-    ----------------------   -----------------------------------------
+    Fixed from M3 (not       Tuned (attention + training)
+    searched; weights        ----------------------------------------
+    random-init per trial)
+    ----------------------
     num_filters              attention_dim:     {32, 64, 128}
     kernel_size              attention_dropout: [0.00, 0.40], step 0.05
     dropout                  learning_rate:     [1e-4, 1e-2]  (log)
@@ -1675,20 +1692,26 @@ ablation comparisons share identical backbone configurations.
     training and for the post-training weight-restoration sanity
     check; it does not appear in any reported number.
 
-7.6.7 Joint training for attention models (M2, M4)
+7.6.7 End-to-end training for attention models (M2, M4)
 
-    During hyperparameter tuning of M2 and M4 (Sections 7.3, 7.5),
-    the backbone was held non-trainable to reduce the Optuna search
-    space to attention-specific parameters. During final model
-    training, the entire parameter set -- both backbone and
-    attention -- is unfrozen and updated jointly from a fresh random
-    initialisation. This is the standard training regimen for
-    attention-augmented convolutional networks in the action-
-    recognition and medical-imaging literature, and it allows the
-    attention module and backbone to co-adapt end-to-end at the
-    full representational capacity of the model.
+    Both Optuna tuning (Sections 7.3, 7.5) and final training of
+    M2 and M4 use end-to-end training: the entire parameter set --
+    backbone and attention -- is initialised randomly and updated
+    jointly through AdamW. No parameters are frozen and no prior
+    backbone checkpoint is loaded at any stage. The only difference
+    between tuning and final training is the search space and the
+    training budget: tuning samples the five attention/training
+    hyperparameters across N_TRIALS = 50 with MAX_EPOCHS = 20 and
+    early-stopping patience 5, whereas final training applies the
+    best-trial values for MAX_EPOCHS = 100 with patience 15.
 
-    Joint training is also what makes the ablation comparison
+    End-to-end training is the standard regimen for attention-
+    augmented convolutional networks in the action-recognition and
+    medical-imaging literature; it allows the attention module and
+    backbone to co-adapt at the full representational capacity of
+    the model.
+
+    End-to-end training is also what makes the ablation comparison
     meaningful for this study. The research question targeted by
     M1 vs M2 (and equivalently M3 vs M4) is whether the
     architecture as a whole -- backbone plus attention versus
@@ -1848,6 +1871,36 @@ ablation comparisons share identical backbone configurations.
     configuration used for all inter-model comparisons in the
     ablation analysis.
 
+    Per-row score for AUROC and PRAUC. Threshold-independent metrics
+    (AUROC and PRAUC) require a continuous score. For Row 1 the
+    continuous score is the raw post-sigmoid probability y_prob from
+    the model. For Row 2 and Row 3 the continuous score is the
+    post-processing-smoothed probability y_prob_smoothed produced by
+    Stage 1 of the post-processing pipeline (a moving-average kernel
+    of width SMOOTHING_WIN = 3 segments applied to y_prob, see
+    Section 7.6.9). The smoothed score is the same continuous quantity
+    that the threshold tau is applied to, so reporting AUROC/PRAUC on
+    y_prob_smoothed produces a model-quality ranking that reflects
+    the deployed pipeline's discrimination rather than the raw
+    pre-smoothing output. AUROC/PRAUC values for Row 2 and Row 3 are
+    numerically identical because both use the same smoothing kernel
+    (only the threshold differs); they will typically differ slightly
+    from Row 1 values, with the smoothed score giving marginally
+    higher AUROC/PRAUC because single-segment noise spikes that hurt
+    raw-y_prob ranking are attenuated by the moving average.
+
+    Per-row classification reports. For each of Row 1, Row 2, Row 3,
+    a JSON file
+    <model>_classification_report_row{1,2,3}.json
+    is written. The base content is the standard scikit-learn
+    classification report (per-class precision, recall, F1-score, and
+    support, plus accuracy and macro/weighted averages), augmented
+    with three top-level keys -- auroc, prauc, specificity --
+    computed under the per-row scoring convention above. Each report
+    is therefore self-contained: a reader does not need to
+    cross-reference the three-row CSV to obtain threshold-independent
+    metrics.
+
 7.6.12 Compute budget and wall-clock cost
 
     Empirically observed on the HPC cluster (V100-PCIE-16GB and
@@ -1910,7 +1963,7 @@ ablation comparisons share identical backbone configurations.
     Class balance mechanism  Offline proximity-aware downsampling
     Gradient clipping        max_norm = 1.0 (L2)
     Mixed precision          AMP FP16 (CUDA) / FP32 (CPU)
-    Training mode (M2, M4)   Joint (backbone + attention unfrozen)
+    Training mode (M2, M4)   End-to-end (backbone + attention, random init)
     Checkpoint selection     Best validation macro F1
     Seed                     42 (all RNG streams)
     cuDNN determinism        deterministic = True, benchmark = False

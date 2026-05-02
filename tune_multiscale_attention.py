@@ -33,31 +33,35 @@ Falkner, S., Klein, A., & Hutter, F. (2018). BOHB: Robust and Efficient
     Hyperparameter Optimization at Scale. ICML 2018.
 Mattson, P. et al. (2020). MLPerf Training Benchmark. MLSys 2020.
 
-The MultiScaleTCN backbone hyperparameters (architecture,
-not weights) are inherited from M3's tuning study
-(best_multiscale_params.json) and held fixed during this
-search. The backbone is instantiated with these inherited
-hyperparameters and made non-trainable for the duration of
-tuning. Only the temporal attention module and classification
-head receive gradient updates during each trial.
+The MultiScaleTCN backbone *hyperparameters* (architecture
+only -- not trained weights) are inherited from M3's tuning
+study (best_multiscale_params.json) and held fixed during
+this search. The backbone is instantiated from those
+hyperparameters with random weights and trained end-to-end
+alongside the attention module in every trial: no parameters
+are frozen, and no prior .pt checkpoint is loaded.
 
-Holding the backbone non-trainable during tuning is a
-search-efficiency choice, not an ablation device. The M3 vs
-M4 ablation comparison itself is performed at the final-
+Restricting the Optuna search space to attention and standard
+training hyperparameters keeps optimisation tractable in
+N_TRIALS while still allowing proper feature learning across
+the whole network.
+
+The M3 vs M4 ablation comparison is performed at the final-
 training stage (MultiScaleTCNAttention.py), where both models
 are trained from scratch under an identical protocol -- see
 STUDY_REPORT.txt Sections 7.5 and 7.6.7.
 
 This design mirrors tune_temporal_attention.py:
-  TCN          -> inherit M1 backbone HPs, freeze, tune attn
-  MultiScaleTCN -> inherit M3 backbone HPs, freeze, tune attn
+  TCN           -> inherit M1 backbone HPs, train end-to-end, tune attn
+  MultiScaleTCN -> inherit M3 backbone HPs, train end-to-end, tune attn
 
 Architecture: MultiScaleTCNWithAttention
-  Held fixed (non-trainable during tuning):
-           MultiScaleTCN backbone, instantiated with
-           hyperparameters from best_multiscale_params.json
-  Tuned  : attention_fc, attention_v, attention_drop,
-           classification head
+  Held fixed (architecture HPs only):
+           MultiScaleTCN backbone hyperparameters from
+           best_multiscale_params.json. Weights initialised
+           randomly and trained end-to-end every trial.
+  Tuned  : attention_dim, attention_dropout (attention)
+           learning_rate, weight_decay, batch_size (training)
 
 Hyperparameters tuned (attention only)
 ---------------------------------------
@@ -183,15 +187,10 @@ WD_MIN            = 1e-5                               # weight decay lower boun
 WD_MAX            = 1e-3                               # weight decay upper bound
 BATCH_CHOICES     = [16, 32, 64]                       # batch size candidates
 
-# Dilation schedules -- for backbone reconstruction and JSON documentation
-# (must match tune_multiscale_tcn.py so the M3 backbone loads correctly)
+# Dilation schedules -- backbone architecture (must match tune_multiscale_tcn.py)
 BRANCH1_DILATIONS = [1, 2, 4]                          # fine:         spike morphology
 BRANCH2_DILATIONS = [8, 16, 32]                        # intermediate: rhythmic bursts
 BRANCH3_DILATIONS = [32, 64, 128]                      # coarse:       seizure evolution
-
-# MultiScaleTCNWithAttention stores backbone as self.backbone
-# named_parameters() produces names like "backbone.branch1.0.conv1.weight"
-BACKBONE_PREFIX   = "backbone."                        # freeze prefix for named_parameters
 
 
 # ---------------------------------------------------------------------------
@@ -238,8 +237,10 @@ def setup_logging():
 def load_multiscale_params(logger):
     """Load MultiScaleTCN backbone hyperparameters from best_multiscale_params.json.
 
-    These parameters are transferred to MultiScaleTCNWithAttention and frozen.
-    They must not be modified or re-sampled during attention tuning.
+    These hyperparameters define the backbone architecture only. They are
+    held fixed for every trial (not searched), but the backbone weights are
+    initialised randomly and trained end-to-end alongside the attention
+    module in each trial -- no .pt checkpoint is loaded.
 
     Also extracts branch dilation schedules from the JSON under key
     'branch_dilations'. Falls back to BRANCH1/2/3 constants with a
@@ -286,13 +287,14 @@ def load_multiscale_params(logger):
             "branch3": BRANCH3_DILATIONS,
         }
 
-    logger.info("Fixed MultiScaleTCN backbone hyperparameters (FROZEN):")
+    logger.info("MultiScaleTCN backbone hyperparameters (FIXED, not searched):")
     for k, v in hp.items():
         logger.info("  %-20s: %s", k, v)
     logger.info("Branch dilations:")
     for bname, dils in branch_dilations.items():
         logger.info("  %-20s: %s", bname, dils)
-    logger.info("These parameters are FROZEN during tuning.")
+    logger.info("Backbone HPs are fixed across trials; weights are trained "
+                "end-to-end with the attention module each trial.")
 
     return full_config, hp, branch_dilations
 
@@ -356,14 +358,10 @@ def optuna_objective(trial, train_pairs, val_pairs,
                      ms_hp, branch_dilations, device, logger):
     """Optuna objective for MultiScaleTCNWithAttention.
 
-    The MultiScaleTCN backbone is instantiated from ms_hp, moved to device,
-    then FROZEN immediately before the optimiser is built. Only attention
-    parameters are tuned.
-
-    Backbone freeze mechanism:
-      All parameters whose names begin with 'backbone.' have requires_grad
-      set to False. The optimiser is then built on parameters with
-      requires_grad=True only.
+    The backbone is instantiated from ms_hp (architecture only) with random
+    weights and trained end-to-end alongside the attention module. No
+    parameters are frozen and no prior checkpoint is loaded. Only attention
+    and standard training hyperparameters are sampled by Optuna.
 
     Parameters
     ----------
@@ -411,22 +409,12 @@ def optuna_objective(trial, train_pairs, val_pairs,
             branch3_dilations=branch_dilations.get("branch3", BRANCH3_DILATIONS),
         ).to(device)
 
-        # -- d. Freeze backbone parameters -------------------------------------
-        for name, param in model.named_parameters():
-            if name.startswith(BACKBONE_PREFIX):
-                param.requires_grad = False            # freeze all backbone weights
-
-        # Log parameter audit on first trial to confirm freezing
+        # -- d. Parameter audit on first trial ---------------------------------
+        # All parameters (backbone + attention + head) are trainable.
         if trial.number == 0:
-            n_frozen = sum(
-                p.numel() for p in model.parameters()
-                if not p.requires_grad)
-            n_trainable = sum(
-                p.numel() for p in model.parameters()
-                if p.requires_grad)
+            n_trainable = sum(p.numel() for p in model.parameters())
             logger.info("Trial 0 -- parameter audit:")
-            logger.info("  Frozen (backbone) : %s", "{:,}".format(n_frozen))
-            logger.info("  Trainable (attn)  : %s", "{:,}".format(n_trainable))
+            logger.info("  Trainable (end-to-end) : %s", "{:,}".format(n_trainable))
 
         # -- e. Log trial header with all sampled hyperparameters --------------
         n_params = count_parameters(model)
@@ -439,10 +427,9 @@ def optuna_objective(trial, train_pairs, val_pairs,
         train_loader = make_loader(train_pairs, batch_size=batch_size, train=True, device=device)
         val_loader   = make_loader(val_pairs, batch_size=batch_size, train=False, device=device)
 
-        # -- g. Build optimiser on trainable parameters only -------------------
-        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        # -- g. Build optimiser on all parameters (end-to-end training) --------
         optimiser = torch.optim.AdamW(
-            trainable_params, lr=learning_rate, weight_decay=weight_decay)
+            model.parameters(), lr=learning_rate, weight_decay=weight_decay)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimiser, T_max=MAX_EPOCHS, eta_min=learning_rate * 0.01)
 
@@ -573,8 +560,10 @@ def save_results(study, ms_hp, ms_config, branch_dilations, device, logger):
         record = {
             "model":              "M4_MultiScaleTCN_TemporalAttention",
             "timestamp":          datetime.datetime.now().isoformat(),
-            "note":               ("Attention params tuned with frozen MultiScaleTCN backbone. "
-                                   "No model weights saved here. "
+            "note":               ("Attention HPs tuned with fixed MultiScaleTCN backbone "
+                                   "architecture; backbone weights initialised randomly and "
+                                   "trained end-to-end every trial (no freeze, no checkpoint "
+                                   "loaded). No model weights saved here. "
                                    "Use train notebook to train the final model."),
             "best_trial_number":  best_trial.number,
             "best_val_f1":        round(best_val_f1, 6),
@@ -655,7 +644,8 @@ def save_results(study, ms_hp, ms_config, branch_dilations, device, logger):
             "weight_decay":      "%s to %s (log scale)" % (WD_MIN, WD_MAX),
             "batch_size":        BATCH_CHOICES,
         },
-        "backbone_note":       "Frozen from best_multiscale_params.json",
+        "backbone_note":       ("Architecture HPs fixed from best_multiscale_params.json; "
+                                "weights random-init and trained end-to-end each trial."),
         "fixed_backbone_params": ms_hp,
         "fixed_dilation_schedules": branch_dilations,
     }
@@ -770,7 +760,8 @@ def main():
     logger.info("tune_multiscale_attention.py")
     logger.info("Timestamp       : %s", datetime.datetime.now().isoformat())
     logger.info("Ablation role   : M4 -- Multi-Scale TCN + Temporal Attention")
-    logger.info("Params source   : best_multiscale_params.json (backbone, frozen)")
+    logger.info("Params source   : best_multiscale_params.json (backbone HPs fixed; "
+                "weights trained end-to-end)")
     logger.info("Purpose         : Tune attention HPs (no final model)")
     logger.info("N_TRIALS        : %d%s", N_TRIALS, "  [DRY-RUN]" if DRY_RUN else "")
     logger.info("MAX_EPOCHS      : %d", MAX_EPOCHS)
@@ -942,22 +933,27 @@ if __name__ == "__main__":
 # Methods section template:
 #   "MultiScaleTCNWithAttention temporal attention hyperparameters were tuned
 #   using Optuna TPE with 50 trials and 10 random startup trials. The
-#   MultiScaleTCN backbone weights were transferred from the MultiScaleTCN
-#   tuning study (best_multiscale_params.json) and frozen. Only the temporal
-#   attention module (attention_fc, attention_v, attention_drop) and the
-#   classification head received gradient updates. The tuning objective was
-#   validation macro F1-score."
+#   MultiScaleTCN backbone architecture (num_filters, kernel_size, dropout,
+#   fusion, branch dilation schedules) was inherited from the MultiScaleTCN
+#   tuning study (best_multiscale_params.json) and held fixed across trials.
+#   Backbone weights were initialised randomly and trained end-to-end with
+#   the temporal attention module in every trial (no parameters frozen, no
+#   pretrained weights loaded). The Optuna search space was restricted to
+#   attention hyperparameters (attention_dim, attention_dropout) and standard
+#   training hyperparameters (learning_rate, weight_decay, batch_size). The
+#   tuning objective was validation macro F1-score."
 #
 # Ablation framing:
 #   M3 (MultiScaleTCN) vs M4 (MultiScaleTCNWithAttention) isolates the
 #   contribution of temporal attention at the multi-scale level, paralleling
 #   M1 (TCN) vs M2 (TCNWithAttention) at the single-branch level. Both
-#   comparisons change only one architectural variable while sharing
-#   identical backbone weights.
+#   comparisons change only one architectural variable -- the presence of
+#   the attention module -- while sharing the same backbone architecture
+#   hyperparameters; weights are trained from scratch in each model.
 #
 # All tuned values are in best_multiscale_attn_params.json under
 # "hyperparameters". Report every key in the Methods table. Also report
 # N_TRIALS, N_STARTUP, ES_PATIENCE, optimiser (AdamW + cosine annealing),
-# backbone freeze prefix ("backbone."), and tuning metric (validation
+# end-to-end training (no freezing), and tuning metric (validation
 # macro F1).
 # -----------------------------------------------------------------------------
