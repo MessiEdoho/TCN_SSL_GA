@@ -2,8 +2,9 @@
 #SBATCH --job-name=tcn_HPT_binary
 # One node with one GPU for PyTorch training + CPU cores for Optuna TPE
 #SBATCH -N 1
-# specify number of tasks/cores per node required
-#SBATCH --ntasks-per-node 10
+# Single Python process with 10 CPUs available for DataLoader workers
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=10
 
 #SBATCH --partition=csgpu
 # Request 1 gpus
@@ -22,6 +23,15 @@ date
 echo "Running on node: $(hostname)"
 echo "Job ID: $SLURM_JOB_ID"
 echo "GPU allocated: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'none detected')"
+
+# CPU allocation diagnostics: confirm SLURM gave us 10 cores AND that the
+# Python process can actually use all of them (cpuset / cgroup binding).
+echo "----- CPU allocation -----"
+echo "SLURM_CPUS_PER_TASK : ${SLURM_CPUS_PER_TASK:-unset}"
+echo "SLURM_CPUS_ON_NODE  : ${SLURM_CPUS_ON_NODE:-unset}"
+echo "nproc (visible)     : $(nproc)"
+echo "Affinity (taskset)  : $(taskset -cp $$ 2>/dev/null || echo 'taskset unavailable')"
+echo "--------------------------"
 
 # Activate environment
 module purge
