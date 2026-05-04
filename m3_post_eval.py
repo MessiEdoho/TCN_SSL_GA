@@ -1,83 +1,63 @@
 """
 m3_post_eval.py
 ===============
-Standalone post-training evaluation for the M3 (MultiScaleTCN) model,
-recovering the three-row report after the original training run aborted
-during post-processing due to NaN values in y_prob.
+Post-training evaluation for the M3 (MultiScaleTCN) model that operates
+entirely on the cached predictions saved by an earlier weights-loaded
+run -- no model weights are reloaded and no inference is re-executed.
 
-The original full-validation forward pass crashed at roc_auc_score on
-NaN-valued probabilities. The diagnostic scan
-(scan_val_test_extreme.py) then established that:
+This script reads y_true and y_prob from
+    OUTPUT_ROOT / "multiscale_tcn_predictions_raw.npz"
+recomputes the post-processing rows, and writes the resulting figures,
+JSONs, and CSVs. Because the >5-hour FP32 forward pass is replaced by a
+~1-second .npz load, the script can run on CPU without the
+multiscale_tcn_final_weights.pt file.
 
-  - Zero NaN/Inf values exist in the source .npy files.
-  - 3,201 val segments contain extreme-but-finite amplitudes
-    (worst |x| = 1.65 x 10^19, all label=0).
-  - The FP16 ceiling is 65,504, so any input |x| > 65,504 overflows
-    in the AMP forward pass to +inf, which then triggers NaN inside
-    LayerNorm via inf - inf in the channel-wise reduction.
+What changed (relative to the earlier inference-based design)
+-------------------------------------------------------------
+1. Threshold optimisation is disabled. Row 3 (post-processed at the
+   F1-optimal threshold) consistently produced poor recall on this
+   dataset's ~0.27 % ictal prevalence and is no longer reported.
+   Only Row 1 (raw t = 0.5) and Row 2 (post-processed t = 0.5)
+   remain. The threshold/Row-3 code is left in place as commented
+   scaffolding for future re-enablement.
+2. The four-layer NaN-protection workflow (manifest verification,
+   SafeEEGSegmentDataset, FP32 forward, per-batch finiteness assert)
+   has been retired in this pass. The cached predictions already
+   encode the result of that protected pass from the original M3
+   training run. Restore the commented-out Steps 2-6 in main() if a
+   fresh inference run is required.
+3. A new bar plot summarising the Row 1 / Row 2 macro-average
+   classification report is written to
+       OUTPUT_ROOT / "Result_classReport"
+   alongside the rest of the evaluation outputs.
 
-This script re-runs the full-validation pass and the entire post-
-processing pipeline using the saved final weights, with FOUR layered
-protections so the failure cannot recur:
-
-  Layer 1 -- input filter (manifest-level):
-    Extreme-amplitude (|x| > 1000) and NaN/Inf segments are removed
-    from val/test by apply_val_test_filter.py as a one-shot upstream
-    pipeline step. This script verifies at startup that the loaded
-    manifest's meta.filter_history block records that step; if absent,
-    the script fails loudly to prevent silently running on unfiltered
-    data. Pre-Option-A versions of this script ran the filter inline
-    (~2 h per re-run); the manifest-level move keeps the same
-    protection while reducing wall time.
-
-  Layer 2 -- dataset hardening (defence-in-depth):
-    SafeEEGSegmentDataset replaces NaN/Inf with 0.0 via np.nan_to_num
-    and clips to +- 1000 via np.clip in __getitem__, even though
-    Layer 1 should have already removed such segments. Tracks how
-    many samples needed sanitisation for transparency.
-
-  Layer 3 -- FP32 forward pass:
-    Autocast is disabled (use_amp=False), giving 5+ orders of
-    magnitude more headroom than FP16. Increases wall time by ~30 %
-    compared to AMP but eliminates the FP16 overflow path entirely.
-
-  Layer 4 -- finiteness assertion:
-    After every forward pass we assert torch.isfinite(logits).all().
-    If ANY logit is non-finite despite the first three layers, the
-    script crashes with a localised diagnostic (batch index, sample
-    indices, sample logit values) instead of writing a NaN-poisoned
-    report to disk.
-
-Inputs (paths inherited from MultiScaleTCN.py)
-----------------------------------------------
-  WEIGHTS_PATH         multiscale_tcn_final_weights.pt
-  BACKBONE_PARAMS_PATH best_multiscale_params.json
-  SPLITS_PATH          data_splits_nonictal_sampled.json
+Inputs
+------
+  PREDICTIONS_RAW_NPZ   multiscale_tcn_predictions_raw.npz
+                        (must already exist; produced by a prior
+                         weights-loaded run of this script)
+  best_multiscale_params.json
+                        (architecture metadata for save_all_results)
 
 Outputs (under OUTPUT_ROOT = /scratch/.../MODEL3_OUTPUT/MultiScaleTCN/)
 ----------------------------------------------------------------------
-  multiscale_tcn_evaluation_report.json    -- three-row metrics + meta
-  multiscale_tcn_three_row_summary.csv     -- compact tabular form
-  multiscale_tcn_optimal_threshold.json    -- F1-optimal threshold
-  multiscale_tcn_predictions_raw.npz       -- y_true, y_prob (insurance copy
-                                              saved immediately after eval)
-  multiscale_tcn_predictions.npz           -- full bundle: y_true, y_prob,
-                                              y_pred_row{1,2,3}, optimal
-                                              threshold, post-processing
-                                              config; load with np.load()
-                                              for offline post-processing
-                                              experimentation
-  figures/                                 -- 13 figures (ROC/PR/...)
+  multiscale_tcn_evaluation_report.json    -- Row 1 + Row 2 metrics + meta
+  multiscale_tcn_three_row_summary.csv     -- two-row tabular form
+  multiscale_tcn_classification_report_row{1,2}.json
+  multiscale_tcn_event_details_row2.csv
+  Result_classReport/multiscale_tcn_classreport_barplot.png
+  figures/                                 -- Row 1 / Row 2 figures
   logs/m3_post_eval.log                    -- persistent log
 
 Usage
 -----
-python m3_post_eval.py
+python m3_post_eval.py     # CPU is sufficient; no GPU required
 """
 
 # ---------------------------------------------------------------------------
 # Imports
 # ---------------------------------------------------------------------------
+import csv
 import datetime
 import json
 import logging
@@ -98,9 +78,8 @@ from sklearn.metrics import f1_score
 # does NOT execute its main() because that's guarded by `if __name__`. All
 # top-level constants and functions become importable as-is.
 from MultiScaleTCN import (
-    SEED, MODEL_NAME, OUTPUT_ROOT, LOG_DIR, FIGURE_DIR,
-    WEIGHTS_PATH, EVAL_REPORT_PATH, THRESH_PATH, EPOCH_CSV, THREE_ROW_CSV,
-    SPLITS_PATH,
+    SEED, MODEL_NAME, OUTPUT_ROOT,
+    WEIGHTS_PATH,
     SEGMENT_LEN, SEGMENT_SEC, FS,
     MIN_EVENT_SEC, REFRACTORY_SEC, SMOOTHING_WIN,
     load_splits, load_best_params, build_model,
@@ -108,26 +87,145 @@ from MultiScaleTCN import (
 )
 from tcn_utils import (
     set_seed, count_parameters, EEGSegmentDataset,
+    make_classreport_barplot,
 )
 
 
 # ---------------------------------------------------------------------------
 # Constants (script-local)
 # ---------------------------------------------------------------------------
-EVAL_LOG_PATH       = LOG_DIR / "m3_post_eval.log"     # persistent .log
 AMPLITUDE_THRESHOLD = 1000.0                           # matches train-side filter
 USE_AMP_FOR_EVAL    = False                            # Layer 3: FP32 forward
 NUM_DATA_WORKERS    = 4                                # DataLoader workers
+
+# Cached-prediction path: m3_post_eval.py loads y_true and y_prob from this
+# file produced by a prior weights-based run, eliminating the need to
+# reload the model and re-run the >5-hour FP32 forward pass. Read from the
+# original training-output directory, never overwritten.
+PREDICTIONS_RAW_NPZ = OUTPUT_ROOT / "multiscale_tcn_predictions_raw.npz"
+
+# Per-epoch history sources written by MultiScaleTCN.py at training time.
+# Read from the original training-output directory, never overwritten.
+TRAINING_LOG_JSON_PATH = OUTPUT_ROOT / "multiscale_tcn_training_log.json"
+TRAINING_EPOCH_CSV_PATH = OUTPUT_ROOT / "multiscale_tcn_epoch_metrics.csv"
+
+# Dedicated output folder for everything m3_post_eval.py writes. By design
+# this script never overwrites artefacts the training script produced --
+# all of its outputs (figures, JSONs, CSVs, logs, bar plot) land here.
+POST_EVAL_DIR          = OUTPUT_ROOT / "post_eval_result"
+POST_EVAL_FIGURE_DIR   = POST_EVAL_DIR / "figures"
+POST_EVAL_LOG_DIR      = POST_EVAL_DIR / "logs"
+RESULT_CLASSREPORT_DIR = POST_EVAL_DIR / "Result_classReport"
+EVAL_LOG_PATH          = POST_EVAL_LOG_DIR / "m3_post_eval.log"   # persistent .log
+
+
+# ---------------------------------------------------------------------------
+# _redirect_outputs_to_post_eval
+# ---------------------------------------------------------------------------
+def _redirect_outputs_to_post_eval(logger):
+    """Rebind the path globals on the imported MultiScaleTCN module so
+    save_all_results() and plot_all_figures() write into POST_EVAL_DIR.
+
+    Why this works: those helpers were defined in MultiScaleTCN.py and
+    look up names like OUTPUT_ROOT, FIGURE_DIR, EVAL_REPORT_PATH at call
+    time in *MultiScaleTCN's* module namespace -- not in the caller's. By
+    rebinding those names on the MultiScaleTCN module before invoking
+    the helpers from this script, every write target lands under
+    post_eval_result/ for this process only. A separate Python process
+    running MultiScaleTCN.py for training is not affected (it never
+    imports m3_post_eval and never sees the rebinding).
+
+    The training-script directories (the original OUTPUT_ROOT, FIGURE_DIR,
+    LOG_DIR) are read for inputs (predictions_raw.npz, training history)
+    but never overwritten by this script.
+    """
+    import MultiScaleTCN as _m3
+
+    redirections = {
+        "OUTPUT_ROOT":      POST_EVAL_DIR,
+        "FIGURE_DIR":       POST_EVAL_FIGURE_DIR,
+        "LOG_DIR":          POST_EVAL_LOG_DIR,
+        "TRAIN_LOG_PATH":   POST_EVAL_DIR / "multiscale_tcn_training_log.json",
+        "EVAL_REPORT_PATH": POST_EVAL_DIR / "multiscale_tcn_evaluation_report.json",
+        "EPOCH_CSV":        POST_EVAL_DIR / "multiscale_tcn_epoch_metrics.csv",
+        "THREE_ROW_CSV":    POST_EVAL_DIR / "multiscale_tcn_three_row_summary.csv",
+    }
+    logger.info("Redirecting MultiScaleTCN write targets to POST_EVAL_DIR:")
+    for name, new_path in redirections.items():
+        original = getattr(_m3, name, None)
+        setattr(_m3, name, new_path)
+        logger.info("  %-18s : %s -> %s", name, original, new_path)
+
+
+# ---------------------------------------------------------------------------
+# _load_history
+# ---------------------------------------------------------------------------
+def _load_history(logger):
+    """Load per-epoch training history for the EMA-smoothed training-curves
+    figure.
+
+    Tries, in order:
+      1. multiscale_tcn_training_log.json -- preferred; full schema.
+      2. multiscale_tcn_epoch_metrics.csv -- fallback if JSON is missing.
+      3. Single-point stub -- last resort, matches the legacy behaviour
+         from when the original training run aborted before either
+         artefact was written.
+
+    Returns a dict with keys epoch, train_loss, val_f1, lr (lists).
+    """
+    if TRAINING_LOG_JSON_PATH.exists():
+        with open(TRAINING_LOG_JSON_PATH, "r", encoding="utf-8") as f:
+            log = json.load(f)
+        history = log.get("history", {})
+        if history.get("epoch"):
+            logger.info("Loaded per-epoch history from %s (%d epochs)",
+                        TRAINING_LOG_JSON_PATH.name, len(history["epoch"]))
+            return history
+
+    if TRAINING_EPOCH_CSV_PATH.exists():
+        history = {"epoch": [], "train_loss": [], "val_f1": [], "lr": []}
+        with open(TRAINING_EPOCH_CSV_PATH, "r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                history["epoch"].append(int(row["epoch"]))
+                history["train_loss"].append(float(row["train_loss"]))
+                history["val_f1"].append(float(row["val_f1"]))
+                history["lr"].append(float(row["lr"]))
+        if history["epoch"]:
+            logger.info("Loaded per-epoch history from %s (%d epochs)",
+                        TRAINING_EPOCH_CSV_PATH.name, len(history["epoch"]))
+            return history
+
+    logger.warning(
+        "No per-epoch history artefact found. Tried %s and %s. Falling back "
+        "to single best-epoch stub -- training curves will collapse to one "
+        "point. Re-run MultiScaleTCN.py to produce a full history.",
+        TRAINING_LOG_JSON_PATH.name, TRAINING_EPOCH_CSV_PATH.name)
+    return {
+        "epoch":      [8],
+        "train_loss": [0.1871],
+        "val_f1":     [0.7923],
+        "lr":         [2.87e-4],
+    }
 
 
 # ---------------------------------------------------------------------------
 # setup_logging  (console + persistent file handler)
 # ---------------------------------------------------------------------------
 def setup_logging():
-    """Mirror the MultiScaleTCN.py log style; route to logs/m3_post_eval.log."""
-    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    FIGURE_DIR.mkdir(parents=True, exist_ok=True)
+    """Mirror the MultiScaleTCN.py log style; route to POST_EVAL_DIR/logs/.
+
+    Creates the full POST_EVAL_DIR subtree on first use:
+        post_eval_result/
+        post_eval_result/figures/
+        post_eval_result/logs/
+        post_eval_result/Result_classReport/
+    The training-script directories (LOG_DIR, FIGURE_DIR) are not touched.
+    """
+    POST_EVAL_DIR.mkdir(parents=True, exist_ok=True)
+    POST_EVAL_FIGURE_DIR.mkdir(parents=True, exist_ok=True)
+    POST_EVAL_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    RESULT_CLASSREPORT_DIR.mkdir(parents=True, exist_ok=True)
 
     logger = logging.getLogger("m3_post_eval")
     logger.setLevel(logging.INFO)
@@ -371,206 +469,172 @@ def main():
     logger.info("=" * 65)
     logger.info("m3_post_eval.py")
     logger.info("Timestamp       : %s", datetime.datetime.now().isoformat())
-    logger.info("Purpose         : Post-training eval with 4-layer NaN protection")
+    logger.info("Purpose         : Post-training eval from cached predictions")
     logger.info("Model           : %s", MODEL_NAME)
-    logger.info("Weights         : %s", WEIGHTS_PATH)
-    logger.info("Splits          : %s", SPLITS_PATH)
-    logger.info("Output dir      : %s", OUTPUT_ROOT)
+    logger.info("Cached preds    : %s", PREDICTIONS_RAW_NPZ)
+    logger.info("Read root       : %s (training-script artefacts; never overwritten)", OUTPUT_ROOT)
+    logger.info("Write root      : %s (everything this script emits lands here)", POST_EVAL_DIR)
     logger.info("Eval log path   : %s", EVAL_LOG_PATH)
-    logger.info("Layer 1 (filter): manifest-level (apply_val_test_filter) -- "
-                "verified at startup")
-    logger.info("Layer 2 (dataset): SafeEEGSegmentDataset (nan_to_num + clip)")
-    logger.info("Layer 3 (FP32)  : use_amp=%s", USE_AMP_FOR_EVAL)
-    logger.info("Layer 4 (assert): torch.isfinite(logits).all() per batch")
+    logger.info("Mode            : Row 1 + Row 2 (Row 3 retired); no model "
+                "weights loaded")
     logger.info("=" * 65)
+
+    # Rebind path globals on the imported MultiScaleTCN module BEFORE any
+    # call to save_all_results / plot_all_figures, so every artefact those
+    # helpers write lands inside POST_EVAL_DIR. Reads (predictions_raw.npz,
+    # training history) still happen against the original OUTPUT_ROOT.
+    _redirect_outputs_to_post_eval(logger)
 
     set_seed(SEED)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info("Device          : %s", device)
-    if torch.cuda.is_available():
-        logger.info("GPU             : %s", torch.cuda.get_device_name(0))
-        logger.info("VRAM            : %.2f GB",
-                    torch.cuda.get_device_properties(0).total_memory / 1e9)
-        logger.info("CUDA            : %s", torch.version.cuda)
+    logger.info("Device          : %s (CPU is sufficient -- no inference run)", device)
     logger.info("PyTorch         : %s", torch.__version__)
 
     # -- Step 1: Load M3 hyperparameters from JSON --------------------------
+    # Only used for branch_dilations / batch_size logging; no weights loaded.
     logger.info("-" * 65)
-    logger.info("Step 1: Load M3 hyperparameters")
+    logger.info("Step 1: Load M3 hyperparameters (architecture metadata only)")
     config, hp, branch_dilations = load_best_params(logger)
+    n_params = 0  # placeholder; actual count was logged by the original training run
 
-    # -- Step 2: Build model and load saved weights -------------------------
+    # -- (Retired) Steps 2-6: model load + manifest verify + FP32 forward ---
+    # The four-layer protection workflow (build_model -> load_state_dict ->
+    # SafeEEGSegmentDataset -> evaluate_model_safe) has been retired in this
+    # post-hoc pass because the cached predictions in PREDICTIONS_RAW_NPZ
+    # already encode the result of that protected forward pass from the
+    # original M3 training run. To re-enable a fresh inference pass (e.g.,
+    # after retraining), restore the block below.
+    #
+    # if not WEIGHTS_PATH.exists():
+    #     logger.error("Weights file not found: %s", WEIGHTS_PATH)
+    #     sys.exit(1)
+    # model = build_model(hp, branch_dilations, device, logger)
+    # state_dict = torch.load(WEIGHTS_PATH, map_location=device)
+    # model.load_state_dict(state_dict)
+    # n_params = count_parameters(model)
+    # train_pairs, val_pairs = load_splits(logger)
+    # manifest_filter = verify_manifest_filtered(SPLITS_PATH, logger)
+    # batch_size = int(hp["batch_size"])
+    # val_loader = make_safe_loader(val_pairs, batch_size, device,
+    #                               num_workers=NUM_DATA_WORKERS)
+    # t0_eval = time.time()
+    # val_f1, y_true, y_pred_05, y_prob = evaluate_model_safe(
+    #     model, val_loader, device, logger, use_amp=USE_AMP_FOR_EVAL)
+    # eval_seconds = time.time() - t0_eval
+    # raw_npz_path = OUTPUT_ROOT / "multiscale_tcn_predictions_raw.npz"
+    # np.savez_compressed(raw_npz_path, y_true=y_true.astype(np.int8),
+    #                     y_prob=y_prob.astype(np.float32), ...)
+
+    # -- Step 2 (revised): Load cached predictions from the prior run -------
     logger.info("-" * 65)
-    logger.info("Step 2: Build model and load saved weights")
-    model = build_model(hp, branch_dilations, device, logger)
-    if not WEIGHTS_PATH.exists():
-        logger.error("Weights file not found: %s", WEIGHTS_PATH)
+    logger.info("Step 2: Load cached y_true, y_prob from predictions_raw.npz")
+    if not PREDICTIONS_RAW_NPZ.exists():
+        logger.error(
+            "Cached predictions file not found: %s\n"
+            "Run a weights-loaded m3_post_eval.py pass first (see retired "
+            "Steps 2-6 in the source) to produce this file, or restore the "
+            "inference block to recompute predictions in-place.",
+            PREDICTIONS_RAW_NPZ)
         sys.exit(1)
-    state_dict = torch.load(WEIGHTS_PATH, map_location=device)
-    model.load_state_dict(state_dict)
-    n_params = count_parameters(model)
-    logger.info("Loaded weights : %d params from %s",
-                n_params, WEIGHTS_PATH.name)
-
-    # -- Step 3: Load val pairs ---------------------------------------------
-    logger.info("-" * 65)
-    logger.info("Step 3: Load val pairs from manifest")
-    train_pairs, val_pairs = load_splits(logger)
-    n_val_raw = len(val_pairs)
-    logger.info("Raw val pairs   : %d", n_val_raw)
-
-    # -- Step 4: Layer 1 -- verify manifest was filtered upstream -----------
-    # Layer 1 (extreme-segment removal) now lives in apply_val_test_filter.py
-    # as a one-shot pipeline step. We verify here that the loaded manifest
-    # records that step in its meta.filter_history block. This replaces the
-    # ~2-hour inline filter scan with a ~1-second metadata check while
-    # preserving the same protection level: if the manifest was not produced
-    # by apply_val_test_filter.py, the script fails loudly rather than
-    # silently running on potentially-unfiltered data.
-    logger.info("-" * 65)
-    logger.info("Step 4: Layer 1 -- verify manifest filter (metadata check)")
-    manifest_filter = verify_manifest_filtered(SPLITS_PATH, logger)
-    n_val_segments = len(val_pairs)        # already filtered at manifest step
-
-    # -- Step 5: Layer 2 -- hardened DataLoader -----------------------------
-    logger.info("-" * 65)
-    logger.info("Step 5: Layer 2 -- SafeEEGSegmentDataset + DataLoader")
-    batch_size = int(hp["batch_size"])
-    val_loader = make_safe_loader(val_pairs, batch_size, device,
-                                  num_workers=NUM_DATA_WORKERS)
-    logger.info("Val loader      : %d batches | batch_size=%d | workers=%d",
-                len(val_loader), batch_size, NUM_DATA_WORKERS)
-
-    # -- Step 6: Layers 3 & 4 -- FP32 forward + per-batch isfinite ----------
-    logger.info("-" * 65)
-    logger.info("Step 6: Layers 3+4 -- FP32 forward pass with finiteness asserts")
-    t0_eval = time.time()
-    val_f1, y_true, y_pred_05, y_prob = evaluate_model_safe(
-        model, val_loader, device, logger, use_amp=USE_AMP_FOR_EVAL)
-    eval_seconds = time.time() - t0_eval
-    logger.info("Eval pass done  : %.1f min  | val F1 (raw @ 0.5) = %.4f",
-                eval_seconds / 60, val_f1)
-    logger.info("Layer 2 caught  : %d segments needed in-loader sanitisation",
-                SafeEEGSegmentDataset.n_sanitised)
-
-    # -- Step 6.5: Save raw y_true and y_prob (insurance) -------------------
-    # Persist the raw arrays IMMEDIATELY after the forward pass and before
-    # any downstream post-processing. If anything later in the pipeline
-    # crashes (e.g., metrics computation, plotting, I/O), the >5-hour FP32
-    # eval is not lost -- post-processing experimentation can resume offline
-    # by loading this file. y_prob is the most valuable artefact: any new
-    # smoothing/refractory/min-duration scheme can be developed and
-    # evaluated against y_true without re-running the model.
-    raw_npz_path = OUTPUT_ROOT / "multiscale_tcn_predictions_raw.npz"
-    np.savez_compressed(
-        raw_npz_path,
-        y_true=y_true.astype(np.int8),                  # binary labels, 4.3M x 1 byte
-        y_prob=y_prob.astype(np.float32),               # raw sigmoid probs, 4.3M x 4 bytes
-        segment_sec=np.float32(SEGMENT_SEC),
-        n_segments=np.int64(n_val_segments),
-        manifest_filter_step=np.array(manifest_filter["step"], dtype="U64"),
-        manifest_filter_timestamp=np.array(manifest_filter["timestamp"], dtype="U32"),
-        manifest_filter_threshold=np.float32(manifest_filter["threshold"]),
-        manifest_val_after=np.int64(manifest_filter["val_after"]),
-        manifest_val_removed=np.int64(manifest_filter["val_removed"]),
-    )
-    logger.info("Saved raw arrays: %s (%.2f MB)",
-                raw_npz_path, raw_npz_path.stat().st_size / 1e6)
+    t0_load = time.time()
+    cached = np.load(PREDICTIONS_RAW_NPZ, allow_pickle=False)
+    y_true = cached["y_true"].astype(np.int64)
+    y_prob = cached["y_prob"].astype(np.float32)
+    n_val_segments = int(cached.get("n_segments", len(y_true)))
+    eval_seconds = time.time() - t0_load
+    logger.info("Loaded predictions: %d segments | %.1f s | %s",
+                n_val_segments, eval_seconds, PREDICTIONS_RAW_NPZ.name)
+    logger.info("  y_true  : shape=%s, sum=%d (positives)",
+                y_true.shape, int(y_true.sum()))
+    logger.info("  y_prob  : shape=%s, range=[%.4f, %.4f]",
+                y_prob.shape, float(y_prob.min()), float(y_prob.max()))
 
     # -- Step 7: Three-row post-processing ----------------------------------
     logger.info("-" * 65)
-    logger.info("Step 7: Run three-row post-processing evaluation")
-    (row1_metrics, row2_metrics, row3_metrics,
-     post_row2, post_row3, far_row2, far_row3,
-     thresh_result, optimal_threshold) = run_postprocessing_evaluations(
+    logger.info("Step 7: Run post-processing evaluation (Row 1 + Row 2; Row 3 retired)")
+    (row1_metrics, row2_metrics,
+     post_row2, far_row2) = run_postprocessing_evaluations(
          y_true, y_prob, logger)
 
     # -- Step 8: Save report and figures ------------------------------------
     logger.info("-" * 65)
-    logger.info("Step 8: Save evaluation report, three-row CSV, and figures")
+    logger.info("Step 8: Save evaluation report, two-row CSV, and figures")
     y_pred_row1 = (y_prob >= 0.5).astype(int)
     y_pred_row2 = post_row2["smoothed_preds"]
-    y_pred_row3 = post_row3["smoothed_preds"]
 
-    # -- Step 8a: Save comprehensive predictions bundle ---------------------
-    # One npz containing everything a post-processing study needs:
-    #   y_true, y_prob -- for any new threshold / smoothing technique
-    #   y_pred_row{1,2,3} -- so the three published rows can be recomputed
-    #                        without re-running post-processing
-    #   optimal_threshold -- F1-optimal tau* used for Row 3
-    # See multiscale_tcn_predictions_raw.npz for the insurance copy of just
-    # y_true and y_prob saved immediately after the eval pass.
-    bundle_npz_path = OUTPUT_ROOT / "multiscale_tcn_predictions.npz"
-    np.savez_compressed(
-        bundle_npz_path,
-        y_true=y_true.astype(np.int8),
-        y_prob=y_prob.astype(np.float32),
-        y_pred_row1=y_pred_row1.astype(np.int8),
-        y_pred_row2=y_pred_row2.astype(np.int8),
-        y_pred_row3=y_pred_row3.astype(np.int8),
-        optimal_threshold=np.float32(optimal_threshold),
-        segment_sec=np.float32(SEGMENT_SEC),
-        smoothing_win=np.int64(SMOOTHING_WIN),
-        refractory_sec=np.float32(REFRACTORY_SEC),
-        min_event_sec=np.float32(MIN_EVENT_SEC),
-        threshold_objective=np.array("f1", dtype="U8"),
-        n_segments=np.int64(len(y_true)),
-        # Manifest-level Layer 1 audit trail (no inline filter; verified
-        # against meta.filter_history at startup)
-        manifest_filter_step=np.array(manifest_filter["step"], dtype="U64"),
-        manifest_filter_timestamp=np.array(manifest_filter["timestamp"], dtype="U32"),
-        manifest_filter_threshold=np.float32(manifest_filter["threshold"]),
-        manifest_val_after=np.int64(manifest_filter["val_after"]),
-        manifest_val_removed=np.int64(manifest_filter["val_removed"]),
-    )
-    logger.info("Saved predictions bundle: %s (%.2f MB)",
-                bundle_npz_path, bundle_npz_path.stat().st_size / 1e6)
+    # -- (Retired) Step 8a: Save comprehensive predictions bundle ----------
+    # The Row 3 / optimal-threshold fields no longer have meaning, and the
+    # raw insurance copy already exists at PREDICTIONS_RAW_NPZ. Rather than
+    # overwrite that file with a Row-3-less variant, this step is left as
+    # commented scaffolding. Re-enable together with the threshold and
+    # Row 3 blocks if the optimal-threshold workflow is ever restored.
+    #
+    # bundle_npz_path = OUTPUT_ROOT / "multiscale_tcn_predictions.npz"
+    # np.savez_compressed(
+    #     bundle_npz_path,
+    #     y_true=y_true.astype(np.int8),
+    #     y_prob=y_prob.astype(np.float32),
+    #     y_pred_row1=y_pred_row1.astype(np.int8),
+    #     y_pred_row2=y_pred_row2.astype(np.int8),
+    #     segment_sec=np.float32(SEGMENT_SEC),
+    #     smoothing_win=np.int64(SMOOTHING_WIN),
+    #     refractory_sec=np.float32(REFRACTORY_SEC),
+    #     min_event_sec=np.float32(MIN_EVENT_SEC),
+    #     n_segments=np.int64(len(y_true)),
+    # )
+    # logger.info("Saved predictions bundle: %s", bundle_npz_path)
 
-    # The original training run's per-epoch history was lost when the post-
-    # processing crashed. The SLURM .out file documents the trajectory; here
-    # we record only the best-epoch summary so save_all_results / plotting
-    # have a valid history dict.
-    history = {
-        "epoch":      [8],
-        "train_loss": [0.1871],
-        "val_f1":     [0.7923],
-        "lr":         [2.87e-4],
-    }
+    # Load the per-epoch training history from MultiScaleTCN.py's persisted
+    # artefacts (training_log.json preferred, epoch_metrics.csv as fallback,
+    # single-point stub as last resort). The full multi-epoch history is
+    # what makes the EMA-smoothed training curves in plot_all_figures
+    # actually informative -- a single best-epoch point would render as a
+    # dot, not a trajectory.
+    logger.info("-" * 65)
+    logger.info("Step 7b: Load per-epoch training history")
+    history = _load_history(logger)
+    best_epoch = int(history["epoch"][history["val_f1"].index(max(history["val_f1"]))])
+    best_val_f1 = float(max(history["val_f1"]))
+    logger.info("  Best epoch / val F1 from history : %d / %.4f", best_epoch, best_val_f1)
     elapsed_dt = datetime.timedelta(seconds=int(eval_seconds))
 
     save_all_results(
-        history, row1_metrics, row2_metrics, row3_metrics,
-        far_row2, far_row3, hp, branch_dilations,
-        8, 0.7923, elapsed_dt, device, n_params, y_true,
-        y_pred_row1, y_pred_row2, y_pred_row3, logger)
+        history, row1_metrics, row2_metrics,
+        far_row2, hp, branch_dilations,
+        best_epoch, best_val_f1, elapsed_dt, device, n_params, y_true,
+        y_pred_row1, y_pred_row2, logger)
 
     plot_all_figures(
-        history, 8, 0.7923, y_true, y_prob,
-        y_pred_row1, y_pred_row2, y_pred_row3,
-        row1_metrics, row2_metrics, row3_metrics,
-        post_row2, post_row3, thresh_result, optimal_threshold, logger)
+        history, best_epoch, best_val_f1, y_true, y_prob,
+        y_pred_row1, y_pred_row2,
+        row1_metrics, row2_metrics,
+        post_row2,
+        branch_dilations, hp, logger)
+
+    # -- Step 9: Result_classReport bar plot --------------------------------
+    # Macro-avg classification metrics (Row 1 + Row 2) plus FAR/hr in a
+    # standalone two-panel figure -- identical layout across M1, M2, M3, M4
+    # via the shared helper in tcn_utils. Writes under POST_EVAL_DIR (its
+    # own Result_classReport folder); the bar plot the training script
+    # produced under OUTPUT_ROOT/Result_classReport/ is not overwritten.
+    logger.info("-" * 65)
+    logger.info("Step 9: Result_classReport bar plot (Row 1 + Row 2)")
+    make_classreport_barplot(
+        row1_metrics, row2_metrics,
+        RESULT_CLASSREPORT_DIR / "multiscale_tcn_classreport_barplot.png",
+        title_prefix="Multi-Scale TCN", logger=logger)
 
     # -- Final summary ------------------------------------------------------
     logger.info("=" * 65)
     logger.info("M3 POST-EVAL COMPLETE")
-    logger.info("  Val pairs (manifest)   : %d", n_val_segments)
-    logger.info("  Layer 1 (manifest)     : %s @ %s | threshold=%.1f | "
-                "val %d retained / %d removed",
-                manifest_filter["step"], manifest_filter["timestamp"],
-                manifest_filter["threshold"],
-                manifest_filter["val_after"], manifest_filter["val_removed"])
-    logger.info("  Layer 2 sanitised      : %d (in-loader, defence-in-depth)",
-                SafeEEGSegmentDataset.n_sanitised)
-    logger.info("  Layer 3 (FP32 eval)    : enabled (use_amp=%s)", USE_AMP_FOR_EVAL)
-    logger.info("  Layer 4 (assert)       : never fired => all logits finite")
-    logger.info("  Wall time              : %.1f min", eval_seconds / 60)
+    logger.info("  Val segments           : %d (cached predictions)", n_val_segments)
+    logger.info("  Source                 : %s", PREDICTIONS_RAW_NPZ.name)
+    logger.info("  Wall time (load only)  : %.2f s", eval_seconds)
     logger.info("  Row 1 F1 (raw @ 0.5)   : %.4f",
                 row1_metrics.get("f1_macro", float("nan")))
     logger.info("  Row 2 F1 (post @ 0.5)  : %.4f",
                 row2_metrics.get("f1_macro", float("nan")))
-    logger.info("  Row 3 F1 (post @ tau*) : %.4f",
-                row3_metrics.get("f1_macro", float("nan")))
-    logger.info("  Optimal threshold tau* : %.4f", optimal_threshold)
+    logger.info("  Row 3                  : retired (threshold optimisation disabled)")
     logger.info("=" * 65)
 
 

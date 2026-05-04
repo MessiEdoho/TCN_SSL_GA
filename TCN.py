@@ -90,6 +90,8 @@ from tcn_utils import (
     segment_predictions_to_events,
     compute_event_level_far,
     find_optimal_threshold,
+    make_classreport_barplot,
+    ema_smooth,
 )
 
 
@@ -149,6 +151,7 @@ OUTPUT_ROOT       = Path("outputs") / "TCN"            # all M1 outputs under th
 CKPT_DIR          = OUTPUT_ROOT / "checkpoints"        # periodic and best-model checkpoints
 LOG_DIR           = OUTPUT_ROOT / "logs"               # training log (DEBUG-level detail)
 FIGURE_DIR        = OUTPUT_ROOT / "figures"            # all 12 evaluation figures
+RESULT_CLASSREPORT_DIR = OUTPUT_ROOT / "Result_classReport"  # macro-avg bar plot deliverable
 WEIGHTS_PATH      = OUTPUT_ROOT / "tcn_final_weights.pt"       # final model weights (best epoch)
 TRAIN_LOG_PATH    = OUTPUT_ROOT / "tcn_training_log.json"      # full training history as JSON
 EVAL_REPORT_PATH  = OUTPUT_ROOT / "tcn_evaluation_report.json" # three-row evaluation report
@@ -525,11 +528,17 @@ def compute_all_metrics(y_true, y_pred, y_prob, segment_sec, logger, label=""):
 # run_postprocessing_evaluations
 # ---------------------------------------------------------------------------
 def run_postprocessing_evaluations(y_true, y_prob, logger):
-    """Run all three evaluation rows and compute optimal threshold.
+    """Run Row 1 and Row 2 evaluations (Row 3 retired).
 
-    Returns (row1_metrics, row2_metrics, row3_metrics,
-             post_row2, post_row3, far_row2, far_row3,
-             thresh_result, optimal_threshold).
+    Threshold optimisation is intentionally disabled: Row 3 (post-processed
+    at an Optuna-tuned threshold) consistently produced poor recall on this
+    dataset's ~0.27% ictal prevalence, so the report is restricted to:
+        Row 1 -- raw predictions at threshold 0.5
+        Row 2 -- post-processed predictions at threshold 0.5
+    The threshold-optimisation block and Row 3 computation block are kept
+    in the source as commented-out scaffolding for future re-enablement.
+
+    Returns (row1_metrics, row2_metrics, post_row2, far_row2).
     """
     # -- Row 1: raw at 0.5 ----------------------------------------------------
     y_pred_row1 = (y_prob >= 0.5).astype(int)
@@ -538,35 +547,32 @@ def run_postprocessing_evaluations(y_true, y_prob, logger):
     row1_metrics["threshold"] = 0.5
     row1_metrics["postprocessed"] = False
 
-    # -- Find optimal threshold ------------------------------------------------
-    # Macro F1 is the threshold-selection objective. Youden's J was the
-    # original choice (symmetry between sensitivity and specificity) but
-    # produced degenerate operating points on this dataset's ~0.27% ictal
-    # prevalence: M3 final-eval picked Youden tau* = 0.10, yielding F1 = 0.56
-    # with precision = 7.4% (vs F1 = 0.83, precision = 62% at tau = 0.5).
-    # Macro F1 weights precision and recall on equal footing, which keeps
-    # the optimum on the clinically usable region of the ROC curve. Always
-    # compute fresh from current model predictions -- a cached threshold
-    # from a previous run would be stale if model weights changed.
-    thresh_result = find_optimal_threshold(y_true, y_prob, objective="f1")
-    optimal_threshold = thresh_result["optimal_threshold"]
-    with open(THRESH_PATH, "w", encoding="utf-8") as f:
-        json.dump({
-            "model": MODEL_NAME,
-            "timestamp": datetime.datetime.now().isoformat(),
-            "optimal_threshold": optimal_threshold,
-            "objective": "youden",
-            "optimal_score": thresh_result["optimal_score"],
-            "sensitivity_at_opt": thresh_result["sensitivity_at_opt"],
-            "specificity_at_opt": thresh_result["specificity_at_opt"],
-            "post_processing": {
-                "smoothing_window": SMOOTHING_WIN,
-                "refractory_period_sec": REFRACTORY_SEC,
-                "min_event_duration_sec": MIN_EVENT_SEC,
-                "step_sec": STEP_SEC,
-            },
-        }, f, indent=2)
-    logger.info("Optimal threshold computed and saved: %.4f", optimal_threshold)
+    # -- (Retired) Find optimal threshold -- Row 3 was disabled --------------
+    # Threshold optimisation produced operating points with poor recall on
+    # this dataset (Youden tau*=0.10 -> F1=0.56 / precision=7.4% vs
+    # F1=0.83 / precision=62% at tau=0.5). The report now ends at Row 2
+    # (post-processing at tau=0.5). Re-enable the block below to restore
+    # Row 3.
+    #
+    # thresh_result = find_optimal_threshold(y_true, y_prob, objective="f1")
+    # optimal_threshold = thresh_result["optimal_threshold"]
+    # with open(THRESH_PATH, "w", encoding="utf-8") as f:
+    #     json.dump({
+    #         "model": MODEL_NAME,
+    #         "timestamp": datetime.datetime.now().isoformat(),
+    #         "optimal_threshold": optimal_threshold,
+    #         "objective": "f1",
+    #         "optimal_score": thresh_result["optimal_score"],
+    #         "sensitivity_at_opt": thresh_result["sensitivity_at_opt"],
+    #         "specificity_at_opt": thresh_result["specificity_at_opt"],
+    #         "post_processing": {
+    #             "smoothing_window": SMOOTHING_WIN,
+    #             "refractory_period_sec": REFRACTORY_SEC,
+    #             "min_event_duration_sec": MIN_EVENT_SEC,
+    #             "step_sec": STEP_SEC,
+    #         },
+    #     }, f, indent=2)
+    # logger.info("Optimal threshold computed and saved: %.4f", optimal_threshold)
 
     # -- Row 2: post-processed at 0.5 -----------------------------------------
     # segment_predictions_to_events(y_pred, y_prob, segment_len_sec, step_sec, ...)
@@ -606,51 +612,53 @@ def run_postprocessing_evaluations(y_true, y_prob, logger):
                 far_row2["n_total_events"], far_row2["n_true_alarms"],
                 far_row2["n_false_alarms"], far_row2["far_per_hour"])
 
-    # -- Row 3: post-processed at optimal threshold ----------------------------
-    post_row3 = segment_predictions_to_events(
-        y_pred=(y_prob >= optimal_threshold).astype(int),
-        y_prob=y_prob,
-        segment_len_sec=SEGMENT_SEC,
-        step_sec=STEP_SEC,
-        min_event_duration_sec=MIN_EVENT_SEC,
-        refractory_period_sec=REFRACTORY_SEC,
-        smoothing_window=SMOOTHING_WIN,
-        threshold=optimal_threshold)
-    far_row3 = compute_event_level_far(
-        y_true_segments=y_true,
-        post_processed=post_row3,
-        step_sec=STEP_SEC,
-        segment_len_sec=SEGMENT_SEC)
+    # -- (Retired) Row 3: post-processed at optimal threshold -----------------
+    # Re-enable together with the threshold-optimisation block above.
+    #
+    # post_row3 = segment_predictions_to_events(
+    #     y_pred=(y_prob >= optimal_threshold).astype(int),
+    #     y_prob=y_prob,
+    #     segment_len_sec=SEGMENT_SEC,
+    #     step_sec=STEP_SEC,
+    #     min_event_duration_sec=MIN_EVENT_SEC,
+    #     refractory_period_sec=REFRACTORY_SEC,
+    #     smoothing_window=SMOOTHING_WIN,
+    #     threshold=optimal_threshold)
+    # far_row3 = compute_event_level_far(
+    #     y_true_segments=y_true,
+    #     post_processed=post_row3,
+    #     step_sec=STEP_SEC,
+    #     segment_len_sec=SEGMENT_SEC)
+    # y_pred_row3 = post_row3["smoothed_preds"]
+    # row3_metrics = compute_all_metrics(
+    #     y_true, y_pred_row3, post_row3["smoothed_probs"], SEGMENT_SEC, logger,
+    #     label="Row3_postproc_opt%.3f" % optimal_threshold)
+    # row3_metrics["threshold"] = optimal_threshold
+    # row3_metrics["postprocessed"] = True
+    # row3_metrics["far_per_hour_event"] = round(float(far_row3["far_per_hour"]), 6)
+    # row3_metrics["n_true_alarms"] = far_row3["n_true_alarms"]
+    # row3_metrics["n_false_alarms"] = far_row3["n_false_alarms"]
+    # row3_metrics["n_total_events"] = far_row3["n_total_events"]
+    # logger.info("Row3 events: %d total | %d true | %d false | FAR/hr=%.4f",
+    #             far_row3["n_total_events"], far_row3["n_true_alarms"],
+    #             far_row3["n_false_alarms"], far_row3["far_per_hour"])
 
-    y_pred_row3 = post_row3["smoothed_preds"]
-    # See Row 2 comment above: AUROC/PRAUC are computed on smoothed_probs so
-    # they reflect the post-processed pipeline's continuous score.
-    row3_metrics = compute_all_metrics(
-        y_true, y_pred_row3, post_row3["smoothed_probs"], SEGMENT_SEC, logger,
-        label="Row3_postproc_opt%.3f" % optimal_threshold)
-    row3_metrics["threshold"] = optimal_threshold
-    row3_metrics["postprocessed"] = True
-    row3_metrics["far_per_hour_event"] = round(float(far_row3["far_per_hour"]), 6)
-    row3_metrics["n_true_alarms"] = far_row3["n_true_alarms"]
-    row3_metrics["n_false_alarms"] = far_row3["n_false_alarms"]
-    row3_metrics["n_total_events"] = far_row3["n_total_events"]
-    logger.info("Row3 events: %d total | %d true | %d false | FAR/hr=%.4f",
-                far_row3["n_total_events"], far_row3["n_true_alarms"],
-                far_row3["n_false_alarms"], far_row3["far_per_hour"])
-
-    return (row1_metrics, row2_metrics, row3_metrics,
-            post_row2, post_row3, far_row2, far_row3,
-            thresh_result, optimal_threshold)
+    return (row1_metrics, row2_metrics, post_row2, far_row2)
 
 
 # ---------------------------------------------------------------------------
 # save_all_results
 # ---------------------------------------------------------------------------
-def save_all_results(history, row1_metrics, row2_metrics, row3_metrics,
-                     far_row2, far_row3, hp, best_epoch, best_val_f1,
+def save_all_results(history, row1_metrics, row2_metrics,
+                     far_row2, hp, best_epoch, best_val_f1,
                      elapsed, device, n_params, y_true,
-                     y_pred_row1, y_pred_row2, y_pred_row3, logger):
-    """Save all structured results to files (no figures)."""
+                     y_pred_row1, y_pred_row2, logger):
+    """Save all structured results to files (no figures).
+
+    Row 3 (threshold-optimised post-processing) has been retired due to
+    poor recall on the ~0.27% ictal prevalence. Only Row 1 (raw t=0.5)
+    and Row 2 (post-processed t=0.5) are persisted.
+    """
 
     # -- a. Training log JSON --------------------------------------------------
     rf = 2 * (2 ** int(hp["num_layers"]) - 1) * (int(hp["kernel_size"]) - 1) + 1
@@ -687,7 +695,6 @@ def save_all_results(history, row1_metrics, row2_metrics, row3_metrics,
         },
         "row1_raw_threshold_0_5": row1_metrics,
         "row2_postproc_threshold_0_5": row2_metrics,
-        "row3_postproc_optimal_thresh": row3_metrics,
     }
     with open(EVAL_REPORT_PATH, "w", encoding="utf-8") as f:
         json.dump(eval_report, f, indent=2)
@@ -721,7 +728,6 @@ def save_all_results(history, row1_metrics, row2_metrics, row3_metrics,
         for idx, (label, m) in enumerate([
             ("Row1_raw_0.5", row1_metrics),
             ("Row2_postproc_0.5", row2_metrics),
-            ("Row3_postproc_opt", row3_metrics),
         ], 1):
             writer.writerow({
                 "row": label,
@@ -755,7 +761,6 @@ def save_all_results(history, row1_metrics, row2_metrics, row3_metrics,
     for row_idx, (y_pred_row, row_metrics, row_label) in enumerate([
         (y_pred_row1, row1_metrics, "row1"),
         (y_pred_row2, row2_metrics, "row2"),
-        (y_pred_row3, row3_metrics, "row3"),
     ], 1):
         report_dict = classification_report(
             y_true, y_pred_row,
@@ -770,7 +775,7 @@ def save_all_results(history, row1_metrics, row2_metrics, row3_metrics,
         logger.info("Saved: %s", report_path)
 
     # -- f. Event detail CSVs --------------------------------------------------
-    for far_result, row_label in [(far_row2, "row2"), (far_row3, "row3")]:
+    for far_result, row_label in [(far_row2, "row2")]:
         csv_path = OUTPUT_ROOT / ("tcn_event_details_%s.csv" % row_label)
         details = far_result.get("event_details", [])
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
@@ -792,11 +797,15 @@ def save_all_results(history, row1_metrics, row2_metrics, row3_metrics,
 # ---------------------------------------------------------------------------
 def plot_all_figures(history, best_epoch, best_val_f1,
                     y_true, y_prob,
-                    y_pred_row1, y_pred_row2, y_pred_row3,
-                    row1_metrics, row2_metrics, row3_metrics,
-                    post_row2, post_row3,
-                    thresh_result, optimal_threshold, logger):
-    """Produce and save all 12 figures at dpi=150."""
+                    y_pred_row1, y_pred_row2,
+                    row1_metrics, row2_metrics,
+                    post_row2, logger):
+    """Produce and save figures at dpi=150.
+
+    Row 3 / threshold-optimisation figures (confusion matrix row 3,
+    threshold curve, Row 3 contributions to ROC/metrics/FAR/timeline)
+    have been retired. The remaining figures cover Row 1 + Row 2 only.
+    """
 
     epochs = history["epoch"]
 
@@ -808,14 +817,27 @@ def plot_all_figures(history, best_epoch, best_val_f1,
     # (loss drops but F1 plateaus/declines), underfit (both remain poor), or
     # converged healthily (loss drops and F1 rises then stabilises). The
     # vertical dashed line marks the epoch whose weights are saved as final.
+    # Each panel overlays the raw per-epoch trace (faint) with an EMA-smoothed
+    # trend (alpha=0.6, TensorBoard-default) -- val F1 is noisy at this dataset
+    # prevalence and the smoothed line makes the convergence trajectory legible.
+    EMA_ALPHA = 0.6
+    train_loss_smoothed = ema_smooth(history["train_loss"], alpha=EMA_ALPHA)
+    val_f1_smoothed     = ema_smooth(history["val_f1"], alpha=EMA_ALPHA)
+
     fig, axes = plt.subplots(1, 2, figsize=(13, 4))
-    axes[0].plot(epochs, history["train_loss"], color="#5A7DC8", linewidth=1.2, label="Train loss")
+    axes[0].plot(epochs, history["train_loss"], color="#5A7DC8",
+                 linewidth=1.0, alpha=0.25, label="Train loss (raw)")
+    axes[0].plot(epochs, train_loss_smoothed, color="#5A7DC8",
+                 linewidth=1.6, label="Train loss (EMA, α=0.6)")
     axes[0].axvline(best_epoch, linestyle="--", color="#C85A5A", alpha=0.7, label="Best epoch")
     axes[0].set_xlabel("Epoch")
     axes[0].set_ylabel("BCEWithLogitsLoss")
     axes[0].set_title("Training loss")
     axes[0].legend(fontsize=9)
-    axes[1].plot(epochs, history["val_f1"], color="#5A7DC8", linewidth=1.2, label="Val F1")
+    axes[1].plot(epochs, history["val_f1"], color="#5A7DC8",
+                 linewidth=1.0, alpha=0.25, label="Val F1 (raw)")
+    axes[1].plot(epochs, val_f1_smoothed, color="#5A7DC8",
+                 linewidth=1.6, label="Val F1 (EMA, α=0.6)")
     axes[1].axvline(best_epoch, linestyle="--", color="#C85A5A", alpha=0.7, label="Best epoch")
     axes[1].annotate("%.4f" % best_val_f1, xy=(best_epoch, best_val_f1),
                      xytext=(5, -15), textcoords="offset points", fontsize=9, color="#C85A5A")
@@ -845,17 +867,17 @@ def plot_all_figures(history, best_epoch, best_val_f1,
     plt.close()
     logger.info("Saved: %s", FIGURE_DIR / "tcn_lr_schedule.png")
 
-    # -- Figures 3-5: Confusion matrices per row -------------------------------
+    # -- Figures 3-4: Confusion matrices per row -------------------------------
     # PURPOSE: One confusion matrix per evaluation row shows TP, FP, FN, TN
     # counts. Comparing Row 1 to Row 2 isolates the effect of post-processing
     # (smoothing + merging + min-duration filter) at the same threshold.
-    # Comparing Row 2 to Row 3 isolates the effect of threshold optimisation.
+    # Row 3 (threshold-optimised post-processing) has been retired; see
+    # run_postprocessing_evaluations docstring.
     # The title of each matrix includes sensitivity, specificity, F1, and
     # Youden J so the reader can assess all four quantities at a glance.
     for row_idx, (y_pred_row, m, row_label, thresh) in enumerate([
         (y_pred_row1, row1_metrics, "Row1: raw", 0.5),
         (y_pred_row2, row2_metrics, "Row2: post-proc", 0.5),
-        (y_pred_row3, row3_metrics, "Row3: post-proc", optimal_threshold),
     ], 1):
         cm = confusion_matrix(y_true, y_pred_row, labels=[0, 1])
         fig, ax = plt.subplots(figsize=(5, 4))
@@ -872,7 +894,7 @@ def plot_all_figures(history, best_epoch, best_val_f1,
         plt.savefig(FIGURE_DIR / ("tcn_confusion_matrix_row%d.png" % row_idx),
                     dpi=150, bbox_inches="tight")
         plt.close()
-    logger.info("Saved: confusion matrices (3 figures)")
+    logger.info("Saved: confusion matrices (2 figures)")
 
     # -- Figure 6: ROC curve ---------------------------------------------------
     # PURPOSE: Displays the trade-off between sensitivity and false positive
@@ -889,7 +911,7 @@ def plot_all_figures(history, best_epoch, best_val_f1,
     ax.fill_between(fpr, tpr, alpha=0.08, color="#5A7DC8")
     # Operating points
     for m, lbl, marker in [
-        (row1_metrics, "R1", "o"), (row2_metrics, "R2", "s"), (row3_metrics, "R3", "D"),
+        (row1_metrics, "R1", "o"), (row2_metrics, "R2", "s"),
     ]:
         fpr_pt = 1 - m["specificity"]
         tpr_pt = m["recall"]
@@ -903,31 +925,10 @@ def plot_all_figures(history, best_epoch, best_val_f1,
     plt.close()
     logger.info("Saved: %s", FIGURE_DIR / "tcn_roc_curve.png")
 
-    # -- Figure 7: Threshold curve ---------------------------------------------
-    # PURPOSE: Directly answers the reviewer question "how was the threshold
-    # selected?" by plotting Youden J as a function of threshold from 0.1 to
-    # 0.9. The peak of this curve is the optimal threshold, marked with a
-    # vertical dashed line. A broad, flat peak suggests the model is robust
-    # to threshold choice; a narrow spike suggests sensitivity to the exact
-    # value. This plot is computed on the validation set only -- the selected
-    # threshold is applied without modification to the test set.
-    curve = thresh_result.get("threshold_curve", {})
-    if curve:
-        thresholds_list = sorted(curve.keys())
-        scores_list = [curve[t] for t in thresholds_list]
-        fig, ax = plt.subplots(figsize=(8, 4))
-        ax.plot(thresholds_list, scores_list, color="#5A7DC8", linewidth=1.2)
-        ax.axvline(optimal_threshold, linestyle="--", color="#C85A5A", linewidth=1.2)
-        ax.annotate("Optimal t=%.3f" % optimal_threshold,
-                    xy=(optimal_threshold, max(scores_list) if scores_list else 0),
-                    xytext=(10, -10), textcoords="offset points", fontsize=9, color="#C85A5A")
-        ax.set_xlabel("Threshold")
-        ax.set_ylabel("Youden J statistic")
-        ax.set_title("Threshold selection -- Youden J vs threshold")
-        plt.tight_layout()
-        plt.savefig(FIGURE_DIR / "tcn_threshold_curve.png", dpi=150, bbox_inches="tight")
-        plt.close()
-        logger.info("Saved: %s", FIGURE_DIR / "tcn_threshold_curve.png")
+    # -- Figure 7: Threshold curve (RETIRED) -----------------------------------
+    # Threshold optimisation is disabled (see run_postprocessing_evaluations);
+    # without an optimal threshold there is nothing to plot here. The figure
+    # is intentionally left out of the output set.
 
     # -- Figure 8: Metrics comparison ------------------------------------------
     # PURPOSE: A grouped bar chart providing a single-figure summary of all
@@ -942,16 +943,14 @@ def plot_all_figures(history, best_epoch, best_val_f1,
     metric_names = ["accuracy", "precision", "recall", "specificity", "f1_macro", "auroc", "average_precision"]
     r1_vals = [row1_metrics.get(m, 0) for m in metric_names]
     r2_vals = [row2_metrics.get(m, 0) for m in metric_names]
-    r3_vals = [row3_metrics.get(m, 0) for m in metric_names]
 
     fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(12, 7),
                                           gridspec_kw={"height_ratios": [7, 3]})
     x_pos = np.arange(len(metric_names))
-    w = 0.25
-    bars1 = ax_top.bar(x_pos - w, r1_vals, w, color="#E8A87C", label="Row1: raw t=0.5")
-    bars2 = ax_top.bar(x_pos, r2_vals, w, color="#5A7DC8", label="Row2: post-proc t=0.5")
-    bars3 = ax_top.bar(x_pos + w, r3_vals, w, color="#41B3A3", label="Row3: post-proc t=opt")
-    for bars in [bars1, bars2, bars3]:
+    w = 0.35
+    bars1 = ax_top.bar(x_pos - w / 2, r1_vals, w, color="#E8A87C", label="Row1: raw t=0.5")
+    bars2 = ax_top.bar(x_pos + w / 2, r2_vals, w, color="#5A7DC8", label="Row2: post-proc t=0.5")
+    for bars in [bars1, bars2]:
         for bar in bars:
             h = bar.get_height()
             ax_top.annotate("%.2f" % h, xy=(bar.get_x() + bar.get_width() / 2, h),
@@ -960,18 +959,17 @@ def plot_all_figures(history, best_epoch, best_val_f1,
     ax_top.set_xticks(x_pos)
     ax_top.set_xticklabels(metric_names, fontsize=8)
     ax_top.set_ylabel("Score")
-    ax_top.set_title("Evaluation metrics across three configurations")
+    ax_top.set_title("Evaluation metrics: Row 1 vs Row 2")
     ax_top.legend(fontsize=8)
     ax_top.set_ylim(0, 1.15)
 
     # FAR comparison panel
-    far_labels = ["Row1\nseg-level", "Row2\nevent-level", "Row3\nevent-level"]
+    far_labels = ["Row1\nseg-level", "Row2\nevent-level"]
     far_vals = [
         row1_metrics.get("far_per_hour_seg", 0),
         row2_metrics.get("far_per_hour_event", 0),
-        row3_metrics.get("far_per_hour_event", 0),
     ]
-    far_colors = ["#C85A5A", "#5A7DC8", "#41B3A3"]
+    far_colors = ["#C85A5A", "#5A7DC8"]
     bars_far = ax_bot.bar(far_labels, far_vals, color=far_colors)
     for bar in bars_far:
         h = bar.get_height()
@@ -999,12 +997,27 @@ def plot_all_figures(history, best_epoch, best_val_f1,
     prevalence = np.mean(y_true)
     fig, ax = plt.subplots(figsize=(5, 5))
     ax.plot(rec_arr, prec_arr, color="#5A7DC8", linewidth=1.5,
-            label="TCN (AP = %.4f)" % avg_prec_val)
+            label="PR Curve (AP = %.4f)" % avg_prec_val)
     ax.axhline(prevalence, linestyle="--", color="gray", alpha=0.5, label="No-skill (%.3f)" % prevalence)
     ax.fill_between(rec_arr, prec_arr, alpha=0.08, color="#5A7DC8")
+    # Overlay Row 1 (raw) and Row 2 (post-processed) operating points.
+    # Row 1 sits on the curve (single threshold of y_prob); Row 2 typically
+    # sits off the curve because post-processing is non-monotone.
+    r1_recall = float(row1_metrics.get("recall", 0))
+    r1_precision = float(row1_metrics.get("precision", 0))
+    r2_recall = float(row2_metrics.get("recall", 0))
+    r2_precision = float(row2_metrics.get("precision", 0))
+    ax.scatter([r1_recall], [r1_precision],
+               color="#5A7DC8", s=70, zorder=5, edgecolor="black", linewidth=0.6)
+    ax.annotate("Raw (τ=0.5)", xy=(r1_recall, r1_precision),
+                xytext=(8, -4), textcoords="offset points", fontsize=9)
+    ax.scatter([r2_recall], [r2_precision],
+               color="#E8A87C", s=70, zorder=5, edgecolor="black", linewidth=0.6)
+    ax.annotate("Post-proc (τ=0.5)", xy=(r2_recall, r2_precision),
+                xytext=(8, -4), textcoords="offset points", fontsize=9)
     ax.set_xlabel("Recall (Sensitivity)")
     ax.set_ylabel("Precision")
-    ax.set_title("Precision-Recall Curve -- Validation set")
+    ax.set_title("TCN PR Curve with Operating Points")
     ax.legend(fontsize=9)
     plt.tight_layout()
     plt.savefig(FIGURE_DIR / "tcn_pr_curve.png", dpi=150, bbox_inches="tight")
@@ -1047,13 +1060,12 @@ def plot_all_figures(history, best_epoch, best_val_f1,
     # realistic alarm rate. The visual drop from Row 1 to Rows 2/3 quantifies
     # the clinical benefit of the post-processing pipeline.
     fig, ax = plt.subplots(figsize=(7, 4))
-    far_labels = ["Row1\nsegment-level", "Row2\nevent-level", "Row3\nevent-level"]
+    far_labels = ["Row1\nsegment-level", "Row2\nevent-level"]
     far_vals = [
         row1_metrics.get("far_per_hour_seg", 0),
         row2_metrics.get("far_per_hour_event", 0),
-        row3_metrics.get("far_per_hour_event", 0),
     ]
-    far_colors = ["#C85A5A", "#5A7DC8", "#41B3A3"]
+    far_colors = ["#C85A5A", "#5A7DC8"]
     bars = ax.bar(far_labels, far_vals, color=far_colors, edgecolor="white")
     for bar in bars:
         h = bar.get_height()
@@ -1082,9 +1094,9 @@ def plot_all_figures(history, best_epoch, best_val_f1,
     # events confirm genuine seizure detections. This directly addresses
     # reviewer questions about post-processing parameter sensitivity.
     fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-    # Combine events from rows 2 and 3
+    # Events from Row 2 (post-processed at t=0.5)
     all_durations = []
-    for post in [post_row2, post_row3]:
+    for post in [post_row2]:
         for evt in post.get("events", []):
             all_durations.append(evt.get("duration_sec", 0))
     if all_durations:
@@ -1096,15 +1108,15 @@ def plot_all_figures(history, best_epoch, best_val_f1,
     axes[0].set_ylabel("Count")
     axes[0].set_title("Distribution of detected event durations")
 
-    # Row 3 event timeline
-    events_r3 = far_row3_details = [evt for evt in
-                                     compute_event_level_far(
-                                         y_true, post_row3, STEP_SEC, SEGMENT_SEC
-                                     ).get("event_details", [])]
-    if events_r3:
-        starts = [e["start_sec"] for e in events_r3]
-        durations = [e["duration_sec"] for e in events_r3]
-        colors = ["#41B3A3" if e["is_true_alarm"] else "#C85A5A" for e in events_r3]
+    # Row 2 event timeline
+    events_r2 = [evt for evt in
+                 compute_event_level_far(
+                     y_true, post_row2, STEP_SEC, SEGMENT_SEC
+                 ).get("event_details", [])]
+    if events_r2:
+        starts = [e["start_sec"] for e in events_r2]
+        durations = [e["duration_sec"] for e in events_r2]
+        colors = ["#41B3A3" if e["is_true_alarm"] else "#C85A5A" for e in events_r2]
         axes[1].scatter(starts, durations, c=colors, s=30, alpha=0.7)
         axes[1].axhline(MIN_EVENT_SEC, linestyle="--", color="gray", alpha=0.5)
         # Manual legend
@@ -1113,7 +1125,7 @@ def plot_all_figures(history, best_epoch, best_val_f1,
         axes[1].legend(fontsize=8)
     axes[1].set_xlabel("Event start time (s)")
     axes[1].set_ylabel("Event duration (s)")
-    axes[1].set_title("Event timeline -- Row 3 (optimal threshold)")
+    axes[1].set_title("Event timeline -- Row 2 (post-proc t=0.5)")
     plt.tight_layout()
     plt.savefig(FIGURE_DIR / "tcn_segment_length_analysis.png", dpi=150, bbox_inches="tight")
     plt.close()
@@ -1277,7 +1289,7 @@ def main():
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
         logger.info("RESUMED from %s: epoch %d, best_val_f1=%.4f (epoch %d), patience=%d/%d",
                     resume_path.name, ckpt["epoch"], best_val_f1,
-                    best_epoch, epochs_no_imp, ES_PATIENCE)
+                    best_epoch, min(epochs_no_imp, ES_PATIENCE), ES_PATIENCE)
     else:
         logger.info("No checkpoint found. Starting from epoch 1.")
 
@@ -1328,7 +1340,7 @@ def main():
             "Epoch %3d/%d | loss=%.4f | val_f1=%.4f | lr=%.2e | best=%.4f | patience=%d/%d"
             " | train %.0fs | val %.0fs",
             epoch, MAX_EPOCHS, train_loss, val_f1, current_lr,
-            best_val_f1, epochs_no_imp, ES_PATIENCE, train_sec, val_sec)
+            best_val_f1, min(epochs_no_imp, ES_PATIENCE), ES_PATIENCE, train_sec, val_sec)
 
         if val_f1 > best_val_f1:
             best_val_f1 = val_f1
@@ -1408,30 +1420,36 @@ def main():
     val_f1_final, y_true, y_pred_05, y_prob = evaluate_model(model, val_loader, DEVICE, logger, use_amp=use_amp)
     logger.info("Full-val F1 (raw @ 0.5): %.4f", val_f1_final)
 
-    # -- Step 11: Post-processing evaluations ----------------------------------
-    (row1_metrics, row2_metrics, row3_metrics,
-     post_row2, post_row3, far_row2, far_row3,
-     thresh_result, optimal_threshold) = run_postprocessing_evaluations(y_true, y_prob, logger)
+    # -- Step 11: Post-processing evaluations (Row 3 retired) ------------------
+    (row1_metrics, row2_metrics,
+     post_row2, far_row2) = run_postprocessing_evaluations(y_true, y_prob, logger)
 
     # -- Step 12: Save all structured results ----------------------------------
     y_pred_row1 = (y_prob >= 0.5).astype(int)
     y_pred_row2 = post_row2["smoothed_preds"]
-    y_pred_row3 = post_row3["smoothed_preds"]
 
     save_all_results(
-        history, row1_metrics, row2_metrics, row3_metrics,
-        far_row2, far_row3, hp, best_epoch, best_val_f1,
+        history, row1_metrics, row2_metrics,
+        far_row2, hp, best_epoch, best_val_f1,
         elapsed, DEVICE, n_params, y_true,
-        y_pred_row1, y_pred_row2, y_pred_row3, logger)
+        y_pred_row1, y_pred_row2, logger)
 
     # -- Step 13: Plot all figures ---------------------------------------------
     plot_all_figures(
         history, best_epoch, best_val_f1,
         y_true, y_prob,
-        y_pred_row1, y_pred_row2, y_pred_row3,
-        row1_metrics, row2_metrics, row3_metrics,
-        post_row2, post_row3,
-        thresh_result, optimal_threshold, logger)
+        y_pred_row1, y_pred_row2,
+        row1_metrics, row2_metrics,
+        post_row2, logger)
+
+    # -- Step 13b: Result_classReport bar plot ---------------------------------
+    # Macro-avg classification metrics (Row 1 + Row 2) plus FAR/hr in a
+    # standalone two-panel figure under OUTPUT_ROOT/Result_classReport/.
+    # Same protocol as M2, M3, M4 -- shared helper in tcn_utils.py.
+    make_classreport_barplot(
+        row1_metrics, row2_metrics,
+        RESULT_CLASSREPORT_DIR / "tcn_classreport_barplot.png",
+        title_prefix="TCN", logger=logger)
 
     # -- Step 14: Final inventory and cleanup ----------------------------------
     if torch.cuda.is_available():
@@ -1446,26 +1464,22 @@ def main():
         CKPT_DIR / "tcn_best.pt",
         TRAIN_LOG_PATH,
         EVAL_REPORT_PATH,
-        THRESH_PATH,
         EPOCH_CSV,
         THREE_ROW_CSV,
         OUTPUT_ROOT / "tcn_classification_report_row1.json",
         OUTPUT_ROOT / "tcn_classification_report_row2.json",
-        OUTPUT_ROOT / "tcn_classification_report_row3.json",
         OUTPUT_ROOT / "tcn_event_details_row2.csv",
-        OUTPUT_ROOT / "tcn_event_details_row3.csv",
         FIGURE_DIR / "tcn_training_curves.png",
         FIGURE_DIR / "tcn_lr_schedule.png",
         FIGURE_DIR / "tcn_confusion_matrix_row1.png",
         FIGURE_DIR / "tcn_confusion_matrix_row2.png",
-        FIGURE_DIR / "tcn_confusion_matrix_row3.png",
         FIGURE_DIR / "tcn_roc_curve.png",
-        FIGURE_DIR / "tcn_threshold_curve.png",
         FIGURE_DIR / "tcn_metrics_comparison.png",
         FIGURE_DIR / "tcn_pr_curve.png",
         FIGURE_DIR / "tcn_calibration_curve.png",
         FIGURE_DIR / "tcn_far_comparison.png",
         FIGURE_DIR / "tcn_segment_length_analysis.png",
+        RESULT_CLASSREPORT_DIR / "tcn_classreport_barplot.png",
     ]
     for p in all_outputs:
         exists = Path(p).exists()

@@ -2,26 +2,30 @@
 #SBATCH --job-name=m3_post_eval
 # specify number of nodes
 #SBATCH -N 1
-# Single Python process with 10 CPUs available for DataLoader workers
+# Single Python process. The CPU-only post-eval pass needs only 1-2 cores
+# (no DataLoader workers, no GPU), so cpus-per-task is dropped from 10 to 2.
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=10
+#SBATCH --cpus-per-task=2
 
-#SBATCH --partition=csgpu
+# CPU partition: m3_post_eval.py now reads cached predictions
+# (multiscale_tcn_predictions_raw.npz) instead of re-running model
+# inference, so a GPU is no longer required. Run on the CPU partition.
+#SBATCH --partition=cs
 
-# Request 1 GPU. FP32 final eval needs more memory headroom than AMP,
-# but the 447,617-parameter MultiScaleTCN at batch_size=32 fits in any
-# Tesla V100 / A100 / L40S allocation comfortably.
-#SBATCH --gres=gpu:1
+# (Retired) GPU partition + allocation. Re-enable together with the
+# inference block in m3_post_eval.py if a fresh forward pass is ever
+# required.
+##SBATCH --partition=csgpu
+##SBATCH --gres=gpu:1
 
-# M3 post-training evaluation: load multiscale_tcn_final_weights.pt and
-# run the full-validation pass + three-row post-processing pipeline with
-# four-layer NaN protection (input filter + dataset hardening + FP32
-# forward + finiteness assert). This recovers the three-row report that
-# the original training run aborted before producing. ~14-16 h wall time
-# expected: ~11 h for the full-val FP32 pass plus ~30-60 min for post-
-# processing and figure generation. Wall-time budget allows for slow
-# Lustre/GPFS I/O.
-#SBATCH -t 3-00:00:00
+# M3 post-training evaluation: load cached y_true / y_prob from
+# multiscale_tcn_predictions_raw.npz, run Row 1 + Row 2 post-processing
+# (Row 3 retired -- threshold optimisation disabled), and write the
+# evaluation report, two-row CSV, classification reports, figures, and
+# the new Result_classReport bar plot. The 11-hour FP32 forward pass is
+# replaced by a ~1-second .npz load, so total wall time is dominated by
+# post-processing + figure generation: ~30 min suffices.
+#SBATCH -t 0-05:00:00
 
 # SLURM stdout / stderr routed to the home directory (NOT under any
 # individual output folder). %j expands to the job ID at submission time
@@ -37,10 +41,9 @@ echo "===== JOB START ====="
 date
 echo "Running on node: $(hostname)"
 echo "Job ID: $SLURM_JOB_ID"
-echo "GPU allocated: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'none detected')"
+echo "Partition: ${SLURM_JOB_PARTITION:-unset} (CPU-only post-eval)"
 
-# CPU allocation diagnostics: confirm SLURM gave us 10 cores AND that the
-# Python process can actually use all of them (cpuset / cgroup binding).
+# CPU allocation diagnostics.
 echo "----- CPU allocation -----"
 echo "SLURM_CPUS_PER_TASK : ${SLURM_CPUS_PER_TASK:-unset}"
 echo "SLURM_CPUS_ON_NODE  : ${SLURM_CPUS_ON_NODE:-unset}"
@@ -57,8 +60,9 @@ cd ~/TCN_SSL_GA
 
 # Persistent log goes to:
 #   /home/people/22206468/scratch/OUTPUT/MODEL3_OUTPUT/MultiScaleTCN/logs/m3_post_eval.log
-# Outputs (report JSON, three-row CSV, optimal-threshold JSON, figures)
-# go to /home/people/22206468/scratch/OUTPUT/MODEL3_OUTPUT/MultiScaleTCN/.
+# Outputs (report JSON, two-row CSV, classification reports, figures, and
+# Result_classReport/multiscale_tcn_classreport_barplot.png) go under
+#   /home/people/22206468/scratch/OUTPUT/MODEL3_OUTPUT/MultiScaleTCN/.
 python m3_post_eval.py
 
 echo "===== JOB END ====="

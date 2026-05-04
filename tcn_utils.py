@@ -2537,3 +2537,130 @@ class MultiScaleTCNWithAttention(nn.Module):
 # Both return scalar logits for BCEWithLogitsLoss.
 # count_parameters() works on both.
 # -----------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# ema_smooth
+# ---------------------------------------------------------------------------
+def ema_smooth(values, alpha=0.6):
+    """Exponential moving average for noisy training-curve plotting.
+
+    Matches TensorBoard's "smoothing" slider semantics so figures are
+    immediately readable to reviewers familiar with that interface:
+        s_0 = v_0
+        s_t = alpha * s_{t-1} + (1 - alpha) * v_t
+
+    alpha = 0   -> no smoothing (returns input unchanged)
+    alpha = 0.6 -> TensorBoard default; tracks recent trend
+    alpha -> 1  -> very heavy smoothing, lags the signal
+
+    Parameters
+    ----------
+    values : sequence of float
+        Per-epoch metric values (loss, F1, etc.).
+    alpha : float, default 0.6
+        Smoothing factor in [0, 1).
+
+    Returns
+    -------
+    list of float
+        Smoothed sequence, same length as input.
+    """
+    if not values:
+        return []
+    if alpha <= 0.0:
+        return list(values)
+    smoothed = [float(values[0])]
+    for v in values[1:]:
+        smoothed.append(alpha * smoothed[-1] + (1.0 - alpha) * float(v))
+    return smoothed
+
+
+# ---------------------------------------------------------------------------
+# make_classreport_barplot
+# ---------------------------------------------------------------------------
+def make_classreport_barplot(row1_metrics, row2_metrics, out_path,
+                             title_prefix, logger):
+    """Two-panel grouped bar plot for the Result_classReport deliverable.
+
+    Identical layout for M1, M2, M3, M4 -- the only per-model variation is
+    the title prefix and the output filename, both passed in by the caller.
+
+    Top panel : macro-average classification metrics (accuracy, precision,
+                recall, F1-score, AUROC, specificity, average_precision)
+                for Row 1 (raw t=0.5) and Row 2 (post-processed t=0.5).
+    Bottom    : FAR/hr -- Row 1 segment-level vs Row 2 event-level.
+
+    Parameters
+    ----------
+    row1_metrics, row2_metrics : dict
+        Output of compute_all_metrics(). Required keys: accuracy, precision,
+        recall, f1_macro, auroc, specificity, average_precision; plus
+        far_per_hour_seg on row1 and far_per_hour_event on row2.
+    out_path : pathlib.Path
+        Full path of the .png to write. Parent directory is created if
+        absent (mkdir parents=True, exist_ok=True).
+    title_prefix : str
+        Model identifier injected into the top-panel title, e.g. "TCN",
+        "TCN + Attention", "Multi-Scale TCN", "MS-TCN + Attention".
+    logger : logging.Logger
+        For the "Saved: ..." line on success.
+    """
+    import matplotlib.pyplot as plt                # local import: keep
+                                                    # tcn_utils import light
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    metric_names = ["accuracy", "precision", "recall", "f1_macro",
+                    "auroc", "specificity", "average_precision"]
+    display_names = ["accuracy", "precision", "recall", "F1-score",
+                     "AUROC", "specificity", "AP (PRAUC)"]
+    r1_vals = [row1_metrics.get(m, 0) for m in metric_names]
+    r2_vals = [row2_metrics.get(m, 0) for m in metric_names]
+
+    fig, (ax_top, ax_bot) = plt.subplots(
+        2, 1, figsize=(12, 7),
+        gridspec_kw={"height_ratios": [7, 3]})
+    x_pos = np.arange(len(metric_names))
+    w = 0.35
+    bars1 = ax_top.bar(x_pos - w / 2, r1_vals, w, color="#E8A87C",
+                       label="Row1: raw t=0.5")
+    bars2 = ax_top.bar(x_pos + w / 2, r2_vals, w, color="#5A7DC8",
+                       label="Row2: post-proc t=0.5")
+    for bars in [bars1, bars2]:
+        for bar in bars:
+            h = bar.get_height()
+            ax_top.annotate(
+                "%.2f" % h,
+                xy=(bar.get_x() + bar.get_width() / 2, h),
+                xytext=(0, 2), textcoords="offset points",
+                ha="center", fontsize=7)
+    ax_top.set_xticks(x_pos)
+    ax_top.set_xticklabels(display_names, fontsize=9)
+    ax_top.set_ylabel("Score (macro avg)")
+    ax_top.set_title("%s Classification Report -- Row 1 vs Row 2" % title_prefix)
+    ax_top.legend(fontsize=8)
+    ax_top.set_ylim(0, 1.15)
+
+    far_labels = ["Row1\nseg-level", "Row2\nevent-level"]
+    far_vals = [
+        row1_metrics.get("far_per_hour_seg", 0),
+        row2_metrics.get("far_per_hour_event", 0),
+    ]
+    bars_far = ax_bot.bar(far_labels, far_vals,
+                          color=["#C85A5A", "#5A7DC8"], edgecolor="white")
+    for bar in bars_far:
+        h = bar.get_height()
+        ax_bot.annotate(
+            "%.2f" % h,
+            xy=(bar.get_x() + bar.get_width() / 2, h),
+            xytext=(0, 2), textcoords="offset points",
+            ha="center", fontsize=8)
+    ax_bot.set_ylabel("FAR/hr")
+    ax_bot.set_title("False Alarm Rate per Hour")
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("Saved: %s", out_path)
