@@ -620,6 +620,7 @@ def main():
     logger.info("-" * 65)
     logger.info("Step 9: Result_classReport bar plot (Row 1 + Row 2)")
     make_classreport_barplot(
+        y_true, y_pred_row1, y_pred_row2,
         row1_metrics, row2_metrics,
         RESULT_CLASSREPORT_DIR / "multiscale_tcn_classreport_barplot.png",
         title_prefix="Multi-Scale TCN", logger=logger)

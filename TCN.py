@@ -1447,6 +1447,7 @@ def main():
     # standalone two-panel figure under OUTPUT_ROOT/Result_classReport/.
     # Same protocol as M2, M3, M4 -- shared helper in tcn_utils.py.
     make_classreport_barplot(
+        y_true, y_pred_row1, y_pred_row2,
         row1_metrics, row2_metrics,
         RESULT_CLASSREPORT_DIR / "tcn_classreport_barplot.png",
         title_prefix="TCN", logger=logger)

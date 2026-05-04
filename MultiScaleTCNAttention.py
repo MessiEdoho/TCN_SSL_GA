@@ -1469,6 +1469,7 @@ def main():
     # standalone two-panel figure under OUTPUT_ROOT/Result_classReport/.
     # Same protocol as M1, M2, M3 -- shared helper in tcn_utils.py.
     make_classreport_barplot(
+        y_true, y_pred_row1, y_pred_row2,
         row1_metrics, row2_metrics,
         RESULT_CLASSREPORT_DIR / "ms_attn_classreport_barplot.png",
         title_prefix="MS-TCN + Attention", logger=logger)

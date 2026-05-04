@@ -2579,24 +2579,44 @@ def ema_smooth(values, alpha=0.6):
 # ---------------------------------------------------------------------------
 # make_classreport_barplot
 # ---------------------------------------------------------------------------
-def make_classreport_barplot(row1_metrics, row2_metrics, out_path,
+def make_classreport_barplot(y_true, y_pred_row1, y_pred_row2,
+                             row1_metrics, row2_metrics, out_path,
                              title_prefix, logger):
     """Two-panel grouped bar plot for the Result_classReport deliverable.
 
     Identical layout for M1, M2, M3, M4 -- the only per-model variation is
     the title prefix and the output filename, both passed in by the caller.
 
-    Top panel : macro-average classification metrics (accuracy, precision,
-                recall, F1-score, AUROC, specificity, average_precision)
-                for Row 1 (raw t=0.5) and Row 2 (post-processed t=0.5).
+    Top panel : seven evaluation metrics for Row 1 (raw predictions at
+                t=0.5) and Row 2 (post-processed predictions at t=0.5):
+
+                  1. accuracy           -- classification_report["accuracy"]
+                  2. precision (macro)  -- classification_report["macro avg"]
+                  3. recall    (macro)  -- classification_report["macro avg"]
+                  4. F1-score  (macro)  -- classification_report["macro avg"]
+                  5. specificity        -- conventional positive-class TNR
+                                           = TN/(TN+FP), single value from
+                                           row_metrics
+                  6. AUROC              -- row_metrics["auroc"]
+                  7. AP (PRAUC)         -- row_metrics["average_precision"]
+
     Bottom    : FAR/hr -- Row 1 segment-level vs Row 2 event-level.
+
+    Bar value labels are *truncated* to 2 decimals (math.floor at the
+    second decimal) rather than rounded, so values such as 0.997 display
+    as "0.99" and never round up to "1.00".
 
     Parameters
     ----------
+    y_true : array-like of int
+        Per-segment ground-truth labels (0/1).
+    y_pred_row1, y_pred_row2 : array-like of int
+        Per-segment predictions used to compute the macro avg metrics for
+        each row via sklearn.metrics.classification_report.
     row1_metrics, row2_metrics : dict
-        Output of compute_all_metrics(). Required keys: accuracy, precision,
-        recall, f1_macro, auroc, specificity, average_precision; plus
-        far_per_hour_seg on row1 and far_per_hour_event on row2.
+        Output of compute_all_metrics(). Required keys: specificity, auroc,
+        average_precision; plus far_per_hour_seg on row1 and
+        far_per_hour_event on row2.
     out_path : pathlib.Path
         Full path of the .png to write. Parent directory is created if
         absent (mkdir parents=True, exist_ok=True).
@@ -2606,54 +2626,77 @@ def make_classreport_barplot(row1_metrics, row2_metrics, out_path,
     logger : logging.Logger
         For the "Saved: ..." line on success.
     """
-    import matplotlib.pyplot as plt                # local import: keep
-                                                    # tcn_utils import light
+    import math                                     # local imports: keep
+    import matplotlib.pyplot as plt                 # tcn_utils import light
+    from sklearn.metrics import classification_report
 
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    metric_names = ["accuracy", "precision", "recall", "f1_macro",
-                    "auroc", "specificity", "average_precision"]
+    def _truncate(v):
+        # Floor to 2 decimal places so values like 0.997 -> "0.99" and never
+        # round up to "1.00". Values exactly equal to 1.0 remain "1.00".
+        return math.floor(float(v) * 100.0) / 100.0
+
+    # Authoritative macro avg from sklearn classification_report.
+    r1_report = classification_report(y_true, y_pred_row1, output_dict=True,
+                                      zero_division=0)
+    r2_report = classification_report(y_true, y_pred_row2, output_dict=True,
+                                      zero_division=0)
+
     display_names = ["accuracy", "precision", "recall", "F1-score",
-                     "AUROC", "specificity", "AP (PRAUC)"]
-    r1_vals = [row1_metrics.get(m, 0) for m in metric_names]
-    r2_vals = [row2_metrics.get(m, 0) for m in metric_names]
+                     "specificity", "AUROC", "AP (PRAUC)"]
+
+    def _row_values(report, row_metrics):
+        macro = report.get("macro avg", {})
+        return [
+            float(report.get("accuracy", 0.0)),
+            float(macro.get("precision", 0.0)),
+            float(macro.get("recall", 0.0)),
+            float(macro.get("f1-score", 0.0)),
+            float(row_metrics.get("specificity", 0.0)),
+            float(row_metrics.get("auroc", 0.0)),
+            float(row_metrics.get("average_precision", 0.0)),
+        ]
+
+    r1_vals = _row_values(r1_report, row1_metrics)
+    r2_vals = _row_values(r2_report, row2_metrics)
 
     fig, (ax_top, ax_bot) = plt.subplots(
         2, 1, figsize=(12, 7),
         gridspec_kw={"height_ratios": [7, 3]})
-    x_pos = np.arange(len(metric_names))
+    x_pos = np.arange(len(display_names))
     w = 0.35
     bars1 = ax_top.bar(x_pos - w / 2, r1_vals, w, color="#E8A87C",
-                       label="Row1: raw t=0.5")
+                       label="Raw score")
     bars2 = ax_top.bar(x_pos + w / 2, r2_vals, w, color="#5A7DC8",
-                       label="Row2: post-proc t=0.5")
+                       label="Post-processed score")
     for bars in [bars1, bars2]:
         for bar in bars:
             h = bar.get_height()
             ax_top.annotate(
-                "%.2f" % h,
+                "%.2f" % _truncate(h),
                 xy=(bar.get_x() + bar.get_width() / 2, h),
                 xytext=(0, 2), textcoords="offset points",
                 ha="center", fontsize=7)
     ax_top.set_xticks(x_pos)
     ax_top.set_xticklabels(display_names, fontsize=9)
-    ax_top.set_ylabel("Score (macro avg)")
+    ax_top.set_ylabel("Score")
     ax_top.set_title("%s Classification Report -- Row 1 vs Row 2" % title_prefix)
     ax_top.legend(fontsize=8)
     ax_top.set_ylim(0, 1.15)
 
     far_labels = ["Row1\nseg-level", "Row2\nevent-level"]
     far_vals = [
-        row1_metrics.get("far_per_hour_seg", 0),
-        row2_metrics.get("far_per_hour_event", 0),
+        float(row1_metrics.get("far_per_hour_seg", 0.0)),
+        float(row2_metrics.get("far_per_hour_event", 0.0)),
     ]
     bars_far = ax_bot.bar(far_labels, far_vals,
                           color=["#C85A5A", "#5A7DC8"], edgecolor="white")
     for bar in bars_far:
         h = bar.get_height()
         ax_bot.annotate(
-            "%.2f" % h,
+            "%.2f" % _truncate(h),
             xy=(bar.get_x() + bar.get_width() / 2, h),
             xytext=(0, 2), textcoords="offset points",
             ha="center", fontsize=8)
