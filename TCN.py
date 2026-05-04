@@ -876,8 +876,8 @@ def plot_all_figures(history, best_epoch, best_val_f1,
     # The title of each matrix includes sensitivity, specificity, F1, and
     # Youden J so the reader can assess all four quantities at a glance.
     for row_idx, (y_pred_row, m, row_label, thresh) in enumerate([
-        (y_pred_row1, row1_metrics, "Row1: raw", 0.5),
-        (y_pred_row2, row2_metrics, "Row2: post-proc", 0.5),
+        (y_pred_row1, row1_metrics, "Raw", 0.5),
+        (y_pred_row2, row2_metrics, "Post-processed", 0.5),
     ], 1):
         cm = confusion_matrix(y_true, y_pred_row, labels=[0, 1])
         fig, ax = plt.subplots(figsize=(5, 4))
@@ -911,7 +911,7 @@ def plot_all_figures(history, best_epoch, best_val_f1,
     ax.fill_between(fpr, tpr, alpha=0.08, color="#5A7DC8")
     # Operating points
     for m, lbl, marker in [
-        (row1_metrics, "R1", "o"), (row2_metrics, "R2", "s"),
+        (row1_metrics, "Raw", "o"), (row2_metrics, "Post-processed", "s"),
     ]:
         fpr_pt = 1 - m["specificity"]
         tpr_pt = m["recall"]
@@ -948,8 +948,8 @@ def plot_all_figures(history, best_epoch, best_val_f1,
                                           gridspec_kw={"height_ratios": [7, 3]})
     x_pos = np.arange(len(metric_names))
     w = 0.35
-    bars1 = ax_top.bar(x_pos - w / 2, r1_vals, w, color="#E8A87C", label="Row1: raw t=0.5")
-    bars2 = ax_top.bar(x_pos + w / 2, r2_vals, w, color="#5A7DC8", label="Row2: post-proc t=0.5")
+    bars1 = ax_top.bar(x_pos - w / 2, r1_vals, w, color="#E8A87C", label="Raw")
+    bars2 = ax_top.bar(x_pos + w / 2, r2_vals, w, color="#5A7DC8", label="Post-processed")
     for bars in [bars1, bars2]:
         for bar in bars:
             h = bar.get_height()
@@ -959,12 +959,12 @@ def plot_all_figures(history, best_epoch, best_val_f1,
     ax_top.set_xticks(x_pos)
     ax_top.set_xticklabels(metric_names, fontsize=8)
     ax_top.set_ylabel("Score")
-    ax_top.set_title("Evaluation metrics: Row 1 vs Row 2")
+    ax_top.set_title("Evaluation metrics: Raw vs Post-processed")
     ax_top.legend(fontsize=8)
     ax_top.set_ylim(0, 1.15)
 
     # FAR comparison panel
-    far_labels = ["Row1\nseg-level", "Row2\nevent-level"]
+    far_labels = ["Raw\nseg-level", "Post-processed\nevent-level"]
     far_vals = [
         row1_metrics.get("far_per_hour_seg", 0),
         row2_metrics.get("far_per_hour_event", 0),
@@ -1060,7 +1060,7 @@ def plot_all_figures(history, best_epoch, best_val_f1,
     # realistic alarm rate. The visual drop from Row 1 to Rows 2/3 quantifies
     # the clinical benefit of the post-processing pipeline.
     fig, ax = plt.subplots(figsize=(7, 4))
-    far_labels = ["Row1\nsegment-level", "Row2\nevent-level"]
+    far_labels = ["Raw\nsegment-level", "Post-processed\nevent-level"]
     far_vals = [
         row1_metrics.get("far_per_hour_seg", 0),
         row2_metrics.get("far_per_hour_event", 0),
@@ -1125,7 +1125,7 @@ def plot_all_figures(history, best_epoch, best_val_f1,
         axes[1].legend(fontsize=8)
     axes[1].set_xlabel("Event start time (s)")
     axes[1].set_ylabel("Event duration (s)")
-    axes[1].set_title("Event timeline -- Row 2 (post-proc t=0.5)")
+    axes[1].set_title("Event timeline -- Post-processed")
     plt.tight_layout()
     plt.savefig(FIGURE_DIR / "tcn_segment_length_analysis.png", dpi=150, bbox_inches="tight")
     plt.close()

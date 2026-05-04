@@ -2682,11 +2682,11 @@ def make_classreport_barplot(y_true, y_pred_row1, y_pred_row2,
     ax_top.set_xticks(x_pos)
     ax_top.set_xticklabels(display_names, fontsize=9)
     ax_top.set_ylabel("Score")
-    ax_top.set_title("%s Classification Report -- Row 1 vs Row 2" % title_prefix)
+    ax_top.set_title("%s Classification Report -- Raw vs Post-processed" % title_prefix)
     ax_top.legend(fontsize=8)
     ax_top.set_ylim(0, 1.15)
 
-    far_labels = ["Row1\nseg-level", "Row2\nevent-level"]
+    far_labels = ["Raw\nseg-level", "Post-processed\nevent-level"]
     far_vals = [
         float(row1_metrics.get("far_per_hour_seg", 0.0)),
         float(row2_metrics.get("far_per_hour_event", 0.0)),

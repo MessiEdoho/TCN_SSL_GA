@@ -913,8 +913,8 @@ def plot_all_figures(history, best_epoch, best_val_f1,
     # Row 3 (threshold-optimised post-processing) has been retired; see
     # run_postprocessing_evaluations docstring.
     for row_idx, (yp, m, rl, th) in enumerate([
-        (y_pred_row1, row1_metrics, "Row1: raw", 0.5),
-        (y_pred_row2, row2_metrics, "Row2: post-proc", 0.5),
+        (y_pred_row1, row1_metrics, "Raw", 0.5),
+        (y_pred_row2, row2_metrics, "Post-processed", 0.5),
     ], 1):
         cm = confusion_matrix(y_true, yp, labels=[0, 1])
         fig, ax = plt.subplots(figsize=(5, 4))
@@ -937,7 +937,7 @@ def plot_all_figures(history, best_epoch, best_val_f1,
             label="MS-TCN+Attn (AUROC = %.4f)" % auroc_val)
     ax.plot([0, 1], [0, 1], linestyle="--", color="gray", alpha=0.5, label="Chance")
     ax.fill_between(fpr, tpr, alpha=0.08, color="#5A7DC8")
-    for m, lbl, mk in [(row1_metrics, "R1", "o"), (row2_metrics, "R2", "s")]:
+    for m, lbl, mk in [(row1_metrics, "Raw", "o"), (row2_metrics, "Post-processed", "s")]:
         ax.scatter([1 - m["specificity"]], [m["recall"]], marker=mk, s=60, zorder=5, label=lbl)
     ax.set_xlabel("FPR (1 - Specificity)"); ax.set_ylabel("TPR (Sensitivity)")
     ax.set_title("MS-TCN+Attention ROC -- Validation"); ax.legend(fontsize=8, loc="lower right")
@@ -956,8 +956,8 @@ def plot_all_figures(history, best_epoch, best_val_f1,
     r2 = [row2_metrics.get(m, 0) for m in mnames]
     fig, (ax_t, ax_b) = plt.subplots(2, 1, figsize=(12, 7), gridspec_kw={"height_ratios": [7, 3]})
     xp = np.arange(len(mnames)); w = 0.35
-    b1 = ax_t.bar(xp - w / 2, r1, w, color="#E8A87C", label="Row1: raw t=0.5")
-    b2 = ax_t.bar(xp + w / 2, r2, w, color="#5A7DC8", label="Row2: post-proc t=0.5")
+    b1 = ax_t.bar(xp - w / 2, r1, w, color="#E8A87C", label="Raw")
+    b2 = ax_t.bar(xp + w / 2, r2, w, color="#5A7DC8", label="Post-processed")
     for bars in [b1, b2]:
         for bar in bars:
             ax_t.annotate("%.2f" % bar.get_height(),
@@ -968,7 +968,7 @@ def plot_all_figures(history, best_epoch, best_val_f1,
     ax_t.legend(fontsize=8); ax_t.set_ylim(0, 1.15)
     fv = [row1_metrics.get("far_per_hour_seg", 0),
           row2_metrics.get("far_per_hour_event", 0)]
-    fb = ax_b.bar(["Row1\nseg", "Row2\nevent"], fv,
+    fb = ax_b.bar(["Raw\nseg", "Post-processed\nevent"], fv,
                   color=["#C85A5A", "#5A7DC8"])
     for bar in fb:
         ax_b.annotate("%.2f" % bar.get_height(),
@@ -1026,7 +1026,7 @@ def plot_all_figures(history, best_epoch, best_val_f1,
 
     # -- Figure 11: FAR comparison ---------------------------------------------
     fig, ax = plt.subplots(figsize=(7, 4))
-    fl = ["Row1\nsegment-level", "Row2\nevent-level"]
+    fl = ["Raw\nsegment-level", "Post-processed\nevent-level"]
     fvals = [row1_metrics.get("far_per_hour_seg", 0),
              row2_metrics.get("far_per_hour_event", 0)]
     bars = ax.bar(fl, fvals, color=["#C85A5A", "#5A7DC8"], edgecolor="white")
@@ -1062,7 +1062,7 @@ def plot_all_figures(history, best_epoch, best_val_f1,
         axes[1].scatter([], [], c="#C85A5A", label="False alarm")
         axes[1].legend(fontsize=8)
     axes[1].set_xlabel("Event start (s)"); axes[1].set_ylabel("Duration (s)")
-    axes[1].set_title("Event Timeline -- Row 2 (post-proc t=0.5)")
+    axes[1].set_title("Event Timeline -- Post-processed")
     plt.tight_layout()
     plt.savefig(FIGURE_DIR / ("%s_segment_length_analysis.png" % pfx), dpi=150, bbox_inches="tight")
     plt.close()
