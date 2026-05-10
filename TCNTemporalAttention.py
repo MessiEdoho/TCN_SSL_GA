@@ -171,6 +171,7 @@ EVAL_REPORT_PATH  = OUTPUT_ROOT / "tcn_attention_evaluation_report.json"
 THRESH_PATH       = OUTPUT_ROOT / "tcn_attention_optimal_threshold.json"
 EPOCH_CSV         = OUTPUT_ROOT / "tcn_attention_epoch_metrics.csv"
 THREE_ROW_CSV     = OUTPUT_ROOT / "tcn_attention_three_row_summary.csv"
+VAL_PREDICTIONS_NPZ = OUTPUT_ROOT / "tcn_attention_val_predictions_full.npz"  # cached val predictions (Phase 3)
 
 # Two JSON input files -- backbone and attention tuning results
 BACKBONE_PARAMS_PATH = Path("/home/people/22206468/scratch/OUTPUT/MODEL1_OUTPUT/TCNtuning_outputs") / "best_params.json"            # from tcn_HPT_binary.ipynb
@@ -1536,6 +1537,24 @@ def main():
     # -- Step 13: Save all results ---------------------------------------------
     y_pred_row1 = (y_prob >= 0.5).astype(int)          # raw binary preds at standard threshold
     y_pred_row2 = post_row2["smoothed_preds"]          # post-processed preds at threshold 0.5
+
+    # Cache val predictions bundle so future post-hoc passes can recompute
+    # Row 1 / Row 2 metrics without re-running the multi-hour val forward pass.
+    np.savez_compressed(
+        VAL_PREDICTIONS_NPZ,
+        y_true=y_true.astype(np.int8),
+        y_prob=y_prob.astype(np.float32),
+        y_pred_row1=y_pred_row1.astype(np.int8),
+        y_pred_row2=y_pred_row2.astype(np.int8),
+        n_segments=np.int64(len(y_true)),
+        segment_sec=np.float32(SEGMENT_SEC),
+        smoothing_win=np.int64(SMOOTHING_WIN),
+        refractory_sec=np.float32(REFRACTORY_SEC),
+        min_event_sec=np.float32(MIN_EVENT_SEC),
+    )
+    logger.info("Saved val predictions bundle: %s (%.2f MB)",
+                VAL_PREDICTIONS_NPZ, VAL_PREDICTIONS_NPZ.stat().st_size / 1e6)
+
     save_all_results(
         history, row1_metrics, row2_metrics,
         far_row2, backbone_hp, attn_hp,

@@ -1,82 +1,88 @@
 """
-MultiScaleTCN_evaluation.py
-===========================
-Final evaluation of the trained Multi-Scale TCN (M3) model on the
-held-out TEST partition. Mirrors MultiScaleTCN.py's post-training pass
-in metrics, post-processing, figures, and JSON/CSV outputs, so the
-test-set numbers are produced through exactly the same computations as
-the validation-set numbers reported by the training script.
+MultiScaleTCNAttention_evaluation.py
+====================================
+Final evaluation of the trained Multi-Scale TCN with Temporal Attention
+(M4) model on the held-out TEST partition. Mirrors
+MultiScaleTCNAttention.py's post-training pass in metrics, post-
+processing, figures, and JSON/CSV outputs, so the test-set numbers are
+produced through exactly the same computations as the validation-set
+numbers reported by the training script.
 
 Pipeline position
 -----------------
-After  : MultiScaleTCN.py      (training; produces final weights)
-This   : MultiScaleTCN_evaluation.py (test-set evaluation)
+After  : MultiScaleTCNAttention.py        (training; produces final weights)
+This   : MultiScaleTCNAttention_evaluation.py (test-set evaluation)
 
 What this script does
 ---------------------
 1. Loads the final trained weights from
-       OUTPUT_ROOT / multiscale_tcn_final_weights.pt
-   (produced by MultiScaleTCN.py).
+       OUTPUT_ROOT / ms_attn_final_weights.pt
+   (produced by MultiScaleTCNAttention.py).
 2. Loads the TEST partition from the filtered splits manifest
        data_splits_nonictal_sampled_filtered.json
    and verifies it was produced by apply_val_test_filter.py
-   (Layer 1 NaN/extreme-amplitude protection).
+   (Layer 1 NaN/extreme-amplitude protection -- via eval_utils).
 3. Runs an FP32 forward pass on GPU (Layer 3) using
    SafeEEGSegmentDataset (Layer 2) and a per-batch isfinite assertion
-   (Layer 4). All four layers mirror m3_post_eval.py.
-4. Caches y_true and y_prob to
-       evaluation/multiscale_tcn_test_predictions_raw.npz
-   so the post-processing pass can be re-run later without inference.
-5. Computes the same Row 1 (raw t=0.5) and Row 2 (post-processed t=0.5)
-   metric set as MultiScaleTCN.py via the shared helpers
+   (Layer 4). All four layers come from eval_utils.py.
+4. Computes the same Row 1 (raw t=0.5) and Row 2 (post-processed t=0.5)
+   metric set as MultiScaleTCNAttention.py via the shared helpers
    compute_all_metrics() and run_postprocessing_evaluations().
+5. Caches the predictions bundle (y_true, y_prob, y_pred_row1,
+   y_pred_row2) to
+       evaluation/ms_attn_test_predictions_full.npz
+   so post-processing can be re-run later without inference.
 6. Produces the same figures, JSON evaluation report, two-row summary
    CSV, per-row sklearn classification reports, event-details CSV,
    and Result_classReport bar plot.
+7. Produces the M4-only attention saliency figure on the test set.
 
 Why this script reuses the training-script helpers
 --------------------------------------------------
-Importing MultiScaleTCN does not execute its main() (guarded by
-__name__ == "__main__"), so all top-level constants and functions are
-importable. By rebinding the path globals on the imported module before
-calling save_all_results() / plot_all_figures(), every artefact those
-helpers write lands inside OUTPUT_ROOT/evaluation/ instead of
+Importing MultiScaleTCNAttention does not execute its main() (guarded
+by __name__ == "__main__"), so all top-level constants and functions
+are importable. By rebinding the path globals on the imported module
+before calling save_all_results() / plot_all_figures(), every artefact
+those helpers write lands inside OUTPUT_ROOT/evaluation/ instead of
 OUTPUT_ROOT/. The training-script outputs are never overwritten.
 
 Eval-folder hygiene: the eval folder MUST contain only test-side
-artefacts. The reused helpers in MultiScaleTCN.py would normally also
-emit four training-side artefacts (training_log.json, epoch_metrics.csv,
-training_curves.png, lr_schedule.png). To prevent this, we call those
-helpers with history=None; they detect the missing history and skip the
-training-only writes. Result: the eval folder contains test outputs only,
-and the training outputs continue to live in OUTPUT_ROOT/ (where the
-training run wrote them).
+artefacts. The reused helpers in MultiScaleTCNAttention.py would
+normally also emit four training-side artefacts (training_log.json,
+epoch_metrics.csv, training_curves.png, lr_schedule.png). To prevent
+this, we call those helpers with history=None; internal guards detect
+the missing history and skip the training-only writes. Result: the
+eval folder contains test outputs only, and the training outputs
+continue to live in OUTPUT_ROOT/ (where the training run wrote them).
 
 Inputs
 ------
-  OUTPUT_ROOT / multiscale_tcn_final_weights.pt
-  best_multiscale_params.json                      (architecture metadata)
+  OUTPUT_ROOT / ms_attn_final_weights.pt
+  best_multiscale_params.json                      (backbone HPs)
+  best_multiscale_attn_params.json                 (attention HPs)
   data_splits_nonictal_sampled_filtered.json       (test partition)
 
 Outputs (under OUTPUT_ROOT / evaluation/) -- TEST artefacts only
 -----------------------------------------
-  multiscale_tcn_evaluation_report.json    -- Row 1 + Row 2 metrics
-  multiscale_tcn_three_row_summary.csv     -- two-row tabular form
-  multiscale_tcn_classification_report_row{1,2}.json
-  multiscale_tcn_event_details_row2.csv
-  multiscale_tcn_test_predictions_raw.npz  -- cached y_true, y_prob
-  Result_classReport/multiscale_tcn_classreport_barplot.png
-  figures/                                 -- Row 1 / Row 2 figures
-                                              (training_curves.png and
-                                               lr_schedule.png are NOT
-                                               written here -- they live
-                                               in OUTPUT_ROOT/figures/
-                                               from the training run)
-  ../logs/multiscale_tcn_evaluation.log    -- persistent log (per user pref)
+  ms_attn_evaluation_report.json    -- Row 1 + Row 2 metrics
+  ms_attn_three_row_summary.csv     -- two-row tabular form
+  ms_attn_classification_report_row{1,2}.json
+  ms_attn_event_details_row2.csv
+  ms_attn_test_predictions_full.npz -- y_true + y_prob + y_pred_row1
+                                       + y_pred_row2
+  Result_classReport/ms_attn_classreport_barplot.png
+  figures/                          -- Row 1 / Row 2 figures, plus the
+                                       M4-only attention saliency figure
+                                       (training_curves.png and
+                                       lr_schedule.png are NOT written
+                                       here -- they live in
+                                       OUTPUT_ROOT/figures/ from the
+                                       training run)
+  ../logs/ms_attn_evaluation.log    -- persistent log (per user pref)
 
 Usage
 -----
-python MultiScaleTCN_evaluation.py
+python MultiScaleTCNAttention_evaluation.py
 """
 
 # ---------------------------------------------------------------------------
@@ -95,16 +101,16 @@ import torch
 import matplotlib
 matplotlib.use("Agg")                                  # non-interactive backend
 
-# Reuse the M3 training script's helpers and constants. Importing the module
+# Reuse the M4 training script's helpers and constants. Importing the module
 # does NOT execute its main() because that's guarded by __name__ == "__main__".
-# All top-level constants and functions become importable as-is.
-from MultiScaleTCN import (
+from MultiScaleTCNAttention import (
     SEED, MODEL_NAME, OUTPUT_ROOT,
     SPLITS_PATH, WEIGHTS_PATH,
     SEGMENT_SEC,
     MIN_EVENT_SEC, REFRACTORY_SEC, SMOOTHING_WIN,
     load_best_params, build_model,
     run_postprocessing_evaluations, save_all_results, plot_all_figures,
+    plot_attention_saliency,
 )
 
 # Four-layer NaN protection workflow lives in eval_utils.py:
@@ -136,20 +142,20 @@ USE_AMP_FOR_EVAL    = False                            # Layer 3: FP32 forward
 NUM_DATA_WORKERS    = 4                                # DataLoader workers
 
 # Output layout. Per user spec, all evaluation artefacts land in a dedicated
-# evaluation/ subdirectory under the existing M3 OUTPUT_ROOT, and the
-# per-script log lives at OUTPUT_ROOT/logs/multiscale_tcn_evaluation.log.
+# evaluation/ subdirectory under the existing M4 OUTPUT_ROOT, and the
+# per-script log lives at OUTPUT_ROOT/logs/ms_attn_evaluation.log.
 EVALUATION_DIR             = OUTPUT_ROOT / "evaluation"
 EVALUATION_FIGURE_DIR      = EVALUATION_DIR / "figures"
 EVALUATION_CLASSREPORT_DIR = EVALUATION_DIR / "Result_classReport"
 EVAL_LOG_DIR               = OUTPUT_ROOT / "logs"
-EVAL_LOG_PATH              = EVAL_LOG_DIR / "multiscale_tcn_evaluation.log"
+EVAL_LOG_PATH              = EVAL_LOG_DIR / "ms_attn_evaluation.log"
 
-# Cached test-set predictions (insurance copy). Lets a future post-hoc pass
-# recompute Row 1 / Row 2 without re-running the multi-hour FP32 forward.
-# "full" schema: y_true + y_prob + y_pred_row1 (raw t=0.5) + y_pred_row2
-# (post-processed smoothed preds) -- matches the val NPZ written by the
-# training script.
-TEST_PREDICTIONS_NPZ       = EVALUATION_DIR / "multiscale_tcn_test_predictions_full.npz"
+# Cached test-set predictions bundle (insurance copy). Lets a future
+# post-hoc pass recompute Row 1 / Row 2 without re-running the multi-hour
+# FP32 forward. "full" schema: y_true + y_prob + y_pred_row1 (raw t=0.5)
+# + y_pred_row2 (post-processed smoothed preds) -- matches the val NPZ
+# written by the training script.
+TEST_PREDICTIONS_NPZ       = EVALUATION_DIR / "ms_attn_test_predictions_full.npz"
 
 
 # ---------------------------------------------------------------------------
@@ -159,15 +165,14 @@ def setup_logging():
     """Console + persistent FileHandler at EVAL_LOG_PATH.
 
     Per user preference: every script writes its own .log via a dedicated
-    FileHandler so SLURM stdout is not the only record. The save location
-    was confirmed at script-write time -- see EVAL_LOG_PATH above.
+    FileHandler so SLURM stdout is not the only record.
     """
     EVALUATION_DIR.mkdir(parents=True, exist_ok=True)
     EVALUATION_FIGURE_DIR.mkdir(parents=True, exist_ok=True)
     EVALUATION_CLASSREPORT_DIR.mkdir(parents=True, exist_ok=True)
     EVAL_LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-    logger = logging.getLogger("multiscale_tcn_evaluation")
+    logger = logging.getLogger("ms_attn_evaluation")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
 
@@ -190,21 +195,21 @@ def setup_logging():
 # _redirect_outputs_to_evaluation
 # ---------------------------------------------------------------------------
 def _redirect_outputs_to_evaluation(logger):
-    """Rebind path globals on the imported MultiScaleTCN module so
+    """Rebind path globals on the imported MultiScaleTCNAttention module so
     save_all_results() and plot_all_figures() write into EVALUATION_DIR.
 
-    Why this works: those helpers were defined in MultiScaleTCN.py and
-    look up names like OUTPUT_ROOT, FIGURE_DIR, EVAL_REPORT_PATH at call
-    time in *MultiScaleTCN's* module namespace -- not in the caller's. By
-    rebinding those names on the MultiScaleTCN module before invoking
-    the helpers from this script, every write target lands under
-    evaluation/ for this process only. A separate Python process running
-    MultiScaleTCN.py for training is not affected.
+    Why this works: those helpers were defined in MultiScaleTCNAttention.py
+    and look up names like OUTPUT_ROOT, FIGURE_DIR, EVAL_REPORT_PATH at call
+    time in *MultiScaleTCNAttention's* module namespace -- not in the
+    caller's. By rebinding those names on the module before invoking the
+    helpers from this script, every write target lands under evaluation/
+    for this process only. A separate Python process running
+    MultiScaleTCNAttention.py for training is not affected.
 
-    The training-script directories are read for inputs (final weights,
-    training history) but never overwritten by this script.
+    The training-script directories are read for inputs (final weights)
+    but never overwritten by this script.
     """
-    import MultiScaleTCN as _m3
+    import MultiScaleTCNAttention as _m4
 
     # TRAIN_LOG_PATH and EPOCH_CSV are intentionally NOT redirected: the
     # save_all_results() helper now skips writing them when called with
@@ -214,13 +219,13 @@ def _redirect_outputs_to_evaluation(logger):
         "OUTPUT_ROOT":      EVALUATION_DIR,
         "FIGURE_DIR":       EVALUATION_FIGURE_DIR,
         "LOG_DIR":          EVAL_LOG_DIR,
-        "EVAL_REPORT_PATH": EVALUATION_DIR / "multiscale_tcn_evaluation_report.json",
-        "THREE_ROW_CSV":    EVALUATION_DIR / "multiscale_tcn_three_row_summary.csv",
+        "EVAL_REPORT_PATH": EVALUATION_DIR / "ms_attn_evaluation_report.json",
+        "THREE_ROW_CSV":    EVALUATION_DIR / "ms_attn_three_row_summary.csv",
     }
-    logger.info("Redirecting MultiScaleTCN write targets to EVALUATION_DIR:")
+    logger.info("Redirecting MultiScaleTCNAttention write targets to EVALUATION_DIR:")
     for name, new_path in redirections.items():
-        original = getattr(_m3, name, None)
-        setattr(_m3, name, new_path)
+        original = getattr(_m4, name, None)
+        setattr(_m4, name, new_path)
         logger.info("  %-18s : %s -> %s", name, original, new_path)
 
 
@@ -230,9 +235,9 @@ def _redirect_outputs_to_evaluation(logger):
 def load_test_split(logger):
     """Load TEST file-label pairs from the filtered splits manifest.
 
-    Mirrors load_splits() in MultiScaleTCN.py but loads the test partition
-    instead of train + val. The manifest is the single source of truth
-    used across the pipeline (data_splits_nonictal_sampled_filtered.json).
+    Mirrors load_splits() in MultiScaleTCNAttention.py but loads the test
+    partition instead of train + val. The manifest is the single source
+    of truth used across the pipeline.
 
     Returns
     -------
@@ -258,14 +263,14 @@ def load_test_split(logger):
 
     # metadata.test_status guard: when "complete", proceed silently. When
     # missing or "pending", fall back to a positive-evidence check: if the
-    # test partition is populated AND verify_manifest_test_filtered has
-    # already confirmed apply_val_test_filter ran (Step 3 in main), the
-    # data is genuinely ready -- the field was just dropped by an
-    # intermediate pipeline step (create_balanced_splits.py or
-    # apply_val_test_filter.py rebuilds the metadata block without
-    # copying test_status across from generate_data_splits.py's output).
-    # Warn and continue rather than blocking the run on a documentation
-    # field that is decoupled from actual readiness.
+    # test partition is populated AND verify_manifest_filtered has already
+    # confirmed apply_val_test_filter ran (Step 3 in main), the data is
+    # genuinely ready -- the field was just dropped by an intermediate
+    # pipeline step (create_balanced_splits.py or apply_val_test_filter.py
+    # rebuilds the metadata block without copying test_status across from
+    # generate_data_splits.py's output). Warn and continue rather than
+    # blocking the run on a documentation field that is decoupled from
+    # actual readiness.
     test_status = splits.get("metadata", {}).get("test_status", "pending")
     if test_status != "complete":
         logger.warning(
@@ -301,7 +306,7 @@ def _patch_eval_report_for_test(eval_report_path, n_test_segments,
     note, and provenance fields reflect the TEST partition instead of
     the validation partition.
 
-    save_all_results() lives in MultiScaleTCN.py and hardcodes
+    save_all_results() lives in MultiScaleTCNAttention.py and hardcodes
     "evaluation_set": "validation" and a note pointing to
     final_evaluation.py. Rather than fork the helper, the cleanest fix
     is to overwrite those few fields after the file is written.
@@ -317,7 +322,7 @@ def _patch_eval_report_for_test(eval_report_path, n_test_segments,
     report["evaluation_set"] = "test"
     report["note"] = ("Final evaluation on the held-out test partition. "
                       "Metrics computed via the same helpers as the "
-                      "validation pass in MultiScaleTCN.py.")
+                      "validation pass in MultiScaleTCNAttention.py.")
     report["n_test_segments"] = int(n_test_segments)
     report["test_predictions_npz"] = str(TEST_PREDICTIONS_NPZ)
     report["weights_path"] = str(WEIGHTS_PATH)
@@ -343,9 +348,9 @@ def main():
     logger = setup_logging()
 
     logger.info("=" * 65)
-    logger.info("MultiScaleTCN_evaluation.py")
+    logger.info("MultiScaleTCNAttention_evaluation.py")
     logger.info("Timestamp     : %s", datetime.datetime.now().isoformat())
-    logger.info("Purpose       : Final evaluation of M3 on TEST set")
+    logger.info("Purpose       : Final evaluation of M4 on TEST set")
     logger.info("Model         : %s", MODEL_NAME)
     logger.info("Weights       : %s", WEIGHTS_PATH)
     logger.info("Read root     : %s (training artefacts; never overwritten)", OUTPUT_ROOT)
@@ -355,7 +360,7 @@ def main():
                 "four-layer NaN protection")
     logger.info("=" * 65)
 
-    # Rebind MultiScaleTCN module path globals BEFORE invoking
+    # Rebind MultiScaleTCNAttention module path globals BEFORE invoking
     # save_all_results / plot_all_figures so all artefacts land in
     # evaluation/ rather than overwriting the training-run outputs.
     _redirect_outputs_to_evaluation(logger)
@@ -377,19 +382,19 @@ def main():
         logger.warning("CUDA not available -- evaluation will run on CPU and "
                        "may take significantly longer than on GPU.")
 
-    # -- Step 1: Load M3 hyperparameters and architecture metadata ------------
+    # -- Step 1: Load M4 hyperparameters and architecture metadata ------------
     logger.info("-" * 65)
-    logger.info("Step 1: Load best M3 hyperparameters")
-    # load_best_params returns (config, hp, branch_dilations); only the
-    # latter two are used downstream, so the full config dict is discarded.
-    _config, hp, branch_dilations = load_best_params(logger)
+    logger.info("Step 1: Load best M4 hyperparameters (backbone + attention)")
+    # load_best_params returns (backbone_config, backbone_hp, branch_dilations,
+    # attn_config, attn_hp); only the HPs are used downstream.
+    _b_cfg, backbone_hp, branch_dilations, _a_cfg, attn_hp = load_best_params(logger)
 
     # -- Step 2: Verify weights file exists ----------------------------------
     logger.info("-" * 65)
     logger.info("Step 2: Verify trained weights file")
     if not WEIGHTS_PATH.exists():
-        logger.error("Weights file not found: %s. Run MultiScaleTCN.py first "
-                     "to produce final weights.", WEIGHTS_PATH)
+        logger.error("Weights file not found: %s. Run MultiScaleTCNAttention.py "
+                     "first to produce final weights.", WEIGHTS_PATH)
         sys.exit(1)
     weights_size_mb = WEIGHTS_PATH.stat().st_size / 1e6
     logger.info("Weights OK: %s (%.2f MB)", WEIGHTS_PATH, weights_size_mb)
@@ -401,8 +406,8 @@ def main():
 
     # -- Step 4: Build model and load trained weights -------------------------
     logger.info("-" * 65)
-    logger.info("Step 4: Build MultiScaleTCN and load final weights")
-    model = build_model(hp, branch_dilations, device, logger)
+    logger.info("Step 4: Build MultiScaleTCNWithAttention and load final weights")
+    model = build_model(backbone_hp, branch_dilations, attn_hp, device, logger)
     state_dict = torch.load(WEIGHTS_PATH, map_location=device)
     model.load_state_dict(state_dict)
     model.eval()
@@ -414,7 +419,7 @@ def main():
     logger.info("-" * 65)
     logger.info("Step 5: Load TEST split and build SafeEEGSegmentDataset loader")
     test_pairs = load_test_split(logger)
-    batch_size = int(hp["batch_size"])
+    batch_size = int(attn_hp["batch_size"])
     test_loader = make_safe_loader(test_pairs, batch_size, device,
                                    num_workers=NUM_DATA_WORKERS)
     logger.info("Test loader: %d batches (batch_size=%d, num_workers=%d)",
@@ -424,14 +429,9 @@ def main():
     logger.info("-" * 65)
     logger.info("Step 6: FP32 forward pass with per-batch isfinite assert")
     # Reset the class-level sanitisation counter so the post-eval log line
-    # at line ~459 reflects only this script's invocation. Defensive against
-    # any prior in-process instantiation of the dataset that left the counter
-    # non-zero (not possible in a clean `python` invocation, but harmless).
+    # reflects only this script's invocation.
     SafeEEGSegmentDataset.n_sanitised = 0
     t0_eval = time.time()
-    # evaluate_model_safe returns (val_f1, y_true, y_pred, y_prob); the
-    # per-batch y_pred at threshold 0.5 is recomputed below as y_pred_row1
-    # (identical values), so we discard the helper's copy.
     test_f1_raw, y_true, _y_pred_05, y_prob = evaluate_model_safe(
         model, test_loader, device, logger, use_amp=USE_AMP_FOR_EVAL)
     eval_seconds = time.time() - t0_eval
@@ -446,14 +446,14 @@ def main():
     else:
         logger.info("SafeEEGSegmentDataset sanitised 0 segments (Layer 1 OK).")
 
-    # -- Step 7: Cache predictions for future post-hoc passes ----------------
     # -- Step 7: Row 1 + Row 2 post-processing evaluations -------------------
-    # run_postprocessing_evaluations() lives in MultiScaleTCN.py and computes:
+    # run_postprocessing_evaluations() lives in MultiScaleTCNAttention.py and
+    # computes:
     #   Row 1 -- compute_all_metrics(y_true, (y_prob>=0.5), y_prob)
     #   Row 2 -- segment_predictions_to_events(...) + compute_event_level_far(...)
     #            + compute_all_metrics(y_true, smoothed_preds, smoothed_probs)
     # Reusing the helper guarantees identical metric definitions and post-
-    # processing parameters as the validation pass in MultiScaleTCN.py.
+    # processing parameters as the validation pass in MultiScaleTCNAttention.py.
     logger.info("-" * 65)
     logger.info("Step 7: Run post-processing evaluation (Row 1 + Row 2)")
     (row1_metrics, row2_metrics,
@@ -488,11 +488,11 @@ def main():
     logger.info("Step 9: Save evaluation report, two-row CSV, classification reports")
 
     # save_all_results accepts history=None when invoked from a test-eval
-    # script. Internal guards in MultiScaleTCN.save_all_results then skip
-    # the two history-dependent training artefacts (multiscale_tcn_training_log.json
-    # and multiscale_tcn_epoch_metrics.csv), so the eval folder receives only
-    # test-side outputs. best_epoch / best_val_f1 are passed as placeholders;
-    # they are unused when history is None.
+    # script. Internal guards in MultiScaleTCNAttention.save_all_results
+    # then skip the two history-dependent training artefacts
+    # (ms_attn_training_log.json and ms_attn_epoch_metrics.csv), so the
+    # eval folder receives only test-side outputs. best_epoch / best_val_f1
+    # are passed as placeholders; they are unused when history is None.
     history     = None
     best_epoch  = 0
     best_val_f1 = 0.0
@@ -500,14 +500,14 @@ def main():
 
     save_all_results(
         history, row1_metrics, row2_metrics,
-        far_row2, hp, branch_dilations,
+        far_row2, backbone_hp, branch_dilations, attn_hp,
         best_epoch, best_val_f1, elapsed_dt, device, n_params, y_true,
         y_pred_row1, y_pred_row2, logger)
 
     # Patch the JSON the helper just wrote so the test-set provenance
     # (evaluation_set, NaN-protection layers, npz cache, etc.) is recorded.
     _patch_eval_report_for_test(
-        EVALUATION_DIR / "multiscale_tcn_evaluation_report.json",
+        EVALUATION_DIR / "ms_attn_evaluation_report.json",
         n_test_segments=len(y_true),
         manifest_filter=manifest_filter,
         eval_seconds=eval_seconds,
@@ -520,8 +520,7 @@ def main():
         history, best_epoch, best_val_f1, y_true, y_prob,
         y_pred_row1, y_pred_row2,
         row1_metrics, row2_metrics,
-        post_row2,
-        branch_dilations, hp, logger)
+        post_row2, logger)
 
     # -- Step 11: Result_classReport bar plot -------------------------------
     # Macro-avg classification metrics (Row 1 + Row 2) plus FAR/hr in a
@@ -533,16 +532,26 @@ def main():
     make_classreport_barplot(
         y_true, y_pred_row1, y_pred_row2,
         row1_metrics, row2_metrics,
-        EVALUATION_CLASSREPORT_DIR / "multiscale_tcn_classreport_barplot.png",
-        title_prefix="Multi-Scale TCN", logger=logger)
+        EVALUATION_CLASSREPORT_DIR / "ms_attn_classreport_barplot.png",
+        title_prefix="MS-TCN + Attention", logger=logger)
 
-    # -- Step 12: Final inventory and cleanup -------------------------------
+    # -- Step 12: Attention saliency figure (M4-only) -----------------------
+    # Re-runs a forward pass through the model to extract per-segment
+    # attention weights and plots mean saliency profiles for ictal vs
+    # non-ictal segments. Writes to EVALUATION_DIR/figures/ via the
+    # rebinded FIGURE_DIR. This is the M4-only equivalent of the val-side
+    # attention saliency the training script produces.
+    logger.info("-" * 65)
+    logger.info("Step 12: Attention saliency figure on test set (M4-only)")
+    plot_attention_saliency(model, test_loader, y_true, device, logger)
+
+    # -- Step 13: Final inventory and cleanup -------------------------------
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         logger.info("GPU cache cleared.")
 
     logger.info("=" * 65)
-    logger.info("M3 TEST EVALUATION COMPLETE")
+    logger.info("M4 TEST EVALUATION COMPLETE")
     logger.info("  Test segments         : %d", len(y_true))
     logger.info("  Forward pass time     : %.1f s", eval_seconds)
     logger.info("  Row 1 F1 (raw  @ 0.5) : %.4f",
@@ -563,13 +572,13 @@ def main():
     # absent from this list -- they live in OUTPUT_ROOT/, written by the
     # training run, and must not appear under EVALUATION_DIR. The eval folder
     # is for test-side artefacts only.
-    pfx = "multiscale_tcn"
+    pfx = "ms_attn"
     all_outputs = [
-        EVALUATION_DIR / "multiscale_tcn_evaluation_report.json",
-        EVALUATION_DIR / "multiscale_tcn_three_row_summary.csv",
-        EVALUATION_DIR / "multiscale_tcn_classification_report_row1.json",
-        EVALUATION_DIR / "multiscale_tcn_classification_report_row2.json",
-        EVALUATION_DIR / "multiscale_tcn_event_details_row2.csv",
+        EVALUATION_DIR / "ms_attn_evaluation_report.json",
+        EVALUATION_DIR / "ms_attn_three_row_summary.csv",
+        EVALUATION_DIR / "ms_attn_classification_report_row1.json",
+        EVALUATION_DIR / "ms_attn_classification_report_row2.json",
+        EVALUATION_DIR / "ms_attn_event_details_row2.csv",
         TEST_PREDICTIONS_NPZ,
         EVALUATION_FIGURE_DIR / ("%s_confusion_matrix_row1.png" % pfx),
         EVALUATION_FIGURE_DIR / ("%s_confusion_matrix_row2.png" % pfx),
@@ -579,7 +588,7 @@ def main():
         EVALUATION_FIGURE_DIR / ("%s_calibration_curve.png" % pfx),
         EVALUATION_FIGURE_DIR / ("%s_far_comparison.png" % pfx),
         EVALUATION_FIGURE_DIR / ("%s_segment_length_analysis.png" % pfx),
-        EVALUATION_FIGURE_DIR / ("%s_branch_rf_diagram.png" % pfx),
+        EVALUATION_FIGURE_DIR / ("%s_saliency_maps.png" % pfx),
         EVALUATION_CLASSREPORT_DIR / ("%s_classreport_barplot.png" % pfx),
         EVAL_LOG_PATH,
     ]

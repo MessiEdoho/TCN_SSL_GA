@@ -158,6 +158,7 @@ EVAL_REPORT_PATH  = OUTPUT_ROOT / "tcn_evaluation_report.json" # three-row evalu
 THRESH_PATH       = OUTPUT_ROOT / "tcn_optimal_threshold.json" # Youden-optimal threshold + metadata
 EPOCH_CSV         = OUTPUT_ROOT / "tcn_epoch_metrics.csv"      # per-epoch loss, F1, LR for plotting
 THREE_ROW_CSV     = OUTPUT_ROOT / "tcn_three_row_summary.csv"  # paper Table 1 (M1 block)
+VAL_PREDICTIONS_NPZ = OUTPUT_ROOT / "tcn_val_predictions_full.npz"  # cached val predictions (Phase 3)
 # Splits manifest -- single source of truth (matches all other pipeline scripts)
 #   Previous (uniform downsampling)             : data_splits.json
 #   Train-side proximity-aware downsampling     : data_splits_nonictal_sampled.json
@@ -1427,6 +1428,23 @@ def main():
     # -- Step 12: Save all structured results ----------------------------------
     y_pred_row1 = (y_prob >= 0.5).astype(int)
     y_pred_row2 = post_row2["smoothed_preds"]
+
+    # Cache val predictions bundle so future post-hoc passes can recompute
+    # Row 1 / Row 2 metrics without re-running the multi-hour val forward pass.
+    np.savez_compressed(
+        VAL_PREDICTIONS_NPZ,
+        y_true=y_true.astype(np.int8),
+        y_prob=y_prob.astype(np.float32),
+        y_pred_row1=y_pred_row1.astype(np.int8),
+        y_pred_row2=y_pred_row2.astype(np.int8),
+        n_segments=np.int64(len(y_true)),
+        segment_sec=np.float32(SEGMENT_SEC),
+        smoothing_win=np.int64(SMOOTHING_WIN),
+        refractory_sec=np.float32(REFRACTORY_SEC),
+        min_event_sec=np.float32(MIN_EVENT_SEC),
+    )
+    logger.info("Saved val predictions bundle: %s (%.2f MB)",
+                VAL_PREDICTIONS_NPZ, VAL_PREDICTIONS_NPZ.stat().st_size / 1e6)
 
     save_all_results(
         history, row1_metrics, row2_metrics,

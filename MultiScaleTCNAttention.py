@@ -166,10 +166,11 @@ EVAL_REPORT_PATH  = OUTPUT_ROOT / "ms_attn_evaluation_report.json"
 THRESH_PATH       = OUTPUT_ROOT / "ms_attn_optimal_threshold.json"
 EPOCH_CSV         = OUTPUT_ROOT / "ms_attn_epoch_metrics.csv"
 THREE_ROW_CSV     = OUTPUT_ROOT / "ms_attn_three_row_summary.csv"
+VAL_PREDICTIONS_NPZ = OUTPUT_ROOT / "ms_attn_val_predictions_full.npz"  # cached val predictions (Phase 3)
 
 # Two JSON input files -- backbone and attention tuning results
 BACKBONE_PARAMS_PATH = Path("/home/people/22206468/scratch/OUTPUT/MODEL3_OUTPUT/MultiScaleTCNtuning_outputs") / "best_multiscale_params.json"
-ATTN_PARAMS_PATH     = Path("/home/people/22206468/scratch/OUTPUT/MODEL4_OUTPUT") / "best_multiscale_attn_params.json"
+ATTN_PARAMS_PATH     = Path("/home/people/22206468/scratch/OUTPUT/MODEL4_OUTPUT/multiscale_attention_tuning_outputs") / "best_multiscale_attn_params.json"
 
 # Splits manifest -- single source of truth (matches all other pipeline scripts)
 #   Previous (uniform downsampling)             : data_splits.json
@@ -714,30 +715,37 @@ def save_all_results(history, row1_metrics, row2_metrics,
         branch_rfs[bname] = {"samples": rf, "seconds": round(rf / FS, 4)}
 
     # -- a. Training log JSON --------------------------------------------------
-    train_log = {
-        "model": MODEL_NAME,
-        "timestamp": datetime.datetime.now().isoformat(),
-        "total_epochs": len(history["epoch"]),
-        "best_epoch": best_epoch,
-        "best_val_f1": round(best_val_f1, 6),
-        "early_stopped": len(history["epoch"]) < MAX_EPOCHS,
-        "duration_seconds": round(elapsed.total_seconds(), 1),
-        "backbone_hyperparameters": backbone_hp,
-        "branch_dilations": branch_dilations,
-        "attention_hyperparameters": attn_hp,
-        "backbone_params_source": str(BACKBONE_PARAMS_PATH),
-        "attention_params_source": str(ATTN_PARAMS_PATH),
-        "training_note": ("All parameters (backbone + attention) trained jointly end-to-end for "
-                          "100 epochs. Tuning (tune_multiscale_attention.py) is also end-to-end "
-                          "with backbone architecture HPs fixed from best_multiscale_params.json."),
-        "branch_receptive_fields": branch_rfs,
-        "trainable_params": n_params,
-        "device": str(device),
-        "history": history,
-    }
-    with open(TRAIN_LOG_PATH, "w", encoding="utf-8") as f:
-        json.dump(train_log, f, indent=2)
-    logger.info("Saved: %s", TRAIN_LOG_PATH)
+    # DO NOT REMOVE THIS GUARD -- required by MultiScaleTCNAttention_evaluation.py,
+    # which calls save_all_results with history=None. Removing it will
+    # cause that script to crash with TypeError on history["epoch"].
+    if history and history.get("epoch"):
+        train_log = {
+            "model": MODEL_NAME,
+            "timestamp": datetime.datetime.now().isoformat(),
+            "total_epochs": len(history["epoch"]),
+            "best_epoch": best_epoch,
+            "best_val_f1": round(best_val_f1, 6),
+            "early_stopped": len(history["epoch"]) < MAX_EPOCHS,
+            "duration_seconds": round(elapsed.total_seconds(), 1),
+            "backbone_hyperparameters": backbone_hp,
+            "branch_dilations": branch_dilations,
+            "attention_hyperparameters": attn_hp,
+            "backbone_params_source": str(BACKBONE_PARAMS_PATH),
+            "attention_params_source": str(ATTN_PARAMS_PATH),
+            "training_note": ("All parameters (backbone + attention) trained jointly end-to-end for "
+                              "100 epochs. Tuning (tune_multiscale_attention.py) is also end-to-end "
+                              "with backbone architecture HPs fixed from best_multiscale_params.json."),
+            "branch_receptive_fields": branch_rfs,
+            "trainable_params": n_params,
+            "device": str(device),
+            "history": history,
+        }
+        with open(TRAIN_LOG_PATH, "w", encoding="utf-8") as f:
+            json.dump(train_log, f, indent=2)
+        logger.info("Saved: %s", TRAIN_LOG_PATH)
+    else:
+        logger.info("Skipping training log JSON (no training history -- "
+                    "test-eval invocation).")
 
     # -- b. Evaluation report JSON ---------------------------------------------
     eval_report = {
@@ -765,17 +773,23 @@ def save_all_results(history, row1_metrics, row2_metrics,
     logger.info("Saved: %s", EVAL_REPORT_PATH)
 
     # -- c. Epoch metrics CSV --------------------------------------------------
-    with open(EPOCH_CSV, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["epoch", "train_loss", "val_f1", "lr"])
-        writer.writeheader()
-        for i in range(len(history["epoch"])):
-            writer.writerow({
-                "epoch": history["epoch"][i],
-                "train_loss": round(history["train_loss"][i], 6),
-                "val_f1": round(history["val_f1"][i], 6),
-                "lr": history["lr"][i],
-            })
-    logger.info("Saved: %s", EPOCH_CSV)
+    # DO NOT REMOVE THIS GUARD -- required by MultiScaleTCNAttention_evaluation.py,
+    # which calls save_all_results with history=None. Removing it will
+    # cause that script to crash with TypeError on history["epoch"].
+    if history and history.get("epoch"):
+        with open(EPOCH_CSV, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["epoch", "train_loss", "val_f1", "lr"])
+            writer.writeheader()
+            for i in range(len(history["epoch"])):
+                writer.writerow({
+                    "epoch": history["epoch"][i],
+                    "train_loss": round(history["train_loss"][i], 6),
+                    "val_f1": round(history["val_f1"][i], 6),
+                    "lr": history["lr"][i],
+                })
+        logger.info("Saved: %s", EPOCH_CSV)
+    else:
+        logger.info("Skipping per-epoch metrics CSV (no training history).")
 
     # -- d. Three-row summary CSV (M4 in ablation table) -----------------------
     fieldnames_3r = [
@@ -868,46 +882,59 @@ def plot_all_figures(history, best_epoch, best_val_f1,
     have been retired. The remaining figures cover Row 1 + Row 2 only.
     """
     pfx = "ms_attn"
-    epochs = history["epoch"]
 
-    # -- Figure 1: Training curves ---------------------------------------------
-    # Each panel overlays the raw per-epoch trace (faint) with an EMA-smoothed
-    # trend (alpha=0.6, TensorBoard-default) -- val F1 is noisy at this dataset
-    # prevalence and the smoothed line makes the convergence trajectory legible.
-    EMA_ALPHA = 0.6
-    train_loss_smoothed = ema_smooth(history["train_loss"], alpha=EMA_ALPHA)
-    val_f1_smoothed     = ema_smooth(history["val_f1"], alpha=EMA_ALPHA)
+    # -- Figures 1 & 2: training-curve and LR-schedule -------------------------
+    # Both figures depend on per-epoch training history. They are emitted on
+    # every training run (history is always populated at the end of the loop)
+    # and suppressed for test-evaluation invocations that pass history=None
+    # or {}, so the eval folder contains only test-side artefacts.
+    # DO NOT REMOVE THIS GUARD -- required by MultiScaleTCNAttention_evaluation.py,
+    # which calls plot_all_figures with history=None. Removing it will
+    # cause that script to crash with TypeError on history["epoch"].
+    if history and history.get("epoch"):
+        epochs = history["epoch"]
 
-    fig, axes = plt.subplots(1, 2, figsize=(13, 4))
-    axes[0].plot(epochs, history["train_loss"], color="#5A7DC8",
-                 linewidth=1.0, alpha=0.25, label="Train loss (raw)")
-    axes[0].plot(epochs, train_loss_smoothed, color="#5A7DC8",
-                 linewidth=1.6, label="Train loss (EMA, α=0.6)")
-    axes[0].axvline(best_epoch, linestyle="--", color="#C85A5A", alpha=0.7, label="Best epoch")
-    axes[0].set_xlabel("Epoch"); axes[0].set_ylabel("BCEWithLogitsLoss")
-    axes[0].set_title("MS-TCN+Attention Training Loss"); axes[0].legend(fontsize=9)
-    axes[1].plot(epochs, history["val_f1"], color="#5A7DC8",
-                 linewidth=1.0, alpha=0.25, label="Val F1 (raw)")
-    axes[1].plot(epochs, val_f1_smoothed, color="#5A7DC8",
-                 linewidth=1.6, label="Val F1 (EMA, α=0.6)")
-    axes[1].axvline(best_epoch, linestyle="--", color="#C85A5A", alpha=0.7, label="Best epoch")
-    axes[1].annotate("%.4f" % best_val_f1, xy=(best_epoch, best_val_f1),
-                     xytext=(5, -15), textcoords="offset points", fontsize=9, color="#C85A5A")
-    axes[1].set_xlabel("Epoch"); axes[1].set_ylabel("Macro F1-score")
-    axes[1].set_title("MS-TCN+Attention Validation Macro F1"); axes[1].legend(fontsize=9)
-    plt.tight_layout()
-    plt.savefig(FIGURE_DIR / ("%s_training_curves.png" % pfx), dpi=150, bbox_inches="tight")
-    plt.close()
-    logger.info("Saved: %s_training_curves.png", pfx)
+        # -- Figure 1: Training curves ----------------------------------------
+        # Each panel overlays the raw per-epoch trace (faint) with an EMA-smoothed
+        # trend (alpha=0.6, TensorBoard-default) -- val F1 is noisy at this dataset
+        # prevalence and the smoothed line makes the convergence trajectory legible.
+        EMA_ALPHA = 0.6
+        train_loss_smoothed = ema_smooth(history["train_loss"], alpha=EMA_ALPHA)
+        val_f1_smoothed     = ema_smooth(history["val_f1"], alpha=EMA_ALPHA)
 
-    # -- Figure 2: LR schedule ------------------------------------------------
-    fig, ax = plt.subplots(figsize=(8, 3))
-    ax.plot(epochs, history["lr"], color="#5A7DC8", linewidth=1.2)
-    ax.set_yscale("log"); ax.set_xlabel("Epoch"); ax.set_ylabel("Learning rate (log scale)")
-    ax.set_title("MS-TCN+Attention Cosine Annealing LR")
-    plt.tight_layout()
-    plt.savefig(FIGURE_DIR / ("%s_lr_schedule.png" % pfx), dpi=150, bbox_inches="tight")
-    plt.close()
+        fig, axes = plt.subplots(1, 2, figsize=(13, 4))
+        axes[0].plot(epochs, history["train_loss"], color="#5A7DC8",
+                     linewidth=1.0, alpha=0.25, label="Train loss (raw)")
+        axes[0].plot(epochs, train_loss_smoothed, color="#5A7DC8",
+                     linewidth=1.6, label="Train loss (EMA, α=0.6)")
+        axes[0].axvline(best_epoch, linestyle="--", color="#C85A5A", alpha=0.7, label="Best epoch")
+        axes[0].set_xlabel("Epoch"); axes[0].set_ylabel("BCEWithLogitsLoss")
+        axes[0].set_title("MS-TCN+Attention Training Loss"); axes[0].legend(fontsize=9)
+        axes[1].plot(epochs, history["val_f1"], color="#5A7DC8",
+                     linewidth=1.0, alpha=0.25, label="Val F1 (raw)")
+        axes[1].plot(epochs, val_f1_smoothed, color="#5A7DC8",
+                     linewidth=1.6, label="Val F1 (EMA, α=0.6)")
+        axes[1].axvline(best_epoch, linestyle="--", color="#C85A5A", alpha=0.7, label="Best epoch")
+        axes[1].annotate("%.4f" % best_val_f1, xy=(best_epoch, best_val_f1),
+                         xytext=(5, -15), textcoords="offset points", fontsize=9, color="#C85A5A")
+        axes[1].set_xlabel("Epoch"); axes[1].set_ylabel("Macro F1-score")
+        axes[1].set_title("MS-TCN+Attention Validation Macro F1"); axes[1].legend(fontsize=9)
+        plt.tight_layout()
+        plt.savefig(FIGURE_DIR / ("%s_training_curves.png" % pfx), dpi=150, bbox_inches="tight")
+        plt.close()
+        logger.info("Saved: %s_training_curves.png", pfx)
+
+        # -- Figure 2: LR schedule --------------------------------------------
+        fig, ax = plt.subplots(figsize=(8, 3))
+        ax.plot(epochs, history["lr"], color="#5A7DC8", linewidth=1.2)
+        ax.set_yscale("log"); ax.set_xlabel("Epoch"); ax.set_ylabel("Learning rate (log scale)")
+        ax.set_title("MS-TCN+Attention Cosine Annealing LR")
+        plt.tight_layout()
+        plt.savefig(FIGURE_DIR / ("%s_lr_schedule.png" % pfx), dpi=150, bbox_inches="tight")
+        plt.close()
+    else:
+        logger.info("Skipping training-curve and LR-schedule figures "
+                    "(no training history -- test-eval invocation).")
 
     # -- Figures 3-4: Confusion matrices ---------------------------------------
     # Row 3 (threshold-optimised post-processing) has been retired; see
@@ -1451,6 +1478,24 @@ def main():
     # -- Step 13: Save all results ---------------------------------------------
     y_pred_row1 = (y_prob >= 0.5).astype(int)
     y_pred_row2 = post_row2["smoothed_preds"]
+
+    # Cache val predictions bundle so future post-hoc passes can recompute
+    # Row 1 / Row 2 metrics without re-running the multi-hour val forward pass.
+    np.savez_compressed(
+        VAL_PREDICTIONS_NPZ,
+        y_true=y_true.astype(np.int8),
+        y_prob=y_prob.astype(np.float32),
+        y_pred_row1=y_pred_row1.astype(np.int8),
+        y_pred_row2=y_pred_row2.astype(np.int8),
+        n_segments=np.int64(len(y_true)),
+        segment_sec=np.float32(SEGMENT_SEC),
+        smoothing_win=np.int64(SMOOTHING_WIN),
+        refractory_sec=np.float32(REFRACTORY_SEC),
+        min_event_sec=np.float32(MIN_EVENT_SEC),
+    )
+    logger.info("Saved val predictions bundle: %s (%.2f MB)",
+                VAL_PREDICTIONS_NPZ, VAL_PREDICTIONS_NPZ.stat().st_size / 1e6)
+
     save_all_results(
         history, row1_metrics, row2_metrics,
         far_row2, backbone_hp, branch_dilations, attn_hp,
