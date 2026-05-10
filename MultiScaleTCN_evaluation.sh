@@ -49,7 +49,26 @@ date
 echo "Running on node: $(hostname)"
 echo "Job ID: $SLURM_JOB_ID"
 echo "Partition: ${SLURM_JOB_PARTITION:-unset}"
-echo "GPU allocated: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'none detected')"
+
+# GPU allocation diagnostics. The other shell scripts in this repo only log
+# the device name, which is not enough to debug shared-GPU contention or
+# OOM. This block additionally records:
+#   - SLURM_JOB_GPUS / CUDA_VISIBLE_DEVICES   (which GPU index was assigned)
+#   - nvidia-smi -L                            (canonical "GPU N: <name> (UUID)")
+#   - per-GPU index, name, total/free MiB, compute capability, driver version
+# Useful when a job is unexpectedly slow, OOMs, or lands on a GPU shared
+# with another job.
+echo "----- GPU allocation -----"
+echo "SLURM_JOB_GPUS         : ${SLURM_JOB_GPUS:-unset}"
+echo "SLURM_GPUS_PER_NODE    : ${SLURM_GPUS_PER_NODE:-unset}"
+echo "CUDA_VISIBLE_DEVICES   : ${CUDA_VISIBLE_DEVICES:-unset}"
+echo "GPUDevice list (nvidia-smi -L):"
+nvidia-smi -L 2>/dev/null || echo "  none detected"
+echo "Per-GPU inventory:"
+nvidia-smi --query-gpu=index,name,memory.total,memory.free,memory.used,compute_cap,driver_version \
+           --format=csv 2>/dev/null \
+    || echo "  nvidia-smi unavailable"
+echo "--------------------------"
 
 # CPU allocation diagnostics: confirm SLURM gave us 10 cores AND that the
 # Python process can actually use all of them (cpuset / cgroup binding).
