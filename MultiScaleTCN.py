@@ -721,26 +721,39 @@ def save_all_results(history, row1_metrics, row2_metrics,
         rf_per_branch[bname] = {"samples": rf, "seconds": round(rf / FS, 4)}
 
     # -- a. Training log JSON --------------------------------------------------
-    train_log = {
-        "model": MODEL_NAME,
-        "timestamp": datetime.datetime.now().isoformat(),
-        "total_epochs": len(history["epoch"]),
-        "best_epoch": best_epoch,
-        "best_val_f1": round(best_val_f1, 6),
-        "early_stopped": len(history["epoch"]) < MAX_EPOCHS,
-        "duration_seconds": round(elapsed.total_seconds(), 1),
-        "hyperparameters": hp,
-        "branch_dilations": branch_dilations,
-        "receptive_field_per_branch": rf_per_branch,
-        "architecture_note": ("MultiScaleTCN with three parallel branches. "
-                              "See branch_dilations for exact schedules used."),
-        "trainable_params": n_params,
-        "device": str(device),
-        "history": history,
-    }
-    with open(TRAIN_LOG_PATH, "w", encoding="utf-8") as f:
-        json.dump(train_log, f, indent=2)
-    logger.info("Saved: %s", TRAIN_LOG_PATH)
+    # Gated on a non-empty per-epoch history. Training runs always have one
+    # (it accumulates across the training loop), so this branch fires
+    # exactly as before for python MultiScaleTCN.py. Test-eval scripts that
+    # import save_all_results pass history=None or {} to suppress this
+    # training artefact -- the eval folder then contains only test-side
+    # outputs (val/test artefact separation, see study report).
+    # DO NOT REMOVE THIS GUARD -- required by MultiScaleTCN_evaluation.py,
+    # which calls save_all_results with history=None. Removing it will
+    # cause that script to crash with TypeError on history["epoch"].
+    if history and history.get("epoch"):
+        train_log = {
+            "model": MODEL_NAME,
+            "timestamp": datetime.datetime.now().isoformat(),
+            "total_epochs": len(history["epoch"]),
+            "best_epoch": best_epoch,
+            "best_val_f1": round(best_val_f1, 6),
+            "early_stopped": len(history["epoch"]) < MAX_EPOCHS,
+            "duration_seconds": round(elapsed.total_seconds(), 1),
+            "hyperparameters": hp,
+            "branch_dilations": branch_dilations,
+            "receptive_field_per_branch": rf_per_branch,
+            "architecture_note": ("MultiScaleTCN with three parallel branches. "
+                                  "See branch_dilations for exact schedules used."),
+            "trainable_params": n_params,
+            "device": str(device),
+            "history": history,
+        }
+        with open(TRAIN_LOG_PATH, "w", encoding="utf-8") as f:
+            json.dump(train_log, f, indent=2)
+        logger.info("Saved: %s", TRAIN_LOG_PATH)
+    else:
+        logger.info("Skipping training log JSON (no training history -- "
+                    "test-eval invocation).")
 
     # -- b. Evaluation report JSON ---------------------------------------------
     eval_report = {
@@ -766,17 +779,24 @@ def save_all_results(history, row1_metrics, row2_metrics,
     logger.info("Saved: %s", EVAL_REPORT_PATH)
 
     # -- c. Epoch metrics CSV --------------------------------------------------
-    with open(EPOCH_CSV, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["epoch", "train_loss", "val_f1", "lr"])
-        writer.writeheader()
-        for i in range(len(history["epoch"])):
-            writer.writerow({
-                "epoch": history["epoch"][i],
-                "train_loss": round(history["train_loss"][i], 6),
-                "val_f1": round(history["val_f1"][i], 6),
-                "lr": history["lr"][i],
-            })
-    logger.info("Saved: %s", EPOCH_CSV)
+    # Same gate as section a: only emitted when a training history exists.
+    # DO NOT REMOVE THIS GUARD -- required by MultiScaleTCN_evaluation.py,
+    # which calls save_all_results with history=None. Removing it will
+    # cause that script to crash with TypeError on history["epoch"].
+    if history and history.get("epoch"):
+        with open(EPOCH_CSV, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["epoch", "train_loss", "val_f1", "lr"])
+            writer.writeheader()
+            for i in range(len(history["epoch"])):
+                writer.writerow({
+                    "epoch": history["epoch"][i],
+                    "train_loss": round(history["train_loss"][i], 6),
+                    "val_f1": round(history["val_f1"][i], 6),
+                    "lr": history["lr"][i],
+                })
+        logger.info("Saved: %s", EPOCH_CSV)
+    else:
+        logger.info("Skipping per-epoch metrics CSV (no training history).")
 
     # -- d. Three-row summary CSV (paper Table for M3) -------------------------
     fieldnames_3r = [
@@ -876,63 +896,77 @@ def plot_all_figures(history, best_epoch, best_val_f1,
     (branch RF diagram). All other figures mirror TCN.py with adapted titles.
     """
     pfx = "multiscale_tcn"  # filename prefix
-    epochs = history["epoch"]
+    # -- Figures 1 & 2: training-curve and LR-schedule -------------------------
+    # Both figures depend on per-epoch training history. They are emitted on
+    # every training run (history is always populated at the end of the loop)
+    # and suppressed for test-evaluation invocations that pass history=None
+    # or {}, so the eval folder contains only test-side artefacts.
+    # DO NOT REMOVE THIS GUARD -- required by MultiScaleTCN_evaluation.py,
+    # which calls plot_all_figures with history=None. Removing it will
+    # cause that script to crash with TypeError on history["epoch"].
+    if history and history.get("epoch"):
+        epochs = history["epoch"]
 
-    # -- Figure 1: Training curves ---------------------------------------------
-    # PURPOSE: Demonstrates model convergence behaviour. Left panel shows
-    # training loss declining over epochs, confirming the optimiser is reducing
-    # the objective. Right panel shows validation macro F1, the metric that
-    # drives early stopping. Together they reveal whether the model overfit
-    # (loss drops but F1 plateaus/declines), underfit (both remain poor), or
-    # converged healthily. The vertical dashed line marks the best epoch.
-    # Each panel overlays the raw per-epoch trace (faint) with an EMA-smoothed
-    # trend (alpha=0.6, TensorBoard-default) -- val F1 is noisy at this dataset
-    # prevalence and the smoothed line makes the convergence trajectory legible.
-    EMA_ALPHA = 0.6
-    train_loss_smoothed = ema_smooth(history["train_loss"], alpha=EMA_ALPHA)
-    val_f1_smoothed     = ema_smooth(history["val_f1"], alpha=EMA_ALPHA)
+        # -- Figure 1: Training curves ----------------------------------------
+        # PURPOSE: Demonstrates model convergence behaviour. Left panel shows
+        # training loss declining over epochs, confirming the optimiser is
+        # reducing the objective. Right panel shows validation macro F1, the
+        # metric that drives early stopping. Together they reveal whether the
+        # model overfit (loss drops but F1 plateaus/declines), underfit (both
+        # remain poor), or converged healthily. The vertical dashed line marks
+        # the best epoch. Each panel overlays the raw per-epoch trace (faint)
+        # with an EMA-smoothed trend (alpha=0.6, TensorBoard-default) -- val
+        # F1 is noisy at this dataset prevalence and the smoothed line makes
+        # the convergence trajectory legible.
+        EMA_ALPHA = 0.6
+        train_loss_smoothed = ema_smooth(history["train_loss"], alpha=EMA_ALPHA)
+        val_f1_smoothed     = ema_smooth(history["val_f1"], alpha=EMA_ALPHA)
 
-    fig, axes = plt.subplots(1, 2, figsize=(13, 4))
-    axes[0].plot(epochs, history["train_loss"], color="#5A7DC8",
-                 linewidth=1.0, alpha=0.25, label="Train loss (raw)")
-    axes[0].plot(epochs, train_loss_smoothed, color="#5A7DC8",
-                 linewidth=1.6, label="Train loss (EMA, α=0.6)")
-    axes[0].axvline(best_epoch, linestyle="--", color="#C85A5A", alpha=0.7, label="Best epoch")
-    axes[0].set_xlabel("Epoch")
-    axes[0].set_ylabel("BCEWithLogitsLoss")
-    axes[0].set_title("Multi-Scale TCN Training Loss")
-    axes[0].legend(fontsize=9)
-    axes[1].plot(epochs, history["val_f1"], color="#5A7DC8",
-                 linewidth=1.0, alpha=0.25, label="Val F1 (raw)")
-    axes[1].plot(epochs, val_f1_smoothed, color="#5A7DC8",
-                 linewidth=1.6, label="Val F1 (EMA, α=0.6)")
-    axes[1].axvline(best_epoch, linestyle="--", color="#C85A5A", alpha=0.7, label="Best epoch")
-    axes[1].annotate("%.4f" % best_val_f1, xy=(best_epoch, best_val_f1),
-                     xytext=(5, -15), textcoords="offset points", fontsize=9, color="#C85A5A")
-    axes[1].set_xlabel("Epoch")
-    axes[1].set_ylabel("Macro F1-score")
-    axes[1].set_title("Multi-Scale TCN Validation Macro F1")
-    axes[1].legend(fontsize=9)
-    plt.tight_layout()
-    plt.savefig(FIGURE_DIR / ("%s_training_curves.png" % pfx), dpi=150, bbox_inches="tight")
-    plt.close()
-    logger.info("Saved: %s", FIGURE_DIR / ("%s_training_curves.png" % pfx))
+        fig, axes = plt.subplots(1, 2, figsize=(13, 4))
+        axes[0].plot(epochs, history["train_loss"], color="#5A7DC8",
+                     linewidth=1.0, alpha=0.25, label="Train loss (raw)")
+        axes[0].plot(epochs, train_loss_smoothed, color="#5A7DC8",
+                     linewidth=1.6, label="Train loss (EMA, α=0.6)")
+        axes[0].axvline(best_epoch, linestyle="--", color="#C85A5A", alpha=0.7, label="Best epoch")
+        axes[0].set_xlabel("Epoch")
+        axes[0].set_ylabel("BCEWithLogitsLoss")
+        axes[0].set_title("Multi-Scale TCN Training Loss")
+        axes[0].legend(fontsize=9)
+        axes[1].plot(epochs, history["val_f1"], color="#5A7DC8",
+                     linewidth=1.0, alpha=0.25, label="Val F1 (raw)")
+        axes[1].plot(epochs, val_f1_smoothed, color="#5A7DC8",
+                     linewidth=1.6, label="Val F1 (EMA, α=0.6)")
+        axes[1].axvline(best_epoch, linestyle="--", color="#C85A5A", alpha=0.7, label="Best epoch")
+        axes[1].annotate("%.4f" % best_val_f1, xy=(best_epoch, best_val_f1),
+                         xytext=(5, -15), textcoords="offset points", fontsize=9, color="#C85A5A")
+        axes[1].set_xlabel("Epoch")
+        axes[1].set_ylabel("Macro F1-score")
+        axes[1].set_title("Multi-Scale TCN Validation Macro F1")
+        axes[1].legend(fontsize=9)
+        plt.tight_layout()
+        plt.savefig(FIGURE_DIR / ("%s_training_curves.png" % pfx), dpi=150, bbox_inches="tight")
+        plt.close()
+        logger.info("Saved: %s", FIGURE_DIR / ("%s_training_curves.png" % pfx))
 
-    # -- Figure 2: LR schedule ------------------------------------------------
-    # PURPOSE: Verifies the cosine annealing schedule behaved as described in
-    # the Methods section. A smooth half-cosine from initial LR to eta_min
-    # confirms correct configuration. Any flat segment at the end indicates
-    # early stopping terminated before the full cosine cycle completed.
-    fig, ax = plt.subplots(figsize=(8, 3))
-    ax.plot(epochs, history["lr"], color="#5A7DC8", linewidth=1.2)
-    ax.set_yscale("log")
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("Learning rate (log scale)")
-    ax.set_title("Multi-Scale TCN Cosine Annealing LR Schedule")
-    plt.tight_layout()
-    plt.savefig(FIGURE_DIR / ("%s_lr_schedule.png" % pfx), dpi=150, bbox_inches="tight")
-    plt.close()
-    logger.info("Saved: %s", FIGURE_DIR / ("%s_lr_schedule.png" % pfx))
+        # -- Figure 2: LR schedule --------------------------------------------
+        # PURPOSE: Verifies the cosine annealing schedule behaved as described
+        # in the Methods section. A smooth half-cosine from initial LR to
+        # eta_min confirms correct configuration. Any flat segment at the end
+        # indicates early stopping terminated before the full cosine cycle
+        # completed.
+        fig, ax = plt.subplots(figsize=(8, 3))
+        ax.plot(epochs, history["lr"], color="#5A7DC8", linewidth=1.2)
+        ax.set_yscale("log")
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Learning rate (log scale)")
+        ax.set_title("Multi-Scale TCN Cosine Annealing LR Schedule")
+        plt.tight_layout()
+        plt.savefig(FIGURE_DIR / ("%s_lr_schedule.png" % pfx), dpi=150, bbox_inches="tight")
+        plt.close()
+        logger.info("Saved: %s", FIGURE_DIR / ("%s_lr_schedule.png" % pfx))
+    else:
+        logger.info("Skipping training-curve and LR-schedule figures "
+                    "(no training history -- test-eval invocation).")
 
     # -- Figures 3-4: Confusion matrices per row -------------------------------
     # PURPOSE: One confusion matrix per evaluation row shows TP, FP, FN, TN.
