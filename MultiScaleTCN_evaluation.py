@@ -409,6 +409,15 @@ def main():
     set_seed(SEED)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Device        : %s", device)
+    if torch.cuda.is_available():
+        logger.info("GPU  : %s", torch.cuda.get_device_name(0))
+        logger.info("VRAM : %.2f GB", torch.cuda.get_device_properties(0).total_memory / 1e9)
+        logger.info("CUDA : %s", torch.version.cuda)
+        try:
+            _free_bytes, _total_bytes = torch.cuda.mem_get_info(0)
+            logger.info("GPU memory free: %.2f / %.2f GB", _free_bytes / 1e9, _total_bytes / 1e9)
+        except Exception as _e:
+            logger.warning("Could not query GPU memory: %s", _e)
     logger.info("PyTorch       : %s", torch.__version__)
     if device.type != "cuda":
         logger.warning("CUDA not available -- evaluation will run on CPU and "
