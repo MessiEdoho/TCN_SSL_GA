@@ -20,7 +20,7 @@
 # validation partition (test set reserved for final_evaluation.py). This
 # is where the M3 vs M4 ablation comparison is performed (see
 # STUDY_REPORT.txt Section 7.6.7).
-#SBATCH -t 3-00:00:00
+#SBATCH -t 13-00:00:00
 
 # Email notifications at start, end, and failure
 #SBATCH --mail-type=ALL
