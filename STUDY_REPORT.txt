@@ -1692,6 +1692,57 @@ configurations.
     training and for the post-training weight-restoration sanity
     check; it does not appear in any reported number.
 
+7.6.6b Numerical safety for the final-evaluation pass (FP32 forward)
+
+    The post-training full-validation forward pass is executed in
+    FP32 (use_amp = False) on all four training scripts (TCN.py,
+    TCNTemporalAttention.py, MultiScaleTCN.py,
+    MultiScaleTCNAttention.py). Training itself remains under AMP
+    (FP16 autocast + dynamic GradScaler) for the speed and memory
+    benefits documented in Section 7.6.4; FP32 applies only to the
+    one-shot full-val pass after weight restoration.
+
+    Motivation. Two distinct FP16 numerical failures during this
+    pass were observed in the course of the study, each of which
+    silently corrupted the y_prob array and surfaced only when
+    sklearn's roc_auc_score raised ValueError: Input contains NaN:
+
+      (i)  Input-side overflow (M3, MultiScaleTCN). A small number
+           of validation segments had max |x| ~ 1e19 (post-
+           preprocessing pipeline drift); these exceed the FP16
+           dynamic range (max ~ 6.55e4), producing +Inf activations
+           that propagate to NaN in the post-sigmoid probability.
+
+      (ii) Attention-softmax overflow (M4, MultiScaleTCNAttention).
+           Even after manifest-level filtering removed all extreme
+           input segments, the attention block's logit -> exp ->
+           normalise pipeline can produce +Inf in the softmax
+           numerator for any attention logit > log(FP16_max) ~ 11.1,
+           giving Inf / Inf = NaN at the normalisation step. This
+           is an architecture-induced failure mode specific to
+           softmax-attention models and is not addressed by input
+           filtering.
+
+    Both failure modes are eliminated unconditionally by running
+    the final-eval forward pass in FP32, whose dynamic range
+    (max ~ 3.4e38) is sufficient for both observed regimes. The
+    full-validation pass typically takes ~10-15 h on V100/A100/L40S
+    under FP32 (vs ~5-8 h under FP16); the additional wall time is
+    negligible relative to the multi-hour-to-multi-day training
+    budget and is paid only once per model.
+
+    A complementary four-layer defence-in-depth pattern is centralised
+    in eval_utils.py (SafeEEGSegmentDataset for Layer 2 input
+    sanitisation, FP32 forward as Layer 3, and a per-batch
+    torch.isfinite(logits).all() assertion as Layer 4) and is used by
+    every *_evaluation.py test-set script in the repo. The M4 val
+    artefact recovery utility (m4_event_metrics_recovery.py) consumes
+    the same pattern -- it loads ms_attn_final_weights.pt, repeats
+    the full-validation pass under all four protections, and emits
+    every val artefact that the original training run failed to
+    write, routed to OUTPUT_ROOT/event_metrics/ so that the parent
+    MODEL4 directory is preserved.
+
 7.6.7 End-to-end training for attention models (M2, M4)
 
     Both Optuna tuning (Sections 7.3, 7.5) and final training of
@@ -1823,6 +1874,114 @@ configurations.
     the basis for the event-level false-alarm-rate metric reported
     alongside segment-level metrics in Section 9.
 
+    Per-mouse chronological organisation
+    ------------------------------------
+    Event detection is performed independently for each mouse,
+    operating on segments arranged in true chronological order
+    relative to that animal's recording start. Two pieces of
+    metadata enable this organisation:
+
+      1. The chronology file {mouse_id}_chronology.npz, produced
+         once per mouse by deterministically replaying the
+         preprocessing grid walk against the corresponding Excel
+         seizure annotation file. For each grid position it
+         records (chrono_idx, t_start_sec, label) and the .npy
+         filename the preprocessing pipeline would have produced.
+
+      2. The chronology-enriched splits manifest
+         data_splits_nonictal_sampled_filtered_enriched.json,
+         which augments each val/test record with mouse_id,
+         chrono_idx, and t_start_sec joined from (1).
+
+    At evaluation time the per-mouse prediction stream is sorted
+    by chrono_idx so that segment k+1 in the stream is exactly
+    step_sec = 2.5 s after segment k in the original recording.
+    Smoothing, run detection, refractory merging, and
+    minimum-duration filtering all operate on this
+    chronologically-ordered per-mouse stream; events cannot span
+    different animals.
+
+    Within each mouse, surviving segments are partitioned into
+    contiguous chunks where consecutive chrono_idx values differ
+    by exactly 1 (delta == 1). A delta > 1 indicates one or more
+    intermediate segments removed by the upstream Layer 1
+    amplitude filter (Section 7.4); the chunk boundary at that
+    gap prevents events from extending across a real-time
+    discontinuity. Each chunk is processed as a self-contained
+    sub-recording through Stages 1-3.
+
+    Event-to-ground-truth matching (any-overlap rule)
+    -------------------------------------------------
+    Each post-processed predicted event for a mouse is matched
+    against that mouse's annotated seizure intervals (the same
+    Excel intervals consumed by the preprocessing labeller and
+    by the chronology builder). The matching rule is any-overlap:
+    a predicted event P is associated with a ground-truth seizure
+    GT if P.start_sec < GT.end_sec and P.end_sec > GT.start_sec.
+
+      True positive  (TP) -- a GT seizure with at least one
+                             overlapping predicted event.
+      False positive (FP) -- a predicted event with no overlapping
+                             GT seizure (a false alarm).
+      False negative (FN) -- a GT seizure with no overlapping
+                             predicted event (a missed seizure).
+
+    A single predicted event spanning two close-together real
+    seizures is credited to each as a separate TP, preserving
+    recall as a per-seizure detection rate rather than a
+    per-prediction matching rate. This rule is standard in the
+    seizure-detection literature (Shoeb 2009; Truong et al. 2018).
+    Consequently, TP + FN equals the total number of ground-truth
+    seizures, while TP + FP may exceed the total number of
+    predicted events when single predictions overlap multiple
+    seizures.
+
+    Detection latency for each TP is defined as the start time
+    of the first overlapping predicted event minus the GT
+    seizure-onset time, computed in seconds. Negative latencies
+    indicate the model's first positive prediction precedes the
+    annotated onset (consistent with conservative annotation
+    boundaries).
+
+    Event-level metrics
+    -------------------
+    Per partition (val and test), the following event-level
+    metrics are aggregated across all animals:
+
+        Event Precision  = TP / (TP + FP)
+        Event Recall     = TP / (TP + FN)              (sensitivity)
+        Event F1         = 2 PR / (P + R)
+        Event FAR/hr     = FP / non_ictal_hours
+        Mean latency     = mean(latency_per_TP)        (seconds)
+
+    The non-ictal-hour denominator is computed as the total
+    number of surviving non-ictal segments multiplied by
+    step_sec = 2.5 s and divided by 3600. This corresponds to
+    the unique wall-clock recording duration each segment
+    contributes under 50% overlap (segment k covers seconds
+    k*step_sec to k*step_sec + segment_len_sec; consecutive
+    segments add only step_sec of new wall-clock time). FAR/hr
+    is therefore expressible as false alarm events per hour of
+    real recording, not per hour of segment-coverage time.
+
+    Event-level metrics complement the segment-level
+    classification metrics (Row 1 / Row 2; see Section 7.6.11).
+    Segment-level metrics characterise the per-window classifier;
+    event-level metrics characterise the deployable alarm system
+    actually experienced by a clinician. Event-level recall and
+    FAR/hr are the principal headline quantities for clinical
+    deployment claims.
+
+    Note on event-level true negatives. Event-level TN, accuracy,
+    and specificity are not well-defined because there is no
+    natural unit for "a non-event period correctly identified as
+    a non-event" without an arbitrary windowing choice. We
+    therefore report event-level TP, FP, FN, Precision, Recall,
+    F1, FAR/hr, and detection latency, in line with the
+    convention in seizure-detection papers (Shoeb 2009; Roy et
+    al. 2019; Tang et al. 2021), and rely on segment-level TN /
+    accuracy / specificity for those quantities.
+
 7.6.10 Operating-point selection (Youden's J)
 
     Following training, three operating thresholds are evaluated
@@ -1900,6 +2059,33 @@ configurations.
     is therefore self-contained: a reader does not need to
     cross-reference the three-row CSV to obtain threshold-independent
     metrics.
+
+    Row 3 retirement. Row 3 (post-processed predictions at the
+    threshold-optimised operating point tau*) has been retired from
+    the current report version. The threshold-optimisation objective
+    was changed from Youden's J to F1 partway through the study
+    (Section 7.6.10) because the Youden operating point degenerated
+    on this dataset's ~0.27% ictal prevalence (tau* = 0.10 yielded
+    precision 7.4%); with the F1 objective Row 3 collapses to an
+    operating point that is empirically very close to Row 2's
+    tau = 0.5 while adding an extra threshold-sweep step that
+    overfits tau to the validation partition. All reported numbers
+    therefore use the Row 1 + Row 2 schema only, with Row 2 (post-
+    processed at tau = 0.5) as the canonical operating configuration
+    for inter-model comparisons. The threshold-sweep code path is
+    kept in the source as commented scaffolding so that Row 3 can
+    be re-enabled if a future dataset warrants it.
+
+    FAR/hr denominator. Segment-level FAR/hr is reported in the
+    corrected form only (denominator = n_non_ictal_segs x step_sec
+    / 3600, where step_sec = 2.5 s is the unique wall-clock time
+    each segment contributes under 50% segment overlap). An earlier
+    "BROKEN" column that multiplied by segment_len_sec = 5.0 s
+    (and so under-reported FAR/hr by 2x) was retained transiently
+    in audit JSONs during the migration; it has now been dropped
+    from all output schemas. Event-level FAR/hr uses the same
+    step_sec-based denominator over per-mouse non-ictal hours
+    (Section 7.6.9).
 
 7.6.12 Compute budget and wall-clock cost
 

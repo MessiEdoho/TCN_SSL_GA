@@ -394,8 +394,11 @@ def detect_events_in_chunk(t_start, y_prob, mouse_id, chunk_id):
     if n == 0:
         return [], np.array([], dtype=np.float64), np.array([], dtype=np.int64)
 
-    kernel = np.ones(SMOOTHING_WIN) / SMOOTHING_WIN
-    smoothed = np.convolve(y_prob, kernel, mode="same")
+    if n < SMOOTHING_WIN:
+        smoothed = y_prob.astype(np.float64).copy()
+    else:
+        kernel = np.ones(SMOOTHING_WIN) / SMOOTHING_WIN
+        smoothed = np.convolve(y_prob, kernel, mode="same")
     preds = (smoothed >= THRESHOLD).astype(np.int64)
 
     raw_events = []

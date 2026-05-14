@@ -94,6 +94,8 @@ from tcn_utils import (
     ema_smooth,
 )
 
+from eval_utils import evaluate_event_level, THRESHOLD
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -166,8 +168,10 @@ VAL_PREDICTIONS_NPZ = OUTPUT_ROOT / "tcn_val_predictions_full.npz"  # cached val
 # Use the fully-filtered manifest so the |x|>1000 / NaN / Inf criterion is
 # applied uniformly across train, val, and test partitions. Eliminates the
 # FP16-overflow NaN failure mode observed in the M3 final-eval pass.
-SPLITS_PATH         = Path("/scratch/22206468/INPUT_DATA/data_splits_outputs/data_splits_nonictal_sampled_filtered.json")
+SPLITS_PATH         = Path("/scratch/22206468/INPUT_DATA/data_splits_outputs/data_splits_nonictal_sampled_filtered_enriched.json")
 BEST_PARAMS_PATH    = Path("/home/people/22206468/scratch/OUTPUT/MODEL1_OUTPUT/TCNtuning_outputs") / "best_params.json"
+ANNOT_DIR           = Path("/home/people/22206468/scratch/seizure_times_updated")
+MOUSE_METADATA_PATH = Path("/home/people/22206468/scratch/INPUT_DATA/Data_diagnostic/mouse_recording_metadata.json")
 
 
 # ---------------------------------------------------------------------------
@@ -276,7 +280,8 @@ def load_splits(logger):
 
     # Convert records to (filepath, label) tuples
     train_pairs = [(rec["filepath"], rec["label"]) for rec in splits["train"]]
-    val_pairs = [(rec["filepath"], rec["label"]) for rec in splits["val"]]
+    val_pairs   = [(rec["filepath"], rec["label"]) for rec in splits["val"]]
+    val_records = list(splits["val"])     # full enriched records (mouse_id, chrono_idx, t_start_sec)
 
     if not train_pairs:
         logger.error("Train partition is empty.")
@@ -294,12 +299,17 @@ def load_splits(logger):
         logger.info("%s: %d total | %d seizure | %d non-seizure | %.1f%% ictal | %d mice",
                     name, n_total, n_sz, n_nsz, pct, len(mouse_ids))
 
+    if not all("chrono_idx" in r for r in val_records[:5]):
+        logger.error("Val records missing 'chrono_idx' -- pointing at the un-enriched manifest? "
+                     "SPLITS_PATH must end in '_enriched.json'. Got: %s", SPLITS_PATH)
+        raise RuntimeError("Manifest not enriched with chronology")
+
     # Check test status
     test_status = splits.get("metadata", {}).get("test_status", "pending")
     if test_status != "complete":
         logger.info("Test data not yet ready -- test split not loaded here.")
 
-    return train_pairs, val_pairs
+    return train_pairs, val_pairs, val_records
 
 
 # ---------------------------------------------------------------------------
@@ -1182,7 +1192,7 @@ def main():
 
     # -- Step 2: Load inputs ---------------------------------------------------
     config, hp = load_best_params(logger)
-    train_pairs, val_pairs = load_splits(logger)
+    train_pairs, val_pairs, val_records = load_splits(logger)
 
     # -- Corpus preparation ----------------------------------------------------
     # Subject exclusion (m254), proximity-aware non-ictal downsampling to a
@@ -1418,39 +1428,149 @@ def main():
         logger.info("F1 consistency check (monitor subset): PASS (%.4f)", val_f1_monitor)
 
     logger.info("Running full-val final evaluation (post-processing inputs)...")
-    val_f1_final, y_true, y_pred_05, y_prob = evaluate_model(model, val_loader, DEVICE, logger, use_amp=use_amp)
+    val_f1_final, y_true, y_pred_05, y_prob = evaluate_model(model, val_loader, DEVICE, logger, use_amp=False)
     logger.info("Full-val F1 (raw @ 0.5): %.4f", val_f1_final)
 
     # -- Step 11: Post-processing evaluations (Row 3 retired) ------------------
+    # Legacy call -- kept for save_all_results' segment-level outputs (epoch
+    # CSV, per-row classification reports). The event-level FAR/hr it produces
+    # is superseded by Step 11b and overwritten in the eval report.
     (row1_metrics, row2_metrics,
      post_row2, far_row2) = run_postprocessing_evaluations(y_true, y_prob, logger)
 
-    # -- Step 12: Save all structured results ----------------------------------
-    y_pred_row1 = (y_prob >= 0.5).astype(int)
-    y_pred_row2 = post_row2["smoothed_preds"]
+    # -- Step 11b: Corrected per-mouse-chronological event-level evaluation ----
+    logger.info("Running per-mouse-chronological event-level evaluation "
+                "(eval_utils.evaluate_event_level)...")
+    if not MOUSE_METADATA_PATH.exists():
+        logger.error("Mouse metadata not found at %s. Run extract_mouse_metadata.py first.",
+                     MOUSE_METADATA_PATH)
+        raise FileNotFoundError(str(MOUSE_METADATA_PATH))
+    mouse_metadata = json.loads(MOUSE_METADATA_PATH.read_text(encoding="utf-8"))
+    val_eval_result = evaluate_event_level(
+        val_records, y_true, y_prob, ANNOT_DIR, mouse_metadata, logger)
 
-    # Cache val predictions bundle so future post-hoc passes can recompute
-    # Row 1 / Row 2 metrics without re-running the multi-hour val forward pass.
+    # -- Step 12: Save all structured results ----------------------------------
+    # y_pred_row1 / y_pred_row2 come from the corrected per-mouse-chronological
+    # pipeline. The val NPZ written below is in chronological order with the
+    # enriched schema (mouse_id, chrono_idx, t_start_sec) per Phase B B1a.
+    reord = val_eval_result["reordered_arrays"]
+    y_pred_row1 = reord["y_pred_row1"]
+    y_pred_row2 = reord["y_pred_row2"]
+
     np.savez_compressed(
         VAL_PREDICTIONS_NPZ,
-        y_true=y_true.astype(np.int8),
-        y_prob=y_prob.astype(np.float32),
+        y_true=reord["y_true"].astype(np.int8),
+        y_prob=reord["y_prob"].astype(np.float32),
         y_pred_row1=y_pred_row1.astype(np.int8),
         y_pred_row2=y_pred_row2.astype(np.int8),
-        n_segments=np.int64(len(y_true)),
+        mouse_id=reord["mouse_id"],
+        chrono_idx=reord["chrono_idx"],
+        t_start_sec=reord["t_start_sec"],
+        n_segments=np.int64(len(reord["y_true"])),
         segment_sec=np.float32(SEGMENT_SEC),
         smoothing_win=np.int64(SMOOTHING_WIN),
         refractory_sec=np.float32(REFRACTORY_SEC),
         min_event_sec=np.float32(MIN_EVENT_SEC),
     )
-    logger.info("Saved val predictions bundle: %s (%.2f MB)",
+    logger.info("Saved enriched val predictions bundle: %s (%.2f MB)",
                 VAL_PREDICTIONS_NPZ, VAL_PREDICTIONS_NPZ.stat().st_size / 1e6)
 
     save_all_results(
         history, row1_metrics, row2_metrics,
         far_row2, hp, best_epoch, best_val_f1,
         elapsed, DEVICE, n_params, y_true,
-        y_pred_row1, y_pred_row2, logger)
+        (y_prob >= 0.5).astype(int), post_row2["smoothed_preds"], logger)
+
+    # -- Step 12b: Overwrite eval report with corrected event-level metrics ----
+    corrected_report = {
+        "model":     MODEL_NAME,
+        "timestamp": datetime.datetime.now().isoformat(),
+        "weights_path":   str(WEIGHTS_PATH),
+        "evaluation_set": "validation",
+        "tuning_source":  str(BEST_PARAMS_PATH),
+        "hyperparameters": hp,
+        "post_processing_params": {
+            "smoothing_window":       SMOOTHING_WIN,
+            "refractory_period_sec":  REFRACTORY_SEC,
+            "min_event_duration_sec": MIN_EVENT_SEC,
+            "step_sec":               STEP_SEC,
+            "matching_rule":          "any-overlap",
+        },
+        "totals":                val_eval_result["totals"],
+        "segment_level_metrics": val_eval_result["segment_level_metrics"],
+        "event_level_metrics":   val_eval_result["event_level_metrics"],
+        "per_mouse":             val_eval_result["per_mouse_results"],
+    }
+    with open(EVAL_REPORT_PATH, "w", encoding="utf-8") as f:
+        json.dump(corrected_report, f, indent=2, default=str)
+    logger.info("Overwrote eval report with corrected schema: %s", EVAL_REPORT_PATH)
+
+    # -- Step 12c: Overwrite event-details CSV with corrected per-event rows ---
+    event_details_path = OUTPUT_ROOT / "tcn_event_details_row2.csv"
+    fieldnames_evt = ["mouse_id", "is_true_alarm", "start_sec", "end_sec",
+                      "duration_sec", "max_prob", "matched_gt_idx",
+                      "matched_gt_start_sec", "matched_gt_end_sec"]
+    with open(event_details_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames_evt)
+        writer.writeheader()
+        for row in val_eval_result["all_event_details"]:
+            writer.writerow(row)
+    logger.info("Overwrote event-details CSV with corrected rows: %s (%d rows)",
+                event_details_path, len(val_eval_result["all_event_details"]))
+
+    # -- Step 12d: Overwrite three-row summary CSV with corrected values -------
+    seg = val_eval_result["segment_level_metrics"]
+    em  = val_eval_result["event_level_metrics"]
+    fieldnames_3r = [
+        "row", "threshold", "postprocessed",
+        "accuracy", "precision", "recall", "specificity", "youden_j",
+        "f1_macro", "auroc", "average_precision",
+        "far_per_hour_seg", "far_per_hour_event",
+        "n_true_alarms", "n_false_alarms", "n_total_events",
+        "tp", "tn", "fp", "fn",
+    ]
+    rows_3r = [
+        ("Row1_raw_0.5",      seg["row1_raw_threshold_0_5"],      "N/A"),
+        ("Row2_postproc_0.5", seg["row2_postproc_threshold_0_5"], em["far_per_hour_event_CORRECTED"]),
+    ]
+    with open(THREE_ROW_CSV, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames_3r)
+        writer.writeheader()
+        for label, m, far_evt in rows_3r:
+            writer.writerow({
+                "row":               label,
+                "threshold":         m.get("threshold", THRESHOLD),
+                "postprocessed":     m.get("postprocessed", False),
+                "accuracy":          m.get("accuracy", ""),
+                "precision":         m.get("precision", ""),
+                "recall":            m.get("recall", ""),
+                "specificity":       m.get("specificity", ""),
+                "youden_j":          m.get("youden_j", ""),
+                "f1_macro":          m.get("f1_macro", ""),
+                "auroc":             m.get("auroc", ""),
+                "average_precision": m.get("average_precision", ""),
+                "far_per_hour_seg":  m.get("far_per_hour_seg_CORRECTED_2_5s_denom", ""),
+                "far_per_hour_event": far_evt,
+                "n_true_alarms":     em["tp"]            if far_evt != "N/A" else "N/A",
+                "n_false_alarms":    em["fp"]            if far_evt != "N/A" else "N/A",
+                "n_total_events":    em["tp"] + em["fp"] if far_evt != "N/A" else "N/A",
+                "tp": m.get("tp", ""), "tn": m.get("tn", ""),
+                "fp": m.get("fp", ""), "fn": m.get("fn", ""),
+            })
+    logger.info("Overwrote three-row summary with corrected values: %s", THREE_ROW_CSV)
+
+    em = val_eval_result["event_level_metrics"]
+    logger.info("=" * 65)
+    logger.info("CORRECTED EVENT-LEVEL VAL METRICS")
+    logger.info("  TP / FP / FN          : %d / %d / %d", em["tp"], em["fp"], em["fn"])
+    logger.info("  Precision             : %.4f", em["precision"])
+    logger.info("  Recall (sensitivity)  : %.4f", em["recall"])
+    logger.info("  F1                    : %.4f", em["f1"])
+    logger.info("  FAR/hr event CORRECTED: %.4f  (non-ictal hours = %.1f)",
+                em["far_per_hour_event_CORRECTED"],
+                val_eval_result["totals"]["non_ictal_hours_corrected"])
+    logger.info("  Mean detection latency: %s s", em["mean_detection_latency_sec"])
+    logger.info("=" * 65)
 
     # -- Step 13: Plot all figures ---------------------------------------------
     plot_all_figures(

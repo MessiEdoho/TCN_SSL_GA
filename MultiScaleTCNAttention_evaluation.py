@@ -88,6 +88,7 @@ python MultiScaleTCNAttention_evaluation.py
 # ---------------------------------------------------------------------------
 # Imports
 # ---------------------------------------------------------------------------
+import csv
 import datetime
 import json
 import logging
@@ -105,7 +106,8 @@ matplotlib.use("Agg")                                  # non-interactive backend
 # does NOT execute its main() because that's guarded by __name__ == "__main__".
 from MultiScaleTCNAttention import (
     SEED, MODEL_NAME, OUTPUT_ROOT,
-    SPLITS_PATH, WEIGHTS_PATH,
+    SPLITS_PATH, WEIGHTS_PATH, ANNOT_DIR, MOUSE_METADATA_PATH,
+    BACKBONE_PARAMS_PATH, ATTN_PARAMS_PATH,
     SEGMENT_SEC,
     MIN_EVENT_SEC, REFRACTORY_SEC, SMOOTHING_WIN,
     load_best_params, build_model,
@@ -126,6 +128,9 @@ from eval_utils import (
     make_safe_loader,
     evaluate_model_safe,
     verify_manifest_filtered,
+    evaluate_event_level,
+    THRESHOLD,
+    STEP_SEC,
 )
 
 from tcn_utils import (
@@ -284,7 +289,8 @@ def load_test_split(logger):
     else:
         logger.info("metadata.test_status = 'complete'.")
 
-    test_pairs = [(rec["filepath"], rec["label"]) for rec in splits["test"]]
+    test_pairs   = [(rec["filepath"], rec["label"]) for rec in splits["test"]]
+    test_records = list(splits["test"])     # full enriched records (mouse_id, chrono_idx, t_start_sec)
 
     n_total = len(test_pairs)
     n_sz = sum(1 for _, l in test_pairs if l == 1)
@@ -294,51 +300,13 @@ def load_test_split(logger):
     logger.info("TEST: %d total | %d seizure | %d non-seizure | %.2f%% ictal | %d mice",
                 n_total, n_sz, n_nsz, pct, len(mouse_ids))
 
-    return test_pairs
+    if not all("chrono_idx" in r for r in test_records[:5]):
+        logger.error("Test records missing 'chrono_idx' -- pointing at the un-enriched manifest? "
+                     "SPLITS_PATH must end in '_enriched.json'. Got: %s", SPLITS_PATH)
+        raise RuntimeError("Manifest not enriched with chronology")
 
+    return test_pairs, test_records
 
-# ---------------------------------------------------------------------------
-# _patch_eval_report_for_test
-# ---------------------------------------------------------------------------
-def _patch_eval_report_for_test(eval_report_path, n_test_segments,
-                                manifest_filter, eval_seconds, logger):
-    """Patch the JSON written by save_all_results so its evaluation_set,
-    note, and provenance fields reflect the TEST partition instead of
-    the validation partition.
-
-    save_all_results() lives in MultiScaleTCNAttention.py and hardcodes
-    "evaluation_set": "validation" and a note pointing to
-    final_evaluation.py. Rather than fork the helper, the cleanest fix
-    is to overwrite those few fields after the file is written.
-    """
-    if not eval_report_path.exists():
-        logger.warning("Eval report missing -- cannot patch test metadata: %s",
-                       eval_report_path)
-        return
-
-    with open(eval_report_path, "r", encoding="utf-8") as f:
-        report = json.load(f)
-
-    report["evaluation_set"] = "test"
-    report["note"] = ("Final evaluation on the held-out test partition. "
-                      "Metrics computed via the same helpers as the "
-                      "validation pass in MultiScaleTCNAttention.py.")
-    report["n_test_segments"] = int(n_test_segments)
-    report["test_predictions_npz"] = str(TEST_PREDICTIONS_NPZ)
-    report["weights_path"] = str(WEIGHTS_PATH)
-    report["fp32_forward"] = bool(not USE_AMP_FOR_EVAL)
-    report["nan_protection"] = {
-        "layer_1_manifest_filter": manifest_filter,
-        "layer_2_dataset":         "SafeEEGSegmentDataset",
-        "layer_3_precision":       "FP32",
-        "layer_4_isfinite_assert": True,
-        "amplitude_threshold":     AMPLITUDE_THRESHOLD,
-    }
-    report["forward_pass_seconds"] = round(float(eval_seconds), 1)
-
-    with open(eval_report_path, "w", encoding="utf-8") as f:
-        json.dump(report, f, indent=2)
-    logger.info("Patched evaluation report for test set: %s", eval_report_path)
 
 
 # ---------------------------------------------------------------------------
@@ -418,7 +386,7 @@ def main():
     # -- Step 5: Load test split + build safe loader (Layer 2) ----------------
     logger.info("-" * 65)
     logger.info("Step 5: Load TEST split and build SafeEEGSegmentDataset loader")
-    test_pairs = load_test_split(logger)
+    test_pairs, test_records = load_test_split(logger)
     batch_size = int(attn_hp["batch_size"])
     test_loader = make_safe_loader(test_pairs, batch_size, device,
                                    num_workers=NUM_DATA_WORKERS)
@@ -446,53 +414,55 @@ def main():
     else:
         logger.info("SafeEEGSegmentDataset sanitised 0 segments (Layer 1 OK).")
 
-    # -- Step 7: Row 1 + Row 2 post-processing evaluations -------------------
-    # run_postprocessing_evaluations() lives in MultiScaleTCNAttention.py and
-    # computes:
-    #   Row 1 -- compute_all_metrics(y_true, (y_prob>=0.5), y_prob)
-    #   Row 2 -- segment_predictions_to_events(...) + compute_event_level_far(...)
-    #            + compute_all_metrics(y_true, smoothed_preds, smoothed_probs)
-    # Reusing the helper guarantees identical metric definitions and post-
-    # processing parameters as the validation pass in MultiScaleTCNAttention.py.
+    # -- Step 7: Run post-processing evaluation (Row 1 + Row 2) --------------
+    # Legacy call -- kept for save_all_results' segment-level outputs (per-row
+    # classification reports). The event-level FAR/hr it produces is
+    # superseded by Step 7b and overwritten in the eval report.
     logger.info("-" * 65)
     logger.info("Step 7: Run post-processing evaluation (Row 1 + Row 2)")
     (row1_metrics, row2_metrics,
      post_row2, far_row2) = run_postprocessing_evaluations(
         y_true, y_prob, logger)
-    y_pred_row1 = (y_prob >= 0.5).astype(int)
-    y_pred_row2 = post_row2["smoothed_preds"]
 
-    # -- Step 8: Cache predictions bundle (full schema) -----------------------
-    # y_true + y_prob + raw + post-processed predictions, so a future
-    # recovery pass can recompute Row 1 / Row 2 without re-running the
-    # multi-hour FP32 forward.
+    # -- Step 7b: Corrected per-mouse-chronological event-level evaluation ----
     logger.info("-" * 65)
-    logger.info("Step 8: Cache test predictions bundle (full schema)")
+    logger.info("Step 7b: Corrected per-mouse-chronological event-level evaluation")
+    if not MOUSE_METADATA_PATH.exists():
+        logger.error("Mouse metadata not found at %s. Run extract_mouse_metadata.py first.",
+                     MOUSE_METADATA_PATH)
+        raise FileNotFoundError(str(MOUSE_METADATA_PATH))
+    mouse_metadata = json.loads(MOUSE_METADATA_PATH.read_text(encoding="utf-8"))
+    test_eval_result = evaluate_event_level(
+        test_records, y_true, y_prob, ANNOT_DIR, mouse_metadata, logger)
+
+    # -- Step 8: Cache test predictions bundle (enriched schema) -------------
+    reord = test_eval_result["reordered_arrays"]
+    y_pred_row1 = reord["y_pred_row1"]
+    y_pred_row2 = reord["y_pred_row2"]
+    logger.info("-" * 65)
+    logger.info("Step 8: Cache enriched test predictions bundle")
     np.savez_compressed(
         TEST_PREDICTIONS_NPZ,
-        y_true=y_true.astype(np.int8),
-        y_prob=y_prob.astype(np.float32),
+        y_true=reord["y_true"].astype(np.int8),
+        y_prob=reord["y_prob"].astype(np.float32),
         y_pred_row1=y_pred_row1.astype(np.int8),
         y_pred_row2=y_pred_row2.astype(np.int8),
-        n_segments=np.int64(len(y_true)),
+        mouse_id=reord["mouse_id"],
+        chrono_idx=reord["chrono_idx"],
+        t_start_sec=reord["t_start_sec"],
+        n_segments=np.int64(len(reord["y_true"])),
         segment_sec=np.float32(SEGMENT_SEC),
         smoothing_win=np.int64(SMOOTHING_WIN),
         refractory_sec=np.float32(REFRACTORY_SEC),
         min_event_sec=np.float32(MIN_EVENT_SEC),
     )
-    logger.info("Saved test predictions bundle: %s (%.2f MB)",
+    logger.info("Saved enriched test predictions bundle: %s (%.2f MB)",
                 TEST_PREDICTIONS_NPZ, TEST_PREDICTIONS_NPZ.stat().st_size / 1e6)
 
     # -- Step 9: Save structured results (JSON / CSV / per-row reports) -------
     logger.info("-" * 65)
     logger.info("Step 9: Save evaluation report, two-row CSV, classification reports")
 
-    # save_all_results accepts history=None when invoked from a test-eval
-    # script. Internal guards in MultiScaleTCNAttention.save_all_results
-    # then skip the two history-dependent training artefacts
-    # (ms_attn_training_log.json and ms_attn_epoch_metrics.csv), so the
-    # eval folder receives only test-side outputs. best_epoch / best_val_f1
-    # are passed as placeholders; they are unused when history is None.
     history     = None
     best_epoch  = 0
     best_val_f1 = 0.0
@@ -502,16 +472,113 @@ def main():
         history, row1_metrics, row2_metrics,
         far_row2, backbone_hp, branch_dilations, attn_hp,
         best_epoch, best_val_f1, elapsed_dt, device, n_params, y_true,
-        y_pred_row1, y_pred_row2, logger)
+        (y_prob >= 0.5).astype(int), post_row2["smoothed_preds"], logger)
 
-    # Patch the JSON the helper just wrote so the test-set provenance
-    # (evaluation_set, NaN-protection layers, npz cache, etc.) is recorded.
-    _patch_eval_report_for_test(
-        EVALUATION_DIR / "ms_attn_evaluation_report.json",
-        n_test_segments=len(y_true),
-        manifest_filter=manifest_filter,
-        eval_seconds=eval_seconds,
-        logger=logger)
+    # -- Step 9b: Overwrite eval report with corrected event-level metrics ----
+    eval_report_path = EVALUATION_DIR / "ms_attn_evaluation_report.json"
+    corrected_report = {
+        "model":     MODEL_NAME,
+        "timestamp": datetime.datetime.now().isoformat(),
+        "weights_path":   str(WEIGHTS_PATH),
+        "evaluation_set": "test",
+        "n_test_segments": int(len(y_true)),
+        "test_predictions_npz": str(TEST_PREDICTIONS_NPZ),
+        "fp32_forward":   bool(not USE_AMP_FOR_EVAL),
+        "forward_pass_seconds": round(float(eval_seconds), 1),
+        "backbone_hyperparameters":  backbone_hp,
+        "branch_dilations":          branch_dilations,
+        "attention_hyperparameters": attn_hp,
+        "backbone_params_source":    str(BACKBONE_PARAMS_PATH),
+        "attention_params_source":   str(ATTN_PARAMS_PATH),
+        "nan_protection": {
+            "layer_1_manifest_filter": manifest_filter,
+            "layer_2_dataset":         "SafeEEGSegmentDataset",
+            "layer_3_precision":       "FP32",
+            "layer_4_isfinite_assert": True,
+            "amplitude_threshold":     AMPLITUDE_THRESHOLD,
+        },
+        "post_processing_params": {
+            "smoothing_window":       SMOOTHING_WIN,
+            "refractory_period_sec":  REFRACTORY_SEC,
+            "min_event_duration_sec": MIN_EVENT_SEC,
+            "step_sec":               STEP_SEC,
+            "matching_rule":          "any-overlap",
+        },
+        "totals":                test_eval_result["totals"],
+        "segment_level_metrics": test_eval_result["segment_level_metrics"],
+        "event_level_metrics":   test_eval_result["event_level_metrics"],
+        "per_mouse":             test_eval_result["per_mouse_results"],
+    }
+    with open(eval_report_path, "w", encoding="utf-8") as f:
+        json.dump(corrected_report, f, indent=2, default=str)
+    logger.info("Overwrote eval report with corrected schema: %s", eval_report_path)
+
+    # -- Step 9c: Overwrite event-details CSV with corrected per-event rows ---
+    event_details_path = EVALUATION_DIR / "ms_attn_event_details_row2.csv"
+    fieldnames_evt = ["mouse_id", "is_true_alarm", "start_sec", "end_sec",
+                      "duration_sec", "max_prob", "matched_gt_idx",
+                      "matched_gt_start_sec", "matched_gt_end_sec"]
+    with open(event_details_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames_evt)
+        writer.writeheader()
+        for row in test_eval_result["all_event_details"]:
+            writer.writerow(row)
+    logger.info("Overwrote event-details CSV with corrected rows: %s (%d rows)",
+                event_details_path, len(test_eval_result["all_event_details"]))
+
+    # -- Step 9d: Overwrite three-row summary CSV with corrected values -------
+    seg = test_eval_result["segment_level_metrics"]
+    em  = test_eval_result["event_level_metrics"]
+    fieldnames_3r = [
+        "row", "threshold", "postprocessed",
+        "accuracy", "precision", "recall", "specificity", "youden_j",
+        "f1_macro", "auroc", "average_precision",
+        "far_per_hour_seg", "far_per_hour_event",
+        "n_true_alarms", "n_false_alarms", "n_total_events",
+        "tp", "tn", "fp", "fn",
+    ]
+    rows_3r = [
+        ("Row1_raw_0.5",      seg["row1_raw_threshold_0_5"],      "N/A"),
+        ("Row2_postproc_0.5", seg["row2_postproc_threshold_0_5"], em["far_per_hour_event_CORRECTED"]),
+    ]
+    three_row_path = EVALUATION_DIR / "ms_attn_three_row_summary.csv"
+    with open(three_row_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames_3r)
+        writer.writeheader()
+        for label, m, far_evt in rows_3r:
+            writer.writerow({
+                "row":               label,
+                "threshold":         m.get("threshold", THRESHOLD),
+                "postprocessed":     m.get("postprocessed", False),
+                "accuracy":          m.get("accuracy", ""),
+                "precision":         m.get("precision", ""),
+                "recall":            m.get("recall", ""),
+                "specificity":       m.get("specificity", ""),
+                "youden_j":          m.get("youden_j", ""),
+                "f1_macro":          m.get("f1_macro", ""),
+                "auroc":             m.get("auroc", ""),
+                "average_precision": m.get("average_precision", ""),
+                "far_per_hour_seg":  m.get("far_per_hour_seg_CORRECTED_2_5s_denom", ""),
+                "far_per_hour_event": far_evt,
+                "n_true_alarms":     em["tp"]            if far_evt != "N/A" else "N/A",
+                "n_false_alarms":    em["fp"]            if far_evt != "N/A" else "N/A",
+                "n_total_events":    em["tp"] + em["fp"] if far_evt != "N/A" else "N/A",
+                "tp": m.get("tp", ""), "tn": m.get("tn", ""),
+                "fp": m.get("fp", ""), "fn": m.get("fn", ""),
+            })
+    logger.info("Overwrote three-row summary with corrected values: %s", three_row_path)
+
+    logger.info("=" * 65)
+    logger.info("CORRECTED EVENT-LEVEL TEST METRICS")
+    logger.info("  TP / FP / FN          : %d / %d / %d", em["tp"], em["fp"], em["fn"])
+    logger.info("  Precision             : %.4f", em["precision"])
+    logger.info("  Recall (sensitivity)  : %.4f", em["recall"])
+    logger.info("  F1                    : %.4f", em["f1"])
+    logger.info("  FAR/hr event CORRECTED: %.4f  (non-ictal hours = %.1f)",
+                em["far_per_hour_event_CORRECTED"],
+                test_eval_result["totals"]["non_ictal_hours_corrected"])
+    logger.info("  Mean detection latency: %s s", em["mean_detection_latency_sec"])
+    logger.info("=" * 65)
 
     # -- Step 10: Plot all figures (Row 1 / Row 2; Row 3 retired) ------------
     logger.info("-" * 65)
