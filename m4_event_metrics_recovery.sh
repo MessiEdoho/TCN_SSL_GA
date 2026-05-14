@@ -14,7 +14,7 @@
 # under OUTPUT_ROOT/event_metrics/. Required because the original M4
 # training run crashed at AUROC due to FP16 attention-softmax NaN before
 # the val artefacts were written.
-#SBATCH -t 0-08:00:00
+#SBATCH -t 5-00:00:00
 
 #SBATCH --output=/home/people/22206468/slurm-m4_event_metrics_recovery-%j.out
 
