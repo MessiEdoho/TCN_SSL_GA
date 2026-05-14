@@ -30,20 +30,26 @@ import csv
 import datetime
 import json
 import logging
+import re
 import sys
 import time
 from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")  # headless backend for SLURM
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
 from MultiScaleTCNAttention import (
     OUTPUT_ROOT, WEIGHTS_PATH, SPLITS_PATH, ANNOT_DIR, MOUSE_METADATA_PATH,
     BACKBONE_PARAMS_PATH, ATTN_PARAMS_PATH, MODEL_NAME,
+    LOG_DIR as TRAIN_LOG_DIR,
     SEGMENT_SEC, STEP_SEC, SMOOTHING_WIN, REFRACTORY_SEC, MIN_EVENT_SEC,
     SEED,
     set_seed, load_best_params, load_splits, build_model, count_parameters,
 )
+from tcn_utils import ema_smooth
 from eval_utils import (
     AMPLITUDE_THRESHOLD, SafeEEGSegmentDataset, make_safe_loader,
     evaluate_model_safe, verify_manifest_filtered,
@@ -61,6 +67,116 @@ EVENT_DETAILS_CSV   = EVENT_METRICS_DIR / "ms_attn_event_details_row2.csv"
 TWO_ROW_CSV         = EVENT_METRICS_DIR / "ms_attn_two_row_summary.csv"
 ROW1_REPORT_PATH    = EVENT_METRICS_DIR / "ms_attn_classification_report_row1.json"
 ROW2_REPORT_PATH    = EVENT_METRICS_DIR / "ms_attn_classification_report_row2.json"
+EPOCH_CSV           = EVENT_METRICS_DIR / "ms_attn_epoch_metrics.csv"
+TRAINING_CURVES_PNG = EVENT_METRICS_DIR / "ms_attn_training_curves.png"
+LR_SCHEDULE_PNG     = EVENT_METRICS_DIR / "ms_attn_lr_schedule.png"
+TRAIN_LOG_PATH      = TRAIN_LOG_DIR / "MultiScaleTCNAttention_training.log"
+
+
+def parse_training_log(log_path, logger):
+    """Reconstruct {epoch, train_loss, val_f1, lr} arrays from the per-epoch
+    log lines emitted by MultiScaleTCNAttention.py's training loop. Format:
+    "Epoch <N>/<MAX> | loss=<...> | val_f1=<...> | lr=<...> | ...".
+    Returns None (and logs a warning) if the log file is missing or contains
+    no parseable epoch lines.
+    """
+    pattern = re.compile(
+        r"Epoch\s+(\d+)/\d+\s+\|\s+loss=([0-9.]+)\s+\|\s+val_f1=([0-9.]+)\s+\|\s+lr=([0-9.eE+-]+)"
+    )
+    if not log_path.exists():
+        logger.warning("Training log not found at %s -- skipping training-dynamics outputs.",
+                       log_path)
+        return None
+
+    epochs, train_loss, val_f1, lrs = [], [], [], []
+    with open(log_path, "r", encoding="utf-8") as f:
+        for line in f:
+            m = pattern.search(line)
+            if m is None:
+                continue
+            epochs.append(int(m.group(1)))
+            train_loss.append(float(m.group(2)))
+            val_f1.append(float(m.group(3)))
+            lrs.append(float(m.group(4)))
+
+    if not epochs:
+        logger.warning("No epoch lines parsed from %s -- skipping training-dynamics outputs.",
+                       log_path)
+        return None
+
+    # Resume runs can emit a given epoch twice (pre-crash + post-resume).
+    # Keep the LAST occurrence per epoch so we reflect the post-resume value.
+    seen = {}
+    for i, ep in enumerate(epochs):
+        seen[ep] = (train_loss[i], val_f1[i], lrs[i])
+    ordered = sorted(seen.items())
+    history = {
+        "epoch":      [ep for ep, _ in ordered],
+        "train_loss": [v[0] for _, v in ordered],
+        "val_f1":     [v[1] for _, v in ordered],
+        "lr":         [v[2] for _, v in ordered],
+    }
+    logger.info("Reconstructed training history: %d epochs from %s",
+                len(history["epoch"]), log_path)
+    return history
+
+
+def write_epoch_metrics_csv(history, out_path, logger):
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["epoch", "train_loss", "val_f1", "lr"])
+        writer.writeheader()
+        for ep, tl, vf, lr in zip(history["epoch"], history["train_loss"],
+                                  history["val_f1"], history["lr"]):
+            writer.writerow({"epoch": ep, "train_loss": tl, "val_f1": vf, "lr": lr})
+    logger.info("Saved per-epoch metrics CSV: %s", out_path)
+
+
+def plot_training_dynamics(history, logger):
+    """Replicate MultiScaleTCNAttention.plot_all_figures Figures 1 + 2 inline,
+    routed to EVENT_METRICS_DIR instead of the parent FIGURE_DIR. Returns
+    (best_epoch, best_val_f1) derived from the reconstructed history.
+    """
+    epochs = history["epoch"]
+    best_idx = int(np.argmax(history["val_f1"]))
+    best_epoch = epochs[best_idx]
+    best_val_f1 = history["val_f1"][best_idx]
+
+    EMA_ALPHA = 0.6
+    train_loss_smoothed = ema_smooth(history["train_loss"], alpha=EMA_ALPHA)
+    val_f1_smoothed     = ema_smooth(history["val_f1"], alpha=EMA_ALPHA)
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4))
+    axes[0].plot(epochs, history["train_loss"], color="#5A7DC8",
+                 linewidth=1.0, alpha=0.25, label="Train loss (raw)")
+    axes[0].plot(epochs, train_loss_smoothed, color="#5A7DC8",
+                 linewidth=1.6, label="Train loss (EMA, alpha=0.6)")
+    axes[0].axvline(best_epoch, linestyle="--", color="#C85A5A", alpha=0.7, label="Best epoch")
+    axes[0].set_xlabel("Epoch"); axes[0].set_ylabel("BCEWithLogitsLoss")
+    axes[0].set_title("MS-TCN+Attention Training Loss"); axes[0].legend(fontsize=9)
+    axes[1].plot(epochs, history["val_f1"], color="#5A7DC8",
+                 linewidth=1.0, alpha=0.25, label="Val F1 (raw)")
+    axes[1].plot(epochs, val_f1_smoothed, color="#5A7DC8",
+                 linewidth=1.6, label="Val F1 (EMA, alpha=0.6)")
+    axes[1].axvline(best_epoch, linestyle="--", color="#C85A5A", alpha=0.7, label="Best epoch")
+    axes[1].annotate("%.4f" % best_val_f1, xy=(best_epoch, best_val_f1),
+                     xytext=(5, -15), textcoords="offset points", fontsize=9, color="#C85A5A")
+    axes[1].set_xlabel("Epoch"); axes[1].set_ylabel("Macro F1-score")
+    axes[1].set_title("MS-TCN+Attention Validation Macro F1"); axes[1].legend(fontsize=9)
+    plt.tight_layout()
+    plt.savefig(TRAINING_CURVES_PNG, dpi=150, bbox_inches="tight")
+    plt.close()
+    logger.info("Saved: %s", TRAINING_CURVES_PNG.name)
+
+    fig, ax = plt.subplots(figsize=(8, 3))
+    ax.plot(epochs, history["lr"], color="#5A7DC8", linewidth=1.2)
+    ax.set_yscale("log"); ax.set_xlabel("Epoch"); ax.set_ylabel("Learning rate (log scale)")
+    ax.set_title("MS-TCN+Attention Cosine Annealing LR")
+    plt.tight_layout()
+    plt.savefig(LR_SCHEDULE_PNG, dpi=150, bbox_inches="tight")
+    plt.close()
+    logger.info("Saved: %s", LR_SCHEDULE_PNG.name)
+
+    return best_epoch, best_val_f1
 
 
 def setup_logging():
@@ -272,6 +388,18 @@ def main():
     with open(ROW2_REPORT_PATH, "w", encoding="utf-8") as f:
         json.dump(row2_report, f, indent=2, default=str)
     logger.info("Saved Row 2 classification report: %s", ROW2_REPORT_PATH)
+
+    # Training-dynamics reconstruction from the original M4 training log
+    # (per-epoch CSV + training_curves.png + lr_schedule.png). The training
+    # history dict was never persisted because the AUROC crash happened
+    # before save_all_results() could run, but every epoch emits one
+    # parseable line to the .log file, so the dynamics can be recovered.
+    history = parse_training_log(TRAIN_LOG_PATH, logger)
+    if history is not None:
+        write_epoch_metrics_csv(history, EPOCH_CSV, logger)
+        recovered_best_epoch, recovered_best_val_f1 = plot_training_dynamics(history, logger)
+        logger.info("Training-dynamics summary: %d epochs | best F1 %.4f at epoch %d",
+                    len(history["epoch"]), recovered_best_val_f1, recovered_best_epoch)
 
     # Final summary log block.
     logger.info("-" * 65)
