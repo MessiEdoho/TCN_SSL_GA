@@ -45,6 +45,7 @@ import csv
 import datetime
 import json
 import logging
+import math
 import sys
 import time
 from pathlib import Path
@@ -115,10 +116,14 @@ VARIANT_CONFIG = {
 
 
 COMPARISON_METRICS = [
-    ("Sensitivity", "recall"),
+    ("Accuracy",    "accuracy"),
+    ("Recall",      "recall_macro"),
+    ("Precision",   "precision_macro"),
+    ("Specificity", "specificity"),
     ("AUROC",       "auroc"),
     ("AP (PRAUC)",  "average_precision"),
-    ("F1 (macro)",  "f1_macro"),
+    ("F1",          "f1_macro"),
+    ("MCC",         "mcc"),
 ]
 
 
@@ -236,18 +241,39 @@ def build_model(variant, hp, attn_hp, branch_dilations, device, logger):
 # ---------------------------------------------------------------------------
 # extract_row1 -- handle both old and new eval-report schemas
 # ---------------------------------------------------------------------------
-def extract_row1(report_path, logger):
+def extract_row1(report_path, prefix, logger):
     """Returns the Row 1 (raw at tau=0.5) segment-level metric dict from
     either the OLD schema (top-level row1_raw_threshold_0_5) or the
     NEW schema (segment_level_metrics.row1_raw_threshold_0_5).
+
+    Back-fills `precision_macro` and `recall_macro` from the sibling
+    classification-report JSON's "macro avg" block if those keys are
+    missing (cached reports written before eval_utils added them).
     """
     if not report_path.exists():
         logger.warning("Eval report not found: %s -- comparison cell will be NA.", report_path)
         return None
     rep = json.loads(report_path.read_text(encoding="utf-8"))
     if "segment_level_metrics" in rep:
-        return rep["segment_level_metrics"].get("row1_raw_threshold_0_5")
-    return rep.get("row1_raw_threshold_0_5")
+        row1 = rep["segment_level_metrics"].get("row1_raw_threshold_0_5") or {}
+    else:
+        row1 = rep.get("row1_raw_threshold_0_5") or {}
+    row1 = dict(row1)
+
+    if "precision_macro" not in row1 or "recall_macro" not in row1:
+        sibling = report_path.parent / f"{prefix}_classification_report_row1.json"
+        if sibling.exists():
+            cr = json.loads(sibling.read_text(encoding="utf-8"))
+            ma = cr.get("macro avg") or {}
+            row1.setdefault("precision_macro", ma.get("precision"))
+            row1.setdefault("recall_macro",    ma.get("recall"))
+
+    if "mcc" not in row1:
+        tp = float(row1.get("tp", 0)); fp = float(row1.get("fp", 0))
+        fn = float(row1.get("fn", 0)); tn = float(row1.get("tn", 0))
+        denom = math.sqrt((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn))
+        row1["mcc"] = ((tp * tn - fp * fn) / denom) if denom > 0 else 0.0
+    return row1
 
 
 # ---------------------------------------------------------------------------
@@ -387,8 +413,8 @@ def main():
     logger.info("Saved: %s (%.2f MB)", train_npz_path, train_npz_path.stat().st_size / 1e6)
 
     # -- Read val + test reports and build comparison ------------------------
-    val_row1  = extract_row1(Path(paths["val_report"]),  logger)
-    test_row1 = extract_row1(Path(paths["test_report"]), logger)
+    val_row1  = extract_row1(Path(paths["val_report"]),  paths["prefix"], logger)
+    test_row1 = extract_row1(Path(paths["test_report"]), paths["prefix"], logger)
 
     comparison = {"metric": [], "train": [], "val": [], "test": []}
     for label, key in COMPARISON_METRICS:
@@ -405,14 +431,15 @@ def main():
         "model":                  args.variant,
         "timestamp":              datetime.datetime.now().isoformat(),
         "metrics_compared":       [m for m, _ in COMPARISON_METRICS],
-        "metrics_excluded_note":  ("Accuracy / specificity / precision / FAR-hr "
-                                   "are excluded from the train-vs-val-vs-test "
-                                   "comparison because they are heavily prevalence-"
-                                   "sensitive (train ~30%% ictal; val ~0.4%%; "
-                                   "test ~0.24%%). The four selected metrics "
-                                   "(Sensitivity, AUROC, AP, F1) are the least "
-                                   "prevalence-sensitive and give a fair "
-                                   "overfitting diagnosis."),
+        "metrics_excluded_note":  ("Class-1 precision and FAR-hr are excluded "
+                                   "from the train-vs-val-vs-test comparison "
+                                   "because they are heavily prevalence-sensitive "
+                                   "(train ~30%% ictal; val ~0.4%%; test ~0.24%%). "
+                                   "Accuracy is included for completeness as "
+                                   "Row-1 reporting, but it is also prevalence-"
+                                   "sensitive -- the prevalence-robust signals "
+                                   "are macro Recall, macro Precision, "
+                                   "Specificity, AUROC, AP, macro F1, and MCC."),
         "comparison":             comparison,
         "sources": {
             "train_report": str(train_eval_report_path),
@@ -433,7 +460,7 @@ def main():
     logger.info("Saved: %s", cmp_csv_path)
 
     # -- Plot ----------------------------------------------------------------
-    fig, ax = plt.subplots(figsize=(11, 5))
+    fig, ax = plt.subplots(figsize=(14, 5))
     x = np.arange(len(comparison["metric"]))
     w = 0.25
     train_vals = comparison["train"]

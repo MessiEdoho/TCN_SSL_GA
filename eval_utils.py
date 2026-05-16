@@ -78,7 +78,7 @@ from torch.utils.data import DataLoader
 from sklearn.metrics import (
     f1_score, accuracy_score, precision_score, recall_score,
     roc_auc_score, average_precision_score, confusion_matrix,
-    classification_report,
+    classification_report, matthews_corrcoef,
 )
 
 from tcn_utils import EEGSegmentDataset
@@ -647,9 +647,12 @@ def compute_segment_level_metrics(y_true, y_pred, y_prob_for_auc, n_non_ictal_se
     prec     = precision_score(y_true, y_pred, pos_label=1, zero_division=0)
     recall   = recall_score(y_true, y_pred, pos_label=1, zero_division=0)
     f1m      = f1_score(y_true, y_pred, average="macro", zero_division=0)
+    prec_macro = precision_score(y_true, y_pred, average="macro", zero_division=0)
+    rec_macro  = recall_score(y_true, y_pred, average="macro", zero_division=0)
     spec     = tn / (tn + fp) if (tn + fp) > 0 else 0.0
     auroc    = roc_auc_score(y_true, y_prob_for_auc) if len(np.unique(y_true)) > 1 else 0.0
     ap       = average_precision_score(y_true, y_prob_for_auc) if len(np.unique(y_true)) > 1 else 0.0
+    mcc      = matthews_corrcoef(y_true, y_pred) if len(np.unique(y_true)) > 1 else 0.0
     youden_j = recall + spec - 1.0
 
     non_ic_hrs = (n_non_ictal_segs * STEP_SEC) / 3600.0
@@ -663,6 +666,9 @@ def compute_segment_level_metrics(y_true, y_pred, y_prob_for_auc, n_non_ictal_se
         "specificity":       round(spec, 6),
         "youden_j":          round(youden_j, 6),
         "f1_macro":          round(f1m, 6),
+        "precision_macro":   round(prec_macro, 6),
+        "recall_macro":      round(rec_macro, 6),
+        "mcc":               round(mcc, 6),
         "auroc":             round(auroc, 6),
         "average_precision": round(ap, 6),
         "tp": tp, "fp": fp, "fn": fn, "tn": tn,
@@ -685,6 +691,9 @@ def build_classification_report(y_true, y_pred, row_metrics):
     report["prauc"]                                = row_metrics.get("average_precision")
     report["specificity"]                          = row_metrics.get("specificity")
     report["sensitivity"]                          = row_metrics.get("sensitivity")
+    report["precision_macro"]                      = row_metrics.get("precision_macro")
+    report["recall_macro"]                         = row_metrics.get("recall_macro")
+    report["mcc"]                                  = row_metrics.get("mcc")
     report["far_per_hour_seg_CORRECTED_2_5s_denom"] = row_metrics.get("far_per_hour_seg_CORRECTED_2_5s_denom")
     return report
 

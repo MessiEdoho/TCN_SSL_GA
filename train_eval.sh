@@ -54,16 +54,10 @@ conda activate torch_v100_py310
 
 cd ~/TCN_SSL_GA
 
-# Edit this single line to choose which model to evaluate. One run per model.
-# All four variants are supported -- defaults for paths come from
-# VARIANT_CONFIG inside train_eval.py and can be overridden via CLI flags.
-#
-# Available variants:
-#   TCN
-#   TCNWithAttention
-#   MultiScaleTCN
-#   MultiScaleTCNWithAttention
-VARIANT="MultiScaleTCN"
+# Variant is passed as the first positional argument.
+# Available: TCN | TCNWithAttention | MultiScaleTCN | MultiScaleTCNWithAttention
+VARIANT="${1:?Usage: sbatch -J <jobname> train_eval.sh <VARIANT>}"
+echo "Variant: $VARIANT"
 
 python train_eval.py --variant "$VARIANT"
 
