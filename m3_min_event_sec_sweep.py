@@ -1,12 +1,12 @@
 """
 m3_min_event_sec_sweep.py
 =========================
-Local sweep over MIN_EVENT_SEC for M3 (MultiScaleTCN) on the test
-partition. Reads cached test predictions (no model forward pass, no
-GPU required) and recomputes the chronology-aware event-level
-evaluation for each candidate value of the post-processing
-min-event-duration filter, to quantify the precision / recall /
-FAR-per-hour tradeoff of raising the filter.
+Sweep over MIN_EVENT_SEC for M3 (MultiScaleTCN) on the test partition.
+Reads cached test predictions (no model forward pass, no GPU required)
+and recomputes the chronology-aware event-level evaluation for each
+candidate value of the post-processing min-event-duration filter, to
+quantify the precision / recall / FAR-per-hour tradeoff of raising the
+filter.
 
 Smoothing window (W=3), threshold (tau=0.5), refractory period (30 s),
 and FAR/hr denominator (step_sec = 2.5 s) are held at their canonical
@@ -15,13 +15,21 @@ values; only MIN_EVENT_SEC varies.
 Sweep values: MIN_EVENT_SEC in [10, 15, 20, 30] seconds (10 s is the
 current production baseline; 15 / 20 / 30 are FP-reduction candidates).
 
-Inputs  (local Windows mirror)
-    NPZ        : TCN_UNIQURE_PROJECT/MultiScaleTCN/evaluation/multiscale_tcn_test_predictions_raw.npz
-    Manifest   : TCN_UNIQURE_PROJECT/data_splits_nonictal_sampled_filtered.json
-    Metadata   : TCN_UNIQURE_PROJECT/mouse_recording_metadata.json
-    Annotations: TCN_UNIQURE_PROJECT/test_seizure_annot_updated/
+Dual-mode execution (cluster or local)
+--------------------------------------
+By default the script reads/writes the canonical cluster paths under
+/home/people/22206468/scratch/. Pass --local-root to switch to the
+Windows local-mirror layout (TCN_UNIQURE_PROJECT/). Individual paths
+can also be overridden one-at-a-time via --npz / --manifest /
+--metadata / --annot-dir / --output-dir.
 
-Outputs (under TCN_UNIQURE_PROJECT/MultiScaleTCN/evaluation/post_process_varing_sec/)
+The manifest can be either the enriched (data_splits_nonictal_sampled_
+filtered_enriched.json) or the unenriched filtered variant. If records
+already carry chrono_idx + t_start_sec, the in-process chronology
+rebuild is skipped; otherwise it runs once (~1 min) from EDF metadata +
+Excel annotations.
+
+Outputs (under --output-dir)
     MIN_EVENT_SEC_<sec>s/
         test_summary.json
         test_classification_report_row1.json
@@ -32,6 +40,7 @@ Outputs (under TCN_UNIQURE_PROJECT/MultiScaleTCN/evaluation/post_process_varing_
     m3_min_event_sec_sweep.log
 """
 
+import argparse
 import csv
 import datetime
 import json
@@ -51,43 +60,120 @@ from eval_utils import (
 )
 
 
-LOCAL_ROOT       = Path(r"C:\Users\messi\OneDrive\Desktop\Desktop\TCN_UNIQURE_PROJECT")
-NPZ_PATH         = LOCAL_ROOT / "MultiScaleTCN" / "evaluation" / "multiscale_tcn_test_predictions_raw.npz"
-MANIFEST_PATH    = LOCAL_ROOT / "data_splits_nonictal_sampled_filtered.json"
-METADATA_PATH    = LOCAL_ROOT / "mouse_recording_metadata.json"
-ANNOT_DIR        = LOCAL_ROOT / "test_seizure_annot_updated"
+CLUSTER_SCRATCH = Path("/home/people/22206468/scratch")
+LOCAL_DEFAULT   = Path(r"C:\Users\messi\OneDrive\Desktop\Desktop\TCN_UNIQURE_PROJECT")
 
-OUTPUT_ROOT      = LOCAL_ROOT / "MultiScaleTCN" / "evaluation" / "post_process_varing_sec"
-COMPARISON_CSV   = OUTPUT_ROOT / "test_postproc_min_event_sec_comparison.csv"
-IMPACT_PLOT      = OUTPUT_ROOT / "test_postproc_min_event_sec_impact.png"
-LOG_PATH         = OUTPUT_ROOT / "m3_min_event_sec_sweep.log"
-
-MODEL_NAME       = "MultiScaleTCN"
-PARTITION        = "test"
-SWEEP_SECS       = [10, 15, 20, 30]
+MODEL_NAME = "MultiScaleTCN"
+PARTITION  = "test"
+SWEEP_SECS = [10, 15, 20, 30]
 
 
-def setup_logging():
-    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--local-root", type=Path, default=None,
+                   help="Switch to local Windows-mirror layout rooted here. "
+                        "Omit on the cluster to use the default /home/people/22206468/scratch/... paths.")
+    p.add_argument("--npz",        type=Path, default=None, help="Override NPZ path.")
+    p.add_argument("--manifest",   type=Path, default=None, help="Override manifest path (enriched preferred).")
+    p.add_argument("--metadata",   type=Path, default=None, help="Override mouse metadata JSON path.")
+    p.add_argument("--annot-dir",  type=Path, default=None, help="Override test annotations dir.")
+    p.add_argument("--output-dir", type=Path, default=None, help="Override output root.")
+    return p.parse_args()
+
+
+def resolve_paths(args):
+    """Return a dict of all resolved input/output paths.
+
+    Defaults switch on whether --local-root was passed. Individual flags
+    override the defaults one-at-a-time. The "manifest_fallback" key gives
+    the unenriched manifest path used only if the preferred (enriched)
+    file is missing.
+    """
+    if args.local_root is not None:
+        root = args.local_root
+        defaults = {
+            "npz":       root / "MultiScaleTCN" / "evaluation" / "multiscale_tcn_test_predictions_raw.npz",
+            "manifest":  root / "data_splits_nonictal_sampled_filtered_enriched.json",
+            "manifest_fallback": root / "data_splits_nonictal_sampled_filtered.json",
+            "metadata":  root / "mouse_recording_metadata.json",
+            "annot_dir": root / "test_seizure_annot_updated",
+            "output":    root / "MultiScaleTCN" / "evaluation" / "post_process_varing_sec",
+        }
+    else:
+        defaults = {
+            "npz":       CLUSTER_SCRATCH / "OUTPUT" / "MODEL3_OUTPUT" / "MultiScaleTCN" / "evaluation" / "multiscale_tcn_test_predictions_raw.npz",
+            "manifest":  CLUSTER_SCRATCH / "INPUT_DATA" / "data_splits_outputs" / "data_splits_nonictal_sampled_filtered_enriched.json",
+            "manifest_fallback": CLUSTER_SCRATCH / "INPUT_DATA" / "data_splits_outputs" / "data_splits_nonictal_sampled_filtered.json",
+            "metadata":  CLUSTER_SCRATCH / "INPUT_DATA" / "Data_diagnostic" / "mouse_recording_metadata.json",
+            "annot_dir": CLUSTER_SCRATCH / "seizure_times_updated",
+            "output":    CLUSTER_SCRATCH / "OUTPUT" / "MODEL3_OUTPUT" / "MultiScaleTCN" / "evaluation" / "post_process_varing_sec",
+        }
+
+    npz      = args.npz       or defaults["npz"]
+    manifest = args.manifest  or defaults["manifest"]
+    if args.manifest is None and not manifest.exists() and defaults["manifest_fallback"].exists():
+        manifest = defaults["manifest_fallback"]
+    metadata = args.metadata  or defaults["metadata"]
+    annot    = args.annot_dir or defaults["annot_dir"]
+    output   = args.output_dir or defaults["output"]
+    return {
+        "npz":       npz,
+        "manifest":  manifest,
+        "metadata":  metadata,
+        "annot_dir": annot,
+        "output":    output,
+    }
+
+
+def setup_logging(output_dir):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    log_path = output_dir / "m3_min_event_sec_sweep.log"
     logger = logging.getLogger("m3_min_event_sec_sweep")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
     fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s",
                             datefmt="%Y-%m-%d %H:%M:%S")
     sh = logging.StreamHandler(sys.stdout); sh.setFormatter(fmt); logger.addHandler(sh)
-    fh = logging.FileHandler(LOG_PATH, mode="a", encoding="utf-8"); fh.setFormatter(fmt); logger.addHandler(fh)
-    return logger
+    fh = logging.FileHandler(log_path, mode="a", encoding="utf-8"); fh.setFormatter(fmt); logger.addHandler(fh)
+    return logger, log_path
 
 
 def enrich_test_records(records, mouse_metadata, annotations_dir, logger):
-    """For each test record, add mouse_id / chrono_idx / t_start_sec by
-    replaying per-mouse chronology from EDF metadata + Excel annotations
-    (build_mouse_chronology). Records that can't be enriched are dropped.
+    """Ensure mouse_id / chrono_idx / t_start_sec are set on every record.
 
-    Returns (enriched_records, kept_indices). kept_indices is an ordered
-    list of original positions in `records` so the caller can trim the
-    NPZ arrays in lockstep.
+    Idempotent: if the records came from the enriched manifest (chrono_idx
+    + t_start_sec already present), pass them through after dropping any
+    sentinel -1 rows that enrich_manifest.py couldn't match. Otherwise
+    rebuild chronology in-process from EDF metadata + Excel annotations
+    via build_mouse_chronology (one-pass, per-mouse).
+
+    Returns (records_kept, npz_indices_kept) -- npz_indices_kept is the
+    ordered list of original positions so the caller can trim the NPZ
+    arrays in lockstep.
     """
+    sample = records[:5]
+    already_enriched = bool(sample) and all(
+        ("chrono_idx" in r and "t_start_sec" in r) for r in sample)
+
+    if already_enriched:
+        logger.info("Manifest already enriched -- skipping in-process chronology rebuild.")
+        kept_recs, kept_idx = [], []
+        for npz_idx, r in enumerate(records):
+            ci = r.get("chrono_idx", -1)
+            if ci is None or int(ci) < 0:
+                continue
+            r2 = dict(r)
+            r2.setdefault("mouse_id", Path(r["filepath"]).stem.split("_")[0])
+            r2["chrono_idx"]  = int(ci)
+            r2["t_start_sec"] = float(r.get("t_start_sec", 0.0))
+            kept_recs.append(r2)
+            kept_idx.append(npz_idx)
+        logger.info("Already-enriched records: %d retained | %d dropped (sentinel chrono_idx=-1)",
+                    len(kept_recs), len(records) - len(kept_recs))
+        return kept_recs, kept_idx
+
+    logger.info("Manifest is unenriched -- rebuilding chronology in-process.")
     mice = sorted({Path(r["filepath"]).stem.split("_")[0] for r in records})
     logger.info("Test partition: %d records, %d unique mice", len(records), len(mice))
 
@@ -110,7 +196,7 @@ def enrich_test_records(records, mouse_metadata, annotations_dir, logger):
             mouse_id, int(meta["n_samples"]), seizure_intervals, logger)
         chrono_maps[mouse_id] = cmap
 
-    enriched, kept = [], []
+    kept_recs, kept_idx = [], []
     for npz_idx, r in enumerate(records):
         fname = Path(r["filepath"]).name
         mouse = fname.split("_")[0]
@@ -124,12 +210,11 @@ def enrich_test_records(records, mouse_metadata, annotations_dir, logger):
         r2["mouse_id"]    = mouse
         r2["chrono_idx"]  = info["chrono_idx"]
         r2["t_start_sec"] = info["t_start_sec"]
-        enriched.append(r2)
-        kept.append(npz_idx)
-
-    logger.info("Enriched: %d retained | %d dropped (no chronology)",
-                len(enriched), len(records) - len(enriched))
-    return enriched, kept
+        kept_recs.append(r2)
+        kept_idx.append(npz_idx)
+    logger.info("In-process enriched: %d retained | %d dropped (no chronology)",
+                len(kept_recs), len(records) - len(kept_recs))
+    return kept_recs, kept_idx
 
 
 def write_summary_json(out_path, model, partition, sec,
@@ -267,32 +352,39 @@ def plot_impact(rows, out_path, logger):
 
 
 def main():
-    logger = setup_logging()
+    args = parse_args()
+    paths = resolve_paths(args)
+    logger, log_path = setup_logging(paths["output"])
+
+    output_root    = paths["output"]
+    comparison_csv = output_root / "test_postproc_min_event_sec_comparison.csv"
+    impact_plot    = output_root / "test_postproc_min_event_sec_impact.png"
+
     logger.info("=" * 65)
     logger.info("m3_min_event_sec_sweep.py")
-    logger.info("Local root      : %s", LOCAL_ROOT)
-    logger.info("NPZ             : %s", NPZ_PATH)
-    logger.info("Manifest        : %s", MANIFEST_PATH)
-    logger.info("Metadata        : %s", METADATA_PATH)
-    logger.info("Annotations dir : %s", ANNOT_DIR)
-    logger.info("Output root     : %s", OUTPUT_ROOT)
-    logger.info("Log             : %s", LOG_PATH)
+    logger.info("Mode            : %s", "local" if args.local_root else "cluster")
+    logger.info("NPZ             : %s", paths["npz"])
+    logger.info("Manifest        : %s", paths["manifest"])
+    logger.info("Metadata        : %s", paths["metadata"])
+    logger.info("Annotations dir : %s", paths["annot_dir"])
+    logger.info("Output root     : %s", output_root)
+    logger.info("Log             : %s", log_path)
     logger.info("Sweep values    : %s", SWEEP_SECS)
     logger.info("=" * 65)
 
-    for p in [NPZ_PATH, MANIFEST_PATH, METADATA_PATH, ANNOT_DIR]:
+    for p in [paths["npz"], paths["manifest"], paths["metadata"], paths["annot_dir"]]:
         if not p.exists():
             logger.error("Required input missing: %s", p); sys.exit(1)
 
-    manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    manifest = json.loads(paths["manifest"].read_text(encoding="utf-8"))
     test_records = manifest.get(PARTITION) or []
     if not test_records:
-        logger.error("Empty test partition in %s.", MANIFEST_PATH); sys.exit(1)
+        logger.error("Empty test partition in %s.", paths["manifest"]); sys.exit(1)
     manifest_filter_state = (manifest.get("meta", {}) or {}).get("filter_history", None)
 
-    mouse_metadata = json.loads(METADATA_PATH.read_text(encoding="utf-8"))
+    mouse_metadata = json.loads(paths["metadata"].read_text(encoding="utf-8"))
 
-    npz = np.load(NPZ_PATH, allow_pickle=False)
+    npz = np.load(paths["npz"], allow_pickle=False)
     y_true_all = npz["y_true"].astype(np.int64)
     y_prob_all = npz["y_prob"].astype(np.float64)
     if len(y_true_all) != len(test_records):
@@ -302,9 +394,9 @@ def main():
                 len(y_true_all), int(y_true_all.sum()),
                 100.0 * float(y_true_all.sum()) / max(1, len(y_true_all)))
 
-    logger.info("Building per-mouse chronologies and enriching records (one-time)...")
+    logger.info("Enriching test records (one-time)...")
     enriched, kept_idx = enrich_test_records(
-        test_records, mouse_metadata, ANNOT_DIR, logger)
+        test_records, mouse_metadata, paths["annot_dir"], logger)
     y_true_kept = y_true_all[kept_idx]
     y_prob_kept = y_prob_all[kept_idx]
 
@@ -314,9 +406,10 @@ def main():
         logger.info("Sweep value: MIN_EVENT_SEC = %d s", sec)
         eval_utils.MIN_EVENT_SEC = float(sec)
         result = evaluate_event_level(
-            enriched, y_true_kept, y_prob_kept, ANNOT_DIR, mouse_metadata, logger)
+            enriched, y_true_kept, y_prob_kept,
+            paths["annot_dir"], mouse_metadata, logger)
 
-        out_dir = OUTPUT_ROOT / f"MIN_EVENT_SEC_{sec}s"
+        out_dir = output_root / f"MIN_EVENT_SEC_{sec}s"
         out_dir.mkdir(parents=True, exist_ok=True)
 
         write_summary_json(out_dir / "test_summary.json",
@@ -351,8 +444,8 @@ def main():
                     em["precision"], em["recall"], em["f1"],
                     em["far_per_hour_event_CORRECTED"])
 
-    write_comparison_csv(COMPARISON_CSV, comparison_rows, logger)
-    plot_impact(comparison_rows, IMPACT_PLOT, logger)
+    write_comparison_csv(comparison_csv, comparison_rows, logger)
+    plot_impact(comparison_rows, impact_plot, logger)
 
     logger.info("=" * 65)
     logger.info("DONE")
