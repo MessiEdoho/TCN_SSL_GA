@@ -31,7 +31,7 @@ OUT_PATH   = (LOCAL_ROOT / "MultiScaleTCN" / "event_metrics_recovery" / "figures
 
 CSVS = {
     "M3 (MultiScaleTCN)":          LOCAL_ROOT / "MultiScaleTCN" / "multiscale_tcn_epoch_metrics.csv",
-    "M4 (MultiScaleTCNAttention)": LOCAL_ROOT / "MultiScaleTCNAttention" / "event_metrics" / "ms_attn_epoch_metrics.csv",
+    "M4 (MultiScaleTCNAttention)": LOCAL_ROOT / "MultiScaleTCNAttention" / "val_event_metrics" / "ms_attn_epoch_metrics.csv",
 }
 
 

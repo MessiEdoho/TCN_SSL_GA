@@ -14,7 +14,7 @@ This script repeats the post-training full-val pass in FP32 (eval_utils
 four-layer protection) and emits every val artefact that the training
 script would have written, but routed to a dedicated subfolder so the
 parent MODEL4 directory is preserved as-is:
-    OUTPUT_ROOT / "event_metrics" / ...
+    OUTPUT_ROOT / "val_event_metrics" / ...
 
 Schema follows the new style: Row 1 (raw @ 0.5) + Row 2 (post-processed
 @ 0.5) only -- Row 3 retired. FAR/hr reported in the corrected form
@@ -57,19 +57,19 @@ from eval_utils import (
 )
 
 
-EVENT_METRICS_DIR = OUTPUT_ROOT / "event_metrics"
-LOG_DIR           = EVENT_METRICS_DIR / "logs"
+VAL_EVENT_METRICS_DIR = OUTPUT_ROOT / "val_event_metrics"
+LOG_DIR           = VAL_EVENT_METRICS_DIR / "logs"
 LOG_PATH          = LOG_DIR / "m4_event_metrics_recovery.log"
 
-VAL_PREDICTIONS_NPZ = EVENT_METRICS_DIR / "ms_attn_val_predictions_full.npz"
-EVAL_REPORT_PATH    = EVENT_METRICS_DIR / "ms_attn_evaluation_report.json"
-EVENT_DETAILS_CSV   = EVENT_METRICS_DIR / "ms_attn_event_details_row2.csv"
-TWO_ROW_CSV         = EVENT_METRICS_DIR / "ms_attn_two_row_summary.csv"
-ROW1_REPORT_PATH    = EVENT_METRICS_DIR / "ms_attn_classification_report_row1.json"
-ROW2_REPORT_PATH    = EVENT_METRICS_DIR / "ms_attn_classification_report_row2.json"
-EPOCH_CSV           = EVENT_METRICS_DIR / "ms_attn_epoch_metrics.csv"
-TRAINING_CURVES_PNG = EVENT_METRICS_DIR / "ms_attn_training_curves.png"
-LR_SCHEDULE_PNG     = EVENT_METRICS_DIR / "ms_attn_lr_schedule.png"
+VAL_PREDICTIONS_NPZ = VAL_EVENT_METRICS_DIR / "ms_attn_val_predictions_full.npz"
+EVAL_REPORT_PATH    = VAL_EVENT_METRICS_DIR / "ms_attn_evaluation_report.json"
+EVENT_DETAILS_CSV   = VAL_EVENT_METRICS_DIR / "ms_attn_event_details_row2.csv"
+TWO_ROW_CSV         = VAL_EVENT_METRICS_DIR / "ms_attn_two_row_summary.csv"
+ROW1_REPORT_PATH    = VAL_EVENT_METRICS_DIR / "ms_attn_classification_report_row1.json"
+ROW2_REPORT_PATH    = VAL_EVENT_METRICS_DIR / "ms_attn_classification_report_row2.json"
+EPOCH_CSV           = VAL_EVENT_METRICS_DIR / "ms_attn_epoch_metrics.csv"
+TRAINING_CURVES_PNG = VAL_EVENT_METRICS_DIR / "ms_attn_training_curves.png"
+LR_SCHEDULE_PNG     = VAL_EVENT_METRICS_DIR / "ms_attn_lr_schedule.png"
 TRAIN_LOG_PATH      = TRAIN_LOG_DIR / "MultiScaleTCNAttention_training.log"
 
 
@@ -133,7 +133,7 @@ def write_epoch_metrics_csv(history, out_path, logger):
 
 def plot_training_dynamics(history, logger):
     """Replicate MultiScaleTCNAttention.plot_all_figures Figures 1 + 2 inline,
-    routed to EVENT_METRICS_DIR instead of the parent FIGURE_DIR. Returns
+    routed to VAL_EVENT_METRICS_DIR instead of the parent FIGURE_DIR. Returns
     (best_epoch, best_val_f1) derived from the reconstructed history.
     """
     epochs = history["epoch"]
@@ -180,7 +180,7 @@ def plot_training_dynamics(history, logger):
 
 
 def setup_logging():
-    EVENT_METRICS_DIR.mkdir(parents=True, exist_ok=True)
+    VAL_EVENT_METRICS_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
     logger = logging.getLogger("m4_event_metrics_recovery")
@@ -203,7 +203,7 @@ def main():
     logger.info("Splits manifest  : %s", SPLITS_PATH)
     logger.info("Annotations dir  : %s", ANNOT_DIR)
     logger.info("Mouse metadata   : %s", MOUSE_METADATA_PATH)
-    logger.info("Output dir       : %s", EVENT_METRICS_DIR)
+    logger.info("Output dir       : %s", VAL_EVENT_METRICS_DIR)
     logger.info("Log              : %s", LOG_PATH)
     logger.info("=" * 65)
 

@@ -518,12 +518,49 @@ def split_into_chunks(chrono_idx_arr):
 # ---------------------------------------------------------------------------
 # detect_events_in_chunk
 # ---------------------------------------------------------------------------
-def detect_events_in_chunk(t_start, y_prob, mouse_id, chunk_id):
-    """Run smoothing + threshold + run-detection + refractory + min-duration
-    on one chunk's prediction subarray. Returns (events, smoothed_probs,
-    smoothed_preds). Chunks shorter than SMOOTHING_WIN bypass smoothing
-    so the smoothed array length always equals the input length (np.convolve
-    with mode='same' otherwise pads to the kernel width on tiny inputs).
+def _refractory_merge(events):
+    """Merge consecutive events whose inter-event gap is < REFRACTORY_SEC."""
+    merged = []
+    for evt in events:
+        if merged and (evt["start_sec"] - merged[-1]["end_sec"]) < REFRACTORY_SEC:
+            merged[-1]["end_sec"] = evt["end_sec"]
+            merged[-1]["seg_indices"].extend(evt["seg_indices"])
+        else:
+            merged.append({
+                "start_sec":   evt["start_sec"],
+                "end_sec":     evt["end_sec"],
+                "seg_indices": list(evt["seg_indices"]),
+            })
+    return merged
+
+
+def _min_duration_filter(events):
+    """Drop events shorter than MIN_EVENT_SEC."""
+    return [evt for evt in events
+            if (evt["end_sec"] - evt["start_sec"]) >= MIN_EVENT_SEC]
+
+
+def detect_events_in_chunk(t_start, y_prob, mouse_id, chunk_id,
+                           order="refractory_then_min"):
+    """Run smoothing + threshold + run-detection, then apply the
+    refractory-merge and min-duration-filter steps in the order specified.
+
+    Parameters
+    ----------
+    order : {"refractory_then_min", "min_then_refractory"}, default
+        "refractory_then_min".
+        "refractory_then_min" (legacy) merges first, then drops surviving
+        short events; can rescue fragmented true detections at the cost
+        of also rescuing fragmented false alarms.
+        "min_then_refractory" drops short events first, then merges
+        surviving ones; more conservative, matches the standard order
+        in the clinical seizure-detection literature.
+
+    Returns
+    -------
+    (events, smoothed_probs, smoothed_preds)
+        Chunks shorter than SMOOTHING_WIN bypass smoothing so the smoothed
+        array length always equals the input length.
     """
     n = len(y_prob)
     if n == 0:
@@ -559,30 +596,24 @@ def detect_events_in_chunk(t_start, y_prob, mouse_id, chunk_id):
             "seg_indices": list(seg_idx_in_event),
         })
 
-    merged = []
-    for evt in raw_events:
-        if merged and (evt["start_sec"] - merged[-1]["end_sec"]) < REFRACTORY_SEC:
-            merged[-1]["end_sec"] = evt["end_sec"]
-            merged[-1]["seg_indices"].extend(evt["seg_indices"])
-        else:
-            merged.append({
-                "start_sec":   evt["start_sec"],
-                "end_sec":     evt["end_sec"],
-                "seg_indices": list(evt["seg_indices"]),
-            })
+    if order == "refractory_then_min":
+        processed = _min_duration_filter(_refractory_merge(raw_events))
+    elif order == "min_then_refractory":
+        processed = _refractory_merge(_min_duration_filter(raw_events))
+    else:
+        raise ValueError(
+            "Unknown post-processing order %r; expected 'refractory_then_min' "
+            "or 'min_then_refractory'." % order)
 
     final = []
-    for evt in merged:
-        duration = evt["end_sec"] - evt["start_sec"]
-        if duration < MIN_EVENT_SEC:
-            continue
+    for evt in processed:
         seg_idx = evt["seg_indices"]
         final.append({
             "mouse_id":     mouse_id,
             "chunk_id":     chunk_id,
             "start_sec":    round(evt["start_sec"], 4),
             "end_sec":      round(evt["end_sec"], 4),
-            "duration_sec": round(duration, 4),
+            "duration_sec": round(evt["end_sec"] - evt["start_sec"], 4),
             "mean_prob":    round(float(np.mean(smoothed[seg_idx])), 6),
             "max_prob":     round(float(np.max(smoothed[seg_idx])), 6),
         })
@@ -702,7 +733,8 @@ def build_classification_report(y_true, y_pred, row_metrics):
 # evaluate_event_level -- the production orchestrator
 # ---------------------------------------------------------------------------
 def evaluate_event_level(partition_records, y_true_all, y_prob_all,
-                         annotations_dir, mouse_metadata, logger):
+                         annotations_dir, mouse_metadata, logger,
+                         order="refractory_then_min"):
     """End-to-end per-mouse-chronological event-level evaluation.
 
     Parameters
@@ -719,6 +751,9 @@ def evaluate_event_level(partition_records, y_true_all, y_prob_all,
         Loaded mouse_recording_metadata.json (per-mouse n_samples, fs_hz,
         recording_start_dt).
     logger : logging.Logger
+    order : {"refractory_then_min", "min_then_refractory"}, default
+        "refractory_then_min". Controls the post-processing step order
+        in detect_events_in_chunk -- see that function's docstring.
 
     Returns
     -------
@@ -788,11 +823,11 @@ def evaluate_event_level(partition_records, y_true_all, y_prob_all,
         logger.info("  %s : %d ground-truth seizure(s) from %s",
                     mouse_id, len(seizure_intervals), xlsx_path.name)
 
-        order = np.argsort(np.asarray(mouse_block["chrono_idxs"], dtype=np.int64))
-        chrono_idx_arr = np.asarray(mouse_block["chrono_idxs"], dtype=np.int64)[order]
-        t_start_arr    = np.asarray(mouse_block["t_starts"],    dtype=np.float64)[order]
-        npz_idx_arr    = np.asarray(mouse_block["npz_indices"], dtype=np.int64)[order]
-        label_arr      = np.asarray(mouse_block["labels"],      dtype=np.int64)[order]
+        sort_idx = np.argsort(np.asarray(mouse_block["chrono_idxs"], dtype=np.int64))
+        chrono_idx_arr = np.asarray(mouse_block["chrono_idxs"], dtype=np.int64)[sort_idx]
+        t_start_arr    = np.asarray(mouse_block["t_starts"],    dtype=np.float64)[sort_idx]
+        npz_idx_arr    = np.asarray(mouse_block["npz_indices"], dtype=np.int64)[sort_idx]
+        label_arr      = np.asarray(mouse_block["labels"],      dtype=np.int64)[sort_idx]
 
         y_true_mouse = y_true_all[npz_idx_arr]
         y_prob_mouse = y_prob_all[npz_idx_arr]
@@ -812,7 +847,7 @@ def evaluate_event_level(partition_records, y_true_all, y_prob_all,
         mouse_smoothed_preds_full = np.empty(len(chrono_idx_arr), dtype=np.int64)
         for chunk_id, (s, e) in enumerate(chunks):
             evts, smoothed_probs_chunk, smoothed_preds_chunk = detect_events_in_chunk(
-                t_start_arr[s:e], y_prob_mouse[s:e], mouse_id, chunk_id)
+                t_start_arr[s:e], y_prob_mouse[s:e], mouse_id, chunk_id, order=order)
             mouse_predicted.extend(evts)
             mouse_smoothed_probs_full[s:e] = smoothed_probs_chunk
             mouse_smoothed_preds_full[s:e] = smoothed_preds_chunk

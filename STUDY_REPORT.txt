@@ -1740,7 +1740,7 @@ configurations.
     the same pattern -- it loads ms_attn_final_weights.pt, repeats
     the full-validation pass under all four protections, and emits
     every val artefact that the original training run failed to
-    write, routed to OUTPUT_ROOT/event_metrics/ so that the parent
+    write, routed to OUTPUT_ROOT/val_event_metrics/ so that the parent
     MODEL4 directory is preserved.
 
 7.6.7 End-to-end training for attention models (M2, M4)

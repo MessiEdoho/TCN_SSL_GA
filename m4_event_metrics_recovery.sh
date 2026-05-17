@@ -11,7 +11,7 @@
 # ms_attn_final_weights.pt, run an FP32 full-val forward pass with
 # eval_utils' four-layer NaN protection, then write the chronology-aware
 # event-level evaluation artefacts (Row 1 + Row 2, FAR/hr corrected)
-# under OUTPUT_ROOT/event_metrics/. Required because the original M4
+# under OUTPUT_ROOT/val_event_metrics/. Required because the original M4
 # training run crashed at AUROC due to FP16 attention-softmax NaN before
 # the val artefacts were written.
 #SBATCH -t 5-00:00:00
@@ -41,9 +41,9 @@ conda activate torch_v100_py310
 cd ~/TCN_SSL_GA
 
 # Persistent log goes to:
-#   /home/people/22206468/scratch/OUTPUT/MODEL4_OUTPUT/MultiScaleTCNAttention/event_metrics/logs/m4_event_metrics_recovery.log
+#   /home/people/22206468/scratch/OUTPUT/MODEL4_OUTPUT/MultiScaleTCNAttention/val_event_metrics/logs/m4_event_metrics_recovery.log
 # All recovery artefacts go to:
-#   /home/people/22206468/scratch/OUTPUT/MODEL4_OUTPUT/MultiScaleTCNAttention/event_metrics/
+#   /home/people/22206468/scratch/OUTPUT/MODEL4_OUTPUT/MultiScaleTCNAttention/val_event_metrics/
 python m4_event_metrics_recovery.py
 
 echo "===== JOB END ====="
