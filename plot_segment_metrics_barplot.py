@@ -177,13 +177,32 @@ def row_values(report):
     ]
 
 
-def far_corrected(report):
-    return float(report.get("far_per_hour_seg_CORRECTED_2_5s_denom", 0.0))
+def far_from_eval_report(seg_block, class_report):
+    """Resolve segment-level FAR/hr (corrected, step_sec=2.5) from the most
+    authoritative source available. Preference order:
+      1. eval_report.json -> segment_level_metrics -> row{1,2} block
+         (always present for runs that used eval_utils.evaluate_event_level).
+      2. classification_report JSON top-level key (only present for newer
+         runs that called eval_utils.build_classification_report after the
+         FAR field was added).
+    Returns 0.0 if neither source has it (e.g., legacy non-chronology runs).
+    """
+    far = seg_block.get("far_per_hour_seg_CORRECTED_2_5s_denom")
+    if far is None:
+        far = class_report.get("far_per_hour_seg_CORRECTED_2_5s_denom")
+    return float(far) if far is not None else 0.0
 
 
 def plot_one_partition(cfg, partition, out_path):
     r1 = load_row_report(cfg, partition, 1)
     r2 = load_row_report(cfg, partition, 2)
+
+    # FAR/hr lives in the eval-report's segment_level_metrics block; the
+    # per-row classification_report JSONs from older runs may not have it.
+    summary  = load_event_summary(cfg, partition)
+    seg      = summary.get("segment_level_metrics", {}) or {}
+    seg_row1 = seg.get("row1_raw_threshold_0_5", {}) or {}
+    seg_row2 = seg.get("row2_postproc_threshold_0_5", {}) or {}
 
     r1_vals = row_values(r1)
     r2_vals = row_values(r2)
@@ -213,7 +232,8 @@ def plot_one_partition(cfg, partition, out_path):
     ax_top.set_ylim(0, 1.15)
 
     far_labels = ["Raw\nsegment-level", "Post-processed\nsegment-level"]
-    far_vals   = [far_corrected(r1), far_corrected(r2)]
+    far_vals   = [far_from_eval_report(seg_row1, r1),
+                  far_from_eval_report(seg_row2, r2)]
     bars_far = ax_bot.bar(far_labels, far_vals,
                           color=["#C85A5A", "#5A7DC8"], edgecolor="white")
     for bar in bars_far:
