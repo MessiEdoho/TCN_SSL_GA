@@ -115,6 +115,9 @@ def parse_args():
     p.add_argument("--metadata",       type=Path, default=None, help="Override mouse metadata JSON path.")
     p.add_argument("--val-annot-dir",  type=Path, default=None, help="Override val annotations dir.")
     p.add_argument("--test-annot-dir", type=Path, default=None, help="Override test annotations dir.")
+    p.add_argument("--manifest",       type=Path, default=None,
+                   help="Override manifest path (enriched preferred). Used only "
+                        "for _raw-format NPZs that lack embedded chronology.")
     p.add_argument("--output-dir",     type=Path, default=None, help="Override output root.")
     return p.parse_args()
 
@@ -133,6 +136,7 @@ def variant_config(local_root, cluster_root, cluster_mode):
         val_annot  = CLUSTER_SCRATCH / "seizure_times_updated"
         test_annot = CLUSTER_SCRATCH / "seizure_times_updated"
         metadata   = CLUSTER_SCRATCH / "INPUT_DATA" / "Data_diagnostic" / "mouse_recording_metadata.json"
+        manifest   = CLUSTER_SCRATCH / "INPUT_DATA" / "data_splits_outputs" / "data_splits_nonictal_sampled_filtered_enriched.json"
     else:
         m1 = local_root / "TCN"
         m2 = local_root / "TCNAttention"
@@ -141,6 +145,7 @@ def variant_config(local_root, cluster_root, cluster_mode):
         val_annot  = local_root / "val_seizure_annot_updated"
         test_annot = local_root / "test_seizure_annot_updated"
         metadata   = local_root / "mouse_recording_metadata.json"
+        manifest   = local_root / "data_splits_nonictal_sampled_filtered_enriched.json"
 
     variants = {
         "TCN": {
@@ -157,8 +162,11 @@ def variant_config(local_root, cluster_root, cluster_mode):
         },
         "MultiScaleTCN": {
             "model_label": "M3 (MultiScaleTCN)",
-            "val_npz":  m3 / "multiscale_tcn_val_predictions_full.npz",
-            "test_npz": m3 / "evaluation" / "multiscale_tcn_test_predictions_full.npz",
+            # Cluster has the older _raw NPZ format (manifest-order, no
+            # chronology fields). load_records_and_arrays auto-detects this
+            # and falls back to manifest-based enrichment.
+            "val_npz":  m3 / "multiscale_tcn_predictions_raw.npz",
+            "test_npz": m3 / "evaluation" / "multiscale_tcn_test_predictions_raw.npz",
             "output":   m3 / "evaluation" / "post_process_varing_sec",
         },
         "MultiScaleTCNWithAttention": {
@@ -168,11 +176,11 @@ def variant_config(local_root, cluster_root, cluster_mode):
             "output":   m4 / "evaluation" / "post_process_varing_sec",
         },
     }
-    return variants, val_annot, test_annot, metadata
+    return variants, val_annot, test_annot, metadata, manifest
 
 
 def resolve_paths(args):
-    variants, val_annot, test_annot, metadata = variant_config(
+    variants, val_annot, test_annot, metadata, manifest = variant_config(
         args.local_root, args.cluster_root, args.cluster)
     vcfg = variants[args.variant]
     return {
@@ -182,6 +190,7 @@ def resolve_paths(args):
         "val_annot_dir":  args.val_annot_dir  or val_annot,
         "test_annot_dir": args.test_annot_dir or test_annot,
         "metadata":       args.metadata       or metadata,
+        "manifest":       args.manifest       or manifest,
         "output":         args.output_dir     or vcfg["output"],
     }
 
@@ -199,48 +208,138 @@ def setup_logging(output_dir):
     return logger, log_path
 
 
-def records_from_npz(npz, logger):
-    """Build per-segment record dicts directly from a `_full` predictions
-    NPZ. The NPZ schema (saved by every *_evaluation.py and the M4 recovery
-    script via eval_utils.evaluate_event_level['reordered_arrays']) stores
-    y_true, y_prob, mouse_id, chrono_idx, t_start_sec as parallel arrays in
-    chronological-per-mouse order. Building records from these fields
-    avoids the manifest entirely and guarantees record[i] aligns with
-    y_true[i] / y_prob[i].
+def load_records_and_arrays(npz_path, manifest_path, partition, annot_dir,
+                            mouse_metadata, logger):
+    """Load (y_true, y_prob, records) from cached predictions with NPZ-format
+    auto-detection. Returns arrays aligned with records[i].
 
-    Returns (y_true_arr, y_prob_arr, records). records[i] has keys:
-        mouse_id, chrono_idx, t_start_sec, label, filepath (sentinel "")
+    Supports three input shapes:
+
+      1. **_full NPZ** -- chronologically reordered, has mouse_id /
+         chrono_idx / t_start_sec arrays embedded. Records built directly
+         from NPZ; manifest is not consulted. This is what
+         *_evaluation.py and m4_event_metrics_recovery.py write.
+
+      2. **_raw NPZ + enriched manifest** -- NPZ in manifest order with
+         only y_true/y_prob; manifest records have chrono_idx and
+         t_start_sec. Records built from manifest, paired with NPZ by
+         index. This is the M3 cluster case today.
+
+      3. **_raw NPZ + unenriched manifest** -- last-resort fallback. The
+         chronology is rebuilt in-process via
+         eval_utils.build_mouse_chronology from EDF metadata + Excel
+         annotations (~1 min for the full partition). Requires no
+         precomputed chronology cache.
     """
-    required = ("y_true", "y_prob", "mouse_id", "chrono_idx", "t_start_sec")
-    missing = [k for k in required if k not in npz.files]
-    if missing:
+    npz = np.load(npz_path, allow_pickle=True)
+    if "y_true" not in npz.files or "y_prob" not in npz.files:
         raise KeyError(
-            "NPZ missing required _full-schema fields: %s. Available: %s. "
-            "This script requires the chronologically-reordered predictions "
-            "NPZ (filename ends in _predictions_full.npz). The older _raw "
-            "manifest-order NPZs are not supported here -- use a script that "
-            "reads them via the data-splits manifest if you must."
-            % (missing, list(npz.files)))
+            "NPZ %s missing y_true/y_prob. Available: %s"
+            % (npz_path, list(npz.files)))
+    y_true = np.asarray(npz["y_true"]).astype(np.int64)
+    y_prob = np.asarray(npz["y_prob"]).astype(np.float64)
 
-    y_true       = np.asarray(npz["y_true"]).astype(np.int64)
-    y_prob       = np.asarray(npz["y_prob"]).astype(np.float64)
-    mouse_id_arr = np.asarray(npz["mouse_id"])
-    chrono_idx_arr   = np.asarray(npz["chrono_idx"]).astype(np.int64)
-    t_start_sec_arr  = np.asarray(npz["t_start_sec"]).astype(np.float64)
+    has_chrono_in_npz = all(
+        k in npz.files for k in ("mouse_id", "chrono_idx", "t_start_sec"))
 
-    records = []
-    for i in range(len(y_true)):
-        records.append({
-            "mouse_id":    str(mouse_id_arr[i]),
-            "chrono_idx":  int(chrono_idx_arr[i]),
-            "t_start_sec": float(t_start_sec_arr[i]),
-            "label":       int(y_true[i]),
-            "filepath":    "",
-        })
-    logger.info("Built %d records from NPZ (%d unique mice)",
-                len(records),
-                len({r["mouse_id"] for r in records}))
-    return y_true, y_prob, records
+    # Case 1: _full NPZ
+    if has_chrono_in_npz:
+        logger.info("NPZ format: _full (chronology fields embedded; "
+                    "manifest not needed)")
+        mouse_id_arr    = np.asarray(npz["mouse_id"])
+        chrono_idx_arr  = np.asarray(npz["chrono_idx"]).astype(np.int64)
+        t_start_sec_arr = np.asarray(npz["t_start_sec"]).astype(np.float64)
+        records = []
+        for i in range(len(y_true)):
+            records.append({
+                "mouse_id":    str(mouse_id_arr[i]),
+                "chrono_idx":  int(chrono_idx_arr[i]),
+                "t_start_sec": float(t_start_sec_arr[i]),
+                "label":       int(y_true[i]),
+                "filepath":    "",
+            })
+        logger.info("Built %d records from NPZ (%d unique mice)",
+                    len(records), len({r["mouse_id"] for r in records}))
+        return y_true, y_prob, records
+
+    # Cases 2 / 3: _raw NPZ -- need manifest
+    logger.info("NPZ format: _raw (manifest order; chronology not embedded)")
+    if manifest_path is None or not manifest_path.exists():
+        raise FileNotFoundError(
+            "NPZ %s is _raw format and requires a manifest, but manifest "
+            "path %s does not exist. Pass --manifest <PATH>."
+            % (npz_path, manifest_path))
+    logger.info("Loading manifest at %s", manifest_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest_records = manifest.get(partition, []) or []
+    if len(manifest_records) != len(y_true):
+        raise ValueError(
+            "NPZ length %d != manifest partition '%s' length %d."
+            % (len(y_true), partition, len(manifest_records)))
+
+    sample = manifest_records[:5]
+    manifest_enriched = bool(sample) and all(
+        ("chrono_idx" in r and "t_start_sec" in r) for r in sample)
+
+    kept_idx, records = [], []
+    if manifest_enriched:
+        logger.info("Manifest is enriched -- using its chronology fields directly.")
+        for i, rec in enumerate(manifest_records):
+            ci = rec.get("chrono_idx", -1)
+            if ci is None or int(ci) < 0:
+                continue
+            r2 = dict(rec)
+            r2.setdefault("mouse_id", Path(rec["filepath"]).stem.split("_")[0])
+            r2["chrono_idx"]  = int(ci)
+            r2["t_start_sec"] = float(rec.get("t_start_sec", 0.0))
+            records.append(r2)
+            kept_idx.append(i)
+    else:
+        logger.info("Manifest is unenriched -- rebuilding chronology in-process "
+                    "via eval_utils.build_mouse_chronology.")
+        from eval_utils import build_mouse_chronology as _bmc
+        from eval_utils import load_annotations as _load_annot
+        mice = sorted({Path(r["filepath"]).stem.split("_")[0] for r in manifest_records})
+        chrono_maps = {}
+        for mouse_id in mice:
+            if mouse_id not in mouse_metadata:
+                logger.warning("  %s : no metadata; dropping its records.", mouse_id)
+                chrono_maps[mouse_id] = None
+                continue
+            xlsx = annot_dir / f"{mouse_id}_xlsx.xlsx"
+            if not xlsx.exists():
+                logger.warning("  %s : no annotation at %s; dropping its records.",
+                               mouse_id, xlsx)
+                chrono_maps[mouse_id] = None
+                continue
+            meta = mouse_metadata[mouse_id]
+            rec_start = datetime.datetime.fromisoformat(meta["recording_start_dt"])
+            seizure_intervals = _load_annot(xlsx, rec_start)
+            cmap, _, _ = _bmc(mouse_id, int(meta["n_samples"]),
+                              seizure_intervals, logger)
+            chrono_maps[mouse_id] = cmap
+        for i, rec in enumerate(manifest_records):
+            fname = Path(rec["filepath"]).name
+            mouse = fname.split("_")[0]
+            cmap = chrono_maps.get(mouse)
+            if cmap is None:
+                continue
+            info = cmap.get(fname)
+            if info is None:
+                continue
+            r2 = dict(rec)
+            r2["mouse_id"]    = mouse
+            r2["chrono_idx"]  = int(info["chrono_idx"])
+            r2["t_start_sec"] = float(info["t_start_sec"])
+            records.append(r2)
+            kept_idx.append(i)
+
+    y_true_kept = y_true[kept_idx]
+    y_prob_kept = y_prob[kept_idx]
+    logger.info("Built %d records from manifest (%d unique mice; %d dropped)",
+                len(records), len({r["mouse_id"] for r in records}),
+                len(manifest_records) - len(records))
+    return y_true_kept, y_prob_kept, records
 
 
 def write_summary_json(out_path, model_label, partition, sec, order,
@@ -406,8 +505,8 @@ def plot_impact(rows, out_path, model_label, logger):
     logger.info("Saved impact figure: %s", out_path)
 
 
-def sweep_partition(partition, npz_path, annot_dir, mouse_metadata,
-                    output_root, model_label, logger):
+def sweep_partition(partition, npz_path, manifest_path, annot_dir,
+                    mouse_metadata, output_root, model_label, logger):
     """Run the 2-order x 4-sec sweep for one partition. Returns list of
     comparison-row dicts (one per (order, sec))."""
     if not npz_path.exists():
@@ -419,10 +518,10 @@ def sweep_partition(partition, npz_path, annot_dir, mouse_metadata,
                        partition, annot_dir)
         return []
 
-    npz = np.load(npz_path, allow_pickle=True)
     try:
-        y_true_kept, y_prob_kept, records = records_from_npz(npz, logger)
-    except KeyError as exc:
+        y_true_kept, y_prob_kept, records = load_records_and_arrays(
+            npz_path, manifest_path, partition, annot_dir, mouse_metadata, logger)
+    except (KeyError, FileNotFoundError, ValueError) as exc:
         logger.error("[%s] %s", partition, exc)
         return []
     logger.info("[%s] NPZ loaded: %d segments | %d positive (%.3f%%)",
@@ -495,6 +594,7 @@ def main():
     logger.info("Val NPZ         : %s", paths["val_npz"])
     logger.info("Test NPZ        : %s", paths["test_npz"])
     logger.info("Metadata        : %s", paths["metadata"])
+    logger.info("Manifest        : %s", paths["manifest"])
     logger.info("Val annot dir   : %s", paths["val_annot_dir"])
     logger.info("Test annot dir  : %s", paths["test_annot_dir"])
     logger.info("Output root     : %s", output_root)
@@ -516,7 +616,8 @@ def main():
         logger.info("PARTITION: %s", partition.upper())
         logger.info("#" * 65)
         rows = sweep_partition(
-            partition, npz_map[partition], annot_dir_map[partition],
+            partition, npz_map[partition], paths["manifest"],
+            annot_dir_map[partition],
             mouse_metadata, output_root, paths["model_label"], logger)
         all_rows.extend(rows)
 
