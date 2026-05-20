@@ -8,8 +8,8 @@ model forward pass, no GPU.
 
 Sweep grid per partition:
     order ∈ {refractory_then_min, min_then_refractory}
-    MIN_EVENT_SEC ∈ {10, 15, 20, 30}    (seconds)
-= 8 configurations per partition × 2 partitions = 16 evaluations.
+    MIN_EVENT_SEC ∈ {10, 15, 20, 25, 30}    (seconds)
+= 10 configurations per partition × 2 partitions = 20 evaluations.
 
 Smoothing window (W=3), threshold (tau=0.5), refractory period (30 s),
 and FAR/hr denominator (step_sec = 2.5 s) are held at canonical values;
@@ -78,7 +78,7 @@ LOCAL_DEFAULT   = Path(r"C:\Users\messi\OneDrive\Desktop\Desktop\TCN_UNIQURE_PRO
 
 PARTITIONS = ["val", "test"]
 ORDERINGS  = ["refractory_then_min", "min_then_refractory"]
-SWEEP_SECS = [10, 15, 20, 30]
+SWEEP_SECS = [10, 15, 20, 25, 30]
 
 ORDER_LABEL = {
     "refractory_then_min": "Refractory -> Min-dur",
@@ -507,8 +507,8 @@ def plot_impact(rows, out_path, model_label, logger):
 
 def sweep_partition(partition, npz_path, manifest_path, annot_dir,
                     mouse_metadata, output_root, model_label, logger):
-    """Run the 2-order x 4-sec sweep for one partition. Returns list of
-    comparison-row dicts (one per (order, sec))."""
+    """Run the 2-order x N-sec sweep (N = len(SWEEP_SECS)) for one
+    partition. Returns list of comparison-row dicts (one per (order, sec))."""
     if not npz_path.exists():
         logger.warning("[%s] NPZ missing at %s -- skipping this partition.",
                        partition, npz_path)
