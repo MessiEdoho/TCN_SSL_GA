@@ -1694,8 +1694,14 @@ def main():
     # Macro-avg classification metrics (Row 1 + Row 2) plus FAR/hr in a
     # standalone two-panel figure under OUTPUT_ROOT/Result_classReport/.
     # Same protocol as M1, M3, M4 -- shared helper in tcn_utils.py.
+    # Use manifest-order predictions to match y_true (which is also manifest-
+    # order from evaluate_model). y_pred_row1 / y_pred_row2 above were
+    # reordered per-mouse-chronologically for the predictions NPZ; pairing
+    # those with manifest-order y_true would misalign the elements.
     make_classreport_barplot(
-        y_true, y_pred_row1, y_pred_row2,
+        y_true,
+        (y_prob >= 0.5).astype(int),
+        post_row2["smoothed_preds"],
         row1_metrics, row2_metrics,
         RESULT_CLASSREPORT_DIR / "tcn_attention_classreport_barplot.png",
         title_prefix="TCN + Attention", logger=logger)

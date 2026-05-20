@@ -2644,6 +2644,42 @@ def make_classreport_barplot(y_true, y_pred_row1, y_pred_row2,
     r2_report = classification_report(y_true, y_pred_row2, output_dict=True,
                                       zero_division=0)
 
+    # Cross-check the in-function macro avg against the externally-passed
+    # row_metrics dicts. row_metrics was computed by
+    # eval_utils.compute_segment_level_metrics on the same (y_true, y_pred)
+    # pairing the eval/training script saved into the per-row classification-
+    # report JSON. A disagreement here means y_true and y_pred_rowN passed
+    # to this function were ordered inconsistently (manifest order vs
+    # chronological per-mouse reorder), and the bar plot would silently
+    # visualise garbage macro values. Tight tolerance (1e-4) is safe because
+    # both sides use the same sklearn implementation on the same arrays.
+    def _check_macro(row_idx, sklearn_report, row_metrics):
+        expected = {
+            "precision": row_metrics.get("precision_macro"),
+            "recall":    row_metrics.get("recall_macro"),
+            "f1-score":  row_metrics.get("f1_macro"),
+        }
+        if all(v is None for v in expected.values()):
+            return                  # older row_metrics dict; nothing to check
+        macro = sklearn_report.get("macro avg", {}) or {}
+        bad = []
+        for key, exp in expected.items():
+            if exp is None:
+                continue
+            got = float(macro.get(key, 0.0))
+            if abs(got - float(exp)) > 1e-4:
+                bad.append("%s: bar=%.6f vs row_metrics=%.6f" % (key, got, float(exp)))
+        if bad:
+            raise AssertionError(
+                "make_classreport_barplot row %d macro avg mismatch: %s. "
+                "Most likely cause: y_true and y_pred_row%d are in inconsistent "
+                "orders (manifest vs chronological per-mouse). Pass manifest-"
+                "order arrays: y_true, (y_prob >= 0.5).astype(int), "
+                "post_row2['smoothed_preds']." % (row_idx, "; ".join(bad), row_idx))
+
+    _check_macro(1, r1_report, row1_metrics)
+    _check_macro(2, r2_report, row2_metrics)
+
     display_names = ["accuracy", "precision", "recall", "F1-score",
                      "specificity", "AUROC", "AP (PRAUC)"]
 

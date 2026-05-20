@@ -59,6 +59,16 @@ cd ~/TCN_SSL_GA
 VARIANT="${1:?Usage: sbatch -J <jobname> train_eval.sh <VARIANT>}"
 echo "Variant: $VARIANT"
 
+# Per-variant symlink to this job's SLURM stdout file, so that an `ls
+# $HOME/slurm_logs/` immediately tells you which jobs were which variant
+# without opening any file. The original /home/people/22206468/slurm-train
+# _eval-${SLURM_JOB_ID}.out is the live target; the symlink stays valid as
+# long as that file exists.
+mkdir -p "$HOME/slurm_logs"
+ln -sf "/home/people/22206468/slurm-train_eval-${SLURM_JOB_ID}.out" \
+       "$HOME/slurm_logs/train_eval-${VARIANT}-${SLURM_JOB_ID}.out"
+echo "Per-variant log: $HOME/slurm_logs/train_eval-${VARIANT}-${SLURM_JOB_ID}.out"
+
 python train_eval.py --variant "$VARIANT"
 
 echo "===== JOB END ====="
