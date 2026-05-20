@@ -347,7 +347,11 @@ def plot_impact(rows, out_path, model_label, logger):
         ax.set_xlabel("MIN_EVENT_SEC (s)"); ax.set_ylabel("Score")
         ax.set_title(f"[{partition.upper()}] Event Precision / Recall / F1")
         ax.set_xticks(SWEEP_SECS); ax.grid(True, alpha=0.3)
-        ax.legend(fontsize=7, ncol=2, loc="best")
+        # Legend BELOW the axes so the 6 entries never overlap with the
+        # P/R/F1 curves (loc="best" picked the data-covered lower-left
+        # corner for this dataset).
+        ax.legend(fontsize=7, ncol=3, loc="upper center",
+                  bbox_to_anchor=(0.5, -0.18), frameon=True)
 
         ax = axes[row_i, 1]
         for order in ORDERINGS:
@@ -391,6 +395,12 @@ def plot_impact(rows, out_path, model_label, logger):
                  "-- val (top) vs test (bottom)" % model_label,
                  fontsize=13)
     plt.tight_layout(rect=(0, 0, 1, 0.96))
+    # Add vertical breathing room between the two rows so the [VAL] P/R/F1
+    # legend (sitting below its axes) doesn't crowd the [TEST] row's titles.
+    fig.subplots_adjust(hspace=0.55)
+    # bbox_inches="tight" expands the saved figure to fit the below-axis
+    # legend on the bottom row (which would otherwise sit outside the
+    # default canvas).
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close()
     logger.info("Saved impact figure: %s", out_path)
