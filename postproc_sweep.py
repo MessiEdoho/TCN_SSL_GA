@@ -466,7 +466,7 @@ def plot_impact(rows, out_path, model_label, logger):
                     linewidth=1.6,
                     label=ORDER_LABEL[order])
         ax.set_xlabel("MIN_EVENT_SEC (s)"); ax.set_ylabel("Event-level FAR/hr")
-        ax.set_title(f"[{partition.upper()}] Event-level FAR/hr (corrected)")
+        ax.set_title(f"[{partition.upper()}] Event-level FAR/hr")
         ax.set_xticks(SWEEP_SECS); ax.grid(True, alpha=0.3)
         ax.legend(fontsize=8, loc="best")
 
