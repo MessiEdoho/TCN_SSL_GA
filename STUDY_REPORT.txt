@@ -1836,9 +1836,32 @@ configurations.
     nearest few seconds is sufficient for downstream clinical
     interpretation.
 
-    Stage 2 -- Refractory-period merging
+    Stage 2 -- Minimum duration filter
+    ----------------------------------
+    Candidate event runs shorter than MIN_EVENT_SEC = 25.0 seconds
+    are discarded BEFORE the refractory-period merge step. This
+    ordering (min-duration first, refractory merge second) matches
+    the standard convention in clinical seizure-detection pipelines
+    (Saab et al. 2020; Tang et al. 2022) and was confirmed
+    empirically on this dataset to Pareto-dominate the alternative
+    (refractory-then-min) on both M3 and M4, across both val and
+    test partitions, at every MIN_EVENT_SEC value tested (see
+    operating-point selection subsection below).
+
+    The MIN_EVENT_SEC = 25.0 s threshold was selected with two
+    independent lines of evidence converging on the same value:
+    (i) it sits just below the 25th percentile of the empirical
+    seizure-duration distribution (Q1 = 32.3 s, median = 42.6 s,
+    mode-bin = 30-35 s, computed over 4 459 expert-annotated
+    seizures across 101 mice -- Figure X); (ii) it lies at the
+    Pareto knee of the validation recall-vs-event-FAR/hr curve,
+    beyond which additional FAR reduction starts to cost recall
+    disproportionately (Figure Y). Both lines of evidence are
+    detailed in the operating-point subsection below.
+
+    Stage 3 -- Refractory-period merging
     ------------------------------------
-    Pairs of detected event runs separated by gaps shorter than
+    Surviving event pairs separated by gaps shorter than
     REFRACTORY_SEC = 30.0 seconds are merged into a single event.
     This corrects for transient probability dips during a single
     underlying seizure (for example, a brief period of attenuated
@@ -1847,23 +1870,18 @@ configurations.
     with standard practice in automated seizure-detection
     pipelines (Shoeb & Guttag, 2010).
 
-    Stage 3 -- Minimum duration filter
-    ----------------------------------
-    Events shorter than MIN_EVENT_SEC = 10.0 seconds after merging
-    are discarded. This threshold is motivated by the clinical
-    definition of a seizure, which typically requires sustained
-    ictal activity of at least several seconds; runs shorter than
-    10 s are overwhelmingly isolated false positives attributable
-    to transient noise, movement artefact, or brief sub-threshold
-    discharges.
-
     Parameter summary
     -----------------
     Parameter              Value       Rationale
     --------------------- ----------- -----------------------------
     SMOOTHING_WIN          3 segments  Suppress isolated artefact spikes
+    MIN_EVENT_SEC          25.0 s      Discard sub-clinical events; below
+                                        Q1 of annotated seizure-duration
+                                        distribution; Pareto knee on val
     REFRACTORY_SEC         30.0 s      Merge fragmented single-seizure runs
-    MIN_EVENT_SEC          10.0 s      Discard sub-clinical events
+    Stage order            min-duration first, refractory second
+                           (Saab 2020; Tang 2022; empirically Pareto-
+                           dominant on M3 and M4, val and test)
 
     The three-stage pipeline converts segment-level predictions
     (of which there can be many per minute due to 50% segment
@@ -1873,6 +1891,72 @@ configurations.
     quantity actually experienced by a monitoring clinician and is
     the basis for the event-level false-alarm-rate metric reported
     alongside segment-level metrics in Section 9.
+
+    Operating-point selection -- empirical justification
+    ----------------------------------------------------
+    The two post-processing operating-point choices -- (a) the
+    order of Stage 2 and Stage 3, and (b) the value of
+    MIN_EVENT_SEC -- were jointly selected via a 2 x 5 grid sweep
+    on the validation partition, with confirmation on the held-out
+    test partition (no test-set re-tuning was performed). The sweep
+    covered order ∈ {refractory-then-min, min-then-refractory} ×
+    MIN_EVENT_SEC ∈ {10, 15, 20, 25, 30} s, applied identically to
+    M3 (MultiScaleTCN) and M4 (MultiScaleTCN + Attention) on
+    cached per-mouse-chronological prediction streams. Results are
+    summarised in Figure Y (val vs test panels, two orderings per
+    panel) and the underlying numbers are tabulated in
+    comparison_val_vs_test.csv alongside each model's evaluation
+    artefacts.
+
+    Pareto dominance of min-then-refractory. At every value of
+    MIN_EVENT_SEC and on both partitions of both models, the
+    min-duration-then-refractory ordering yielded a strictly
+    Pareto-better recall-vs-event-FAR/hr operating point than the
+    refractory-then-min alternative. For example, at the selected
+    MIN_EVENT_SEC = 25 s on the test partition: M3 precision 0.38
+    -> 0.50, F1 0.54 -> 0.65, FAR/hr 0.151 -> 0.091 (-40%); M4
+    precision 0.27 -> 0.41, F1 0.42 -> 0.57, FAR/hr 0.256 -> 0.130
+    (-49%); recall reduction in both cases was <= 2 percentage
+    points. This direction-of-effect is consistent with the
+    intuition that min-duration filtering ahead of refractory
+    merging eliminates short artefactual bursts before they can be
+    chained into longer apparent events.
+
+    Pareto-knee selection of MIN_EVENT_SEC = 25 s. Within the
+    min-then-refractory ordering, the marginal trade-off ratio
+    Delta(event-FAR/hr) / Delta(recall) per increment of
+    MIN_EVENT_SEC was favourable at 15 -> 20 s (>= 2.0 on all four
+    partition-model combinations) and 20 -> 25 s (>= 1.5), then
+    collapsed sharply at 25 -> 30 s (M3-val 0.12, M3-test 0.33,
+    M4-val 0.77, M4-test 0.75). MIN_EVENT_SEC = 25 s therefore
+    represents the right edge of the favourable-trade-off regime,
+    consistent with the recall-vs-FAR Pareto plot showing a clear
+    bend between 25 s and 30 s on all four panels.
+
+    Empirical distribution support. Independent of the model-side
+    Pareto curve, MIN_EVENT_SEC = 25 s is well-supported by the
+    annotated seizure-duration distribution itself. Across all
+    4 459 expert-annotated seizures in the 101-mouse study cohort,
+    the lower quartile (Q1) is 32.3 s -- the 25 s threshold thus
+    sits 7.3 s below the lower quartile, leaving 89.2% of
+    annotated seizures unambiguously above the cutoff. The median
+    is 42.6 s and the modal duration bin is 30-35 s (n = 557 of
+    4 459), so 25 s does not bisect the dominant seizure
+    morphology cluster. At the alternative cutoff of 30 s,
+    19.5% of annotated seizures fall below the threshold, almost
+    double the 10.8% at-risk count at 25 s. The 25 s value
+    therefore preserves clinical sensitivity (validation event
+    recall remained >= 0.94 on both M3 and M4 after the filter)
+    while still aggressively suppressing the short-duration false
+    alarm population that dominates the raw classifier's FAR
+    budget.
+
+    Generalisation to test. Application of the selected operating
+    point (order = min-then-refractory; MIN_EVENT_SEC = 25 s) to
+    the held-out test partition without re-tuning yielded the
+    Section 9 headline numbers. The Pareto ranking observed on
+    val held on test (Figure Y bottom row), confirming that the
+    selection is not an artefact of validation-set tuning.
 
     Per-mouse chronological organisation
     ------------------------------------

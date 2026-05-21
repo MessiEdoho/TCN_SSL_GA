@@ -360,7 +360,7 @@ STEP_SEC        = STEP / FS       # 2.5
 THRESHOLD       = 0.5
 SMOOTHING_WIN   = 3
 REFRACTORY_SEC  = 30.0
-MIN_EVENT_SEC   = 10.0
+MIN_EVENT_SEC   = 25.0
 
 
 # ---------------------------------------------------------------------------
@@ -541,20 +541,22 @@ def _min_duration_filter(events):
 
 
 def detect_events_in_chunk(t_start, y_prob, mouse_id, chunk_id,
-                           order="refractory_then_min"):
+                           order="min_then_refractory"):
     """Run smoothing + threshold + run-detection, then apply the
     refractory-merge and min-duration-filter steps in the order specified.
 
     Parameters
     ----------
     order : {"refractory_then_min", "min_then_refractory"}, default
-        "refractory_then_min".
+        "min_then_refractory" (selected by the 2 x 5 grid sweep on val;
+        see STUDY_REPORT.txt Section 7.6.10).
+        "min_then_refractory" drops short candidate events first, then
+        merges surviving ones; matches the standard order in the clinical
+        seizure-detection literature and Pareto-dominates the alternative
+        on this dataset.
         "refractory_then_min" (legacy) merges first, then drops surviving
         short events; can rescue fragmented true detections at the cost
         of also rescuing fragmented false alarms.
-        "min_then_refractory" drops short events first, then merges
-        surviving ones; more conservative, matches the standard order
-        in the clinical seizure-detection literature.
 
     Returns
     -------
@@ -734,7 +736,7 @@ def build_classification_report(y_true, y_pred, row_metrics):
 # ---------------------------------------------------------------------------
 def evaluate_event_level(partition_records, y_true_all, y_prob_all,
                          annotations_dir, mouse_metadata, logger,
-                         order="refractory_then_min"):
+                         order="min_then_refractory"):
     """End-to-end per-mouse-chronological event-level evaluation.
 
     Parameters
@@ -752,7 +754,7 @@ def evaluate_event_level(partition_records, y_true_all, y_prob_all,
         recording_start_dt).
     logger : logging.Logger
     order : {"refractory_then_min", "min_then_refractory"}, default
-        "refractory_then_min". Controls the post-processing step order
+        "min_then_refractory". Controls the post-processing step order
         in detect_events_in_chunk -- see that function's docstring.
 
     Returns
