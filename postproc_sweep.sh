@@ -39,7 +39,7 @@ VARIANT="${1:?Usage: sbatch -J <jobname> postproc_sweep.sh <VARIANT>}"
 echo "Variant: $VARIANT"
 
 # Per-variant symlink to this job's SLURM stdout. Mirrors the Option-B
-# pattern in train_eval.sh so `ls $HOME/slurm_logs/` immediately tells
+# pattern in raw_segment_level_3partitions.sh so `ls $HOME/slurm_logs/` immediately tells
 # which variant a job ran without opening any file.
 mkdir -p "$HOME/slurm_logs"
 ln -sf "/home/people/22206468/slurm-postproc_sweep-${SLURM_JOB_ID}.out" \

@@ -6,7 +6,7 @@ classification report JSONs and per-partition event-level summary JSONs
 that the recovery / evaluation scripts produced, and emits paper-ready
 bar plots.
 
-Variant-parameterised in the same style as train_eval.py:
+Variant-parameterised in the same style as raw_segment_level_3partitions.py:
     python plot_segment_metrics_barplot.py --variant MultiScaleTCN
     python plot_segment_metrics_barplot.py --variant MultiScaleTCNWithAttention
     python plot_segment_metrics_barplot.py --variant TCN                       # future
@@ -36,6 +36,7 @@ below; override paths via --local-root or per-variant flags.
 """
 
 import argparse
+import csv
 import json
 import math
 from pathlib import Path
@@ -59,75 +60,51 @@ DISPLAY_NAMES = ["accuracy", "precision", "recall\n(sensitivity)",
 # {row} is filled with 1 or 2 for the per-row classification report.
 # ---------------------------------------------------------------------------
 def variant_config(local_root):
+    """All partition inputs read from the postproc_sweep.py output for the
+    LOCKED operating point: order = min_then_refractory, MIN_EVENT_SEC = 25 s.
+    Per-partition file naming is uniform across variants because the sweep
+    writes generic '{partition}_summary.json' / '{partition}_classification_
+    report_row{row}.json'. Figure output goes to a per-variant
+    'evaluation_figure_paper/' folder, distinct from earlier 'figures_2/'
+    or 'event_metrics_recovery/figures/' folders that hold artefacts from
+    the prior operating point.
+    """
+    LOCK = ("evaluation", "post_process_varing_sec",
+            "{partition}", "min_then_refractory", "MIN_EVENT_SEC_25s")
+
+    def _partition_dir(model_root, partition):
+        # Build path from the LOCK template with the partition substituted.
+        return model_root.joinpath(*(s.format(partition=partition) for s in LOCK))
+
+    m1 = local_root / "TCN"
+    m2 = local_root / "TCNAttention"
+    m3 = local_root / "MultiScaleTCN"
+    m4 = local_root / "MultiScaleTCNAttention"
+
+    def _variant_entry(model_label, output_prefix, model_root):
+        return {
+            "model_label":   model_label,
+            "output_prefix": output_prefix,
+            "figure_dir":    model_root / "evaluation_figure_paper",
+            "partitions": {
+                "val": {
+                    "dir":         _partition_dir(model_root, "val"),
+                    "row_report":  "val_classification_report_row{row}.json",
+                    "summary":     "val_summary.json",
+                },
+                "test": {
+                    "dir":         _partition_dir(model_root, "test"),
+                    "row_report":  "test_classification_report_row{row}.json",
+                    "summary":     "test_summary.json",
+                },
+            },
+        }
+
     return {
-        "TCN": {
-            "model_label":   "TCN",
-            "output_prefix": "tcn",
-            "figure_dir":    local_root / "TCN" / "figures",
-            "partitions": {
-                "val": {
-                    "dir":         local_root / "TCN",
-                    "row_report":  "tcn_classification_report_row{row}.json",
-                    "summary":     "tcn_evaluation_report.json",
-                },
-                "test": {
-                    "dir":         local_root / "TCN" / "evaluation",
-                    "row_report":  "tcn_classification_report_row{row}.json",
-                    "summary":     "tcn_evaluation_report.json",
-                },
-            },
-        },
-        "TCNWithAttention": {
-            "model_label":   "TCN + Attention",
-            "output_prefix": "tcn_attention",
-            "figure_dir":    local_root / "TCNAttention" / "figures",
-            "partitions": {
-                "val": {
-                    "dir":         local_root / "TCNAttention",
-                    "row_report":  "tcn_attention_classification_report_row{row}.json",
-                    "summary":     "tcn_attention_evaluation_report.json",
-                },
-                "test": {
-                    "dir":         local_root / "TCNAttention" / "evaluation",
-                    "row_report":  "tcn_attention_classification_report_row{row}.json",
-                    "summary":     "tcn_attention_evaluation_report.json",
-                },
-            },
-        },
-        "MultiScaleTCN": {
-            "model_label":   "Multi-Scale TCN",
-            "output_prefix": "multiscale_tcn",
-            "figure_dir":    local_root / "MultiScaleTCN" / "event_metrics_recovery" / "figures",
-            "partitions": {
-                "val": {
-                    "dir":         local_root / "MultiScaleTCN" / "event_metrics_recovery",
-                    "row_report":  "recover_classification_report_val_row{row}.json",
-                    "summary":     "recover_event_metrics_val.json",
-                },
-                "test": {
-                    "dir":         local_root / "MultiScaleTCN" / "event_metrics_recovery",
-                    "row_report":  "recover_classification_report_test_row{row}.json",
-                    "summary":     "recover_event_metrics_test.json",
-                },
-            },
-        },
-        "MultiScaleTCNWithAttention": {
-            "model_label":   "Multi-Scale TCN + Attention",
-            "output_prefix": "ms_attn",
-            "figure_dir":    local_root / "MultiScaleTCNAttention" / "evaluation" / "figures_2",
-            "partitions": {
-                "val": {
-                    "dir":         local_root / "MultiScaleTCNAttention" / "val_event_metrics",
-                    "row_report":  "ms_attn_classification_report_row{row}.json",
-                    "summary":     "ms_attn_evaluation_report.json",
-                },
-                "test": {
-                    "dir":         local_root / "MultiScaleTCNAttention" / "evaluation",
-                    "row_report":  "ms_attn_classification_report_row{row}.json",
-                    "summary":     "ms_attn_evaluation_report.json",
-                },
-            },
-        },
+        "TCN":                        _variant_entry("TCN",                          "tcn",            m1),
+        "TCNWithAttention":           _variant_entry("TCN + Attention",              "tcn_attention",  m2),
+        "MultiScaleTCN":              _variant_entry("Multi-Scale TCN",              "multiscale_tcn", m3),
+        "MultiScaleTCNWithAttention": _variant_entry("Multi-Scale TCN + Attention",  "ms_attn",        m4),
     }
 
 
@@ -328,6 +305,97 @@ def plot_event_level_val_vs_test(cfg, out_path):
     print(f"Saved: {out_path}")
 
 
+def plot_far_3stage_val_vs_test(cfg, out_path):
+    """Three-stage FAR/hr improvement figure -- six bars (2 partitions x 3
+    pipeline stages). Stages, from left to right within each partition:
+      (A) Raw segment-level FAR/hr        -- raw classifier at tau=0.5.
+      (B) Post-processed segment-level    -- after smoothing + threshold
+                                             + run-detection + min-dur
+                                             + refractory; scored per
+                                             segment on smoothed_preds.
+      (C) Post-processed event-level      -- per detected event after
+                                             any-overlap GT matching.
+    Stages (A) and (B) are scored on segments; (C) is scored on events,
+    so the y-axis is FAR/hr but the units of "alarm" change between
+    (A,B) and (C). The figure exists precisely to make that contrast
+    visible -- it is the headline narrative of the post-processing
+    contribution: noise spikes -> filtered segments -> clinical events.
+    """
+    rows = {}
+    for p in PARTITIONS:
+        s = load_event_summary(cfg, p)
+        seg = s.get("segment_level_metrics", {}) or {}
+        em  = s.get("event_level_metrics", {}) or {}
+        r1  = seg.get("row1_raw_threshold_0_5", {}) or {}
+        r2  = seg.get("row2_postproc_threshold_0_5", {}) or {}
+        rows[p] = (
+            float(r1.get("far_per_hour_seg_CORRECTED_2_5s_denom", 0.0)),
+            float(r2.get("far_per_hour_seg_CORRECTED_2_5s_denom", 0.0)),
+            float(em.get("far_per_hour_event_CORRECTED", 0.0)),
+        )
+
+    stage_labels = ["Raw\nsegment-level",
+                    "Post-processed\nsegment-level",
+                    "Post-processed\nevent-level"]
+    stage_colors = ["#C85A5A", "#E8A87C", "#5A7DC8"]   # red -> orange -> blue
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    x = np.arange(len(PARTITIONS))           # 0 = val, 1 = test
+    w = 0.27
+
+    for i, (lbl, color) in enumerate(zip(stage_labels, stage_colors)):
+        x_offset = (i - 1) * w
+        vals = [rows[p][i] for p in PARTITIONS]
+        bars = ax.bar(x + x_offset, vals, w, color=color, label=lbl,
+                      edgecolor="white")
+        for bar, v in zip(bars, vals):
+            h = bar.get_height()
+            ax.annotate("%.2f" % v,
+                        xy=(bar.get_x() + bar.get_width() / 2, h),
+                        xytext=(0, 3), textcoords="offset points",
+                        ha="center", fontsize=9, fontweight="bold")
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(["Validation", "Test"], fontsize=11)
+    ax.set_ylabel("FAR per hour", fontsize=11)
+    ax.set_title("%s False Alarm Rate -- Three-stage pipeline impact "
+                 "(raw segment -> post-processed segment -> event-level)"
+                 % cfg["model_label"], fontsize=11)
+    ax.legend(fontsize=9, loc="upper right", framealpha=0.9)
+    ax.grid(True, alpha=0.3, axis="y")
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {out_path}")
+
+
+def write_per_mouse_csv(cfg, partition, out_path):
+    """Extract the per-mouse breakdown block from the eval summary JSON
+    and write a paper-table CSV. Source is the locked-operating-point
+    sweep output (MIN_EVENT_SEC=25 s, order=min_then_refractory). One
+    row per mouse, sorted by mouse_id for stable diffing.
+    """
+    summary = load_event_summary(cfg, partition)
+    per_mouse = summary.get("per_mouse", {}) or {}
+    fieldnames = [
+        "mouse_id",
+        "n_ground_truth_seizures", "n_predicted_events",
+        "tp", "fp", "fn",
+        "precision", "recall", "f1",
+        "non_ictal_segments", "non_ictal_hours",
+        "far_per_hour", "mean_detection_latency_sec", "n_chunks",
+    ]
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for mouse_id in sorted(per_mouse.keys()):
+            row = dict(per_mouse[mouse_id])
+            row["mouse_id"] = mouse_id
+            writer.writerow(row)
+    print(f"Saved: {out_path} ({len(per_mouse)} mice)")
+
+
 def main():
     args = parse_args()
     cfg = variant_config(args.local_root)[args.variant]
@@ -339,13 +407,27 @@ def main():
     print(f"Local root  : {args.local_root}")
     print(f"Figure dir  : {figure_dir}")
     print(f"Output stem : {prefix}_*")
+    print(f"Source      : MIN_EVENT_SEC=25s, order=min_then_refractory "
+          f"(locked operating point; sweep output)")
     print("-" * 60)
 
+    # Row 1 vs Row 2 segment-level barplots (per partition; 7 metrics + seg FAR)
     for partition in PARTITIONS:
         out_path = figure_dir / f"{prefix}_segment_metrics_barplot_{partition}.png"
         plot_one_partition(cfg, partition, out_path)
+
+    # Event-level P/R/F1 + event FAR/hr (val vs test) -- primary headline result
     plot_event_level_val_vs_test(
         cfg, figure_dir / f"{prefix}_event_metrics_barplot_val_vs_test.png")
+
+    # Three-stage FAR/hr improvement (raw seg -> post seg -> post event)
+    plot_far_3stage_val_vs_test(
+        cfg, figure_dir / f"{prefix}_far_3stage_val_vs_test.png")
+
+    # Per-mouse breakdown CSVs (val + test) -- paper appendix table
+    for partition in PARTITIONS:
+        out_path = figure_dir / f"{prefix}_per_mouse_table_{partition}.csv"
+        write_per_mouse_csv(cfg, partition, out_path)
 
 
 if __name__ == "__main__":

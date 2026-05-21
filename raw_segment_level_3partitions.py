@@ -1,20 +1,41 @@
 """
-train_eval.py
-=============
-Cluster script. Runs FP32 inference of a trained model on the TRAIN
-partition (proximity-aware downsampled, ~30% ictal prevalence),
-computes segment-level Row 1 metrics, and writes a partition-level
-comparison (Train vs Val vs Test) for the four metrics least
-prevalence-sensitive: Sensitivity, AUROC, AP, F1 (macro).
+raw_segment_level_3partitions.py
+================================
+Cluster script. Produces a raw segment-level (Row 1) cross-partition
+comparison -- train vs val vs test -- as a single bar-plot and matching
+CSV / JSON. Eight metrics are reported per partition, side by side:
 
-Why only Row 1 segment-level (no Row 2, no event-level)
--------------------------------------------------------
-The training partition is proximity-aware downsampled, so segments
-are not chronologically contiguous. Smoothing (Row 2) and event
-detection both assume time contiguity and are therefore not
-meaningful for train. Row 1 (raw at tau=0.5) is the right comparison
-target -- it characterises the per-window classifier alone and is
-order-invariant.
+  Accuracy, Recall (macro), Precision (macro), Specificity,
+  AUROC, AP (PRAUC), F1 (macro), MCC.
+
+Train metrics are computed live by running an FP32 inference pass of
+the trained model on splits["train"] (proximity-aware downsampled,
+~30% ictal prevalence). Val and test metrics are read from the
+already-cached *_classification_report_row1.json files written by
+the canonical *_evaluation.py runs (post-processing-invariant, so
+unaffected by MIN_EVENT_SEC / ordering choices).
+
+Why "raw segment level" / "Row 1"
+---------------------------------
+The training partition is proximity-aware downsampled, so its segments
+are not chronologically contiguous. Smoothing (Row 2) and event-level
+detection both assume time contiguity and are therefore not meaningful
+for train. Row 1 (raw classifier at tau = 0.5, scored per segment) is
+the only stage that is meaningful for all three partitions and is the
+right comparison target for cross-partition diagnosis. Post-processed
+(Row 2) and event-level metrics for val and test are reported separately
+(plot_segment_metrics_barplot.py).
+
+Note on prevalence-sensitive metrics
+------------------------------------
+Among the eight metrics reported, Accuracy and Specificity are
+heavily prevalence-sensitive -- train is downsampled to ~30% ictal
+while val and test are at the natural ~0.27% prevalence, so these
+two metrics will look very different across partitions for reasons
+unrelated to model behaviour. They are kept in the figure for
+completeness of Row-1 reporting; for genuine cross-partition
+generalisation diagnosis rely on the prevalence-robust metrics
+(macro Recall, macro Precision, AUROC, AP, macro F1, MCC).
 
 Pipeline
 --------
@@ -22,20 +43,21 @@ Pipeline
 2. FP32 forward pass on splits["train"] with per-batch isfinite
    assertion (Layer 4).
 3. compute_segment_level_metrics on Row 1.
-4. Build sklearn classification report.
+4. Build sklearn classification report (with macro precision / recall /
+   f1 + MCC + AUROC + AP + specificity surfaced at top level).
 5. Save train_evaluation_report.json + train_classification_report.json
    + train_predictions_raw.npz.
-6. Read val and test eval reports from the cluster (handles both
-   old and new schemas; Row 1 values are identical across schemas).
-7. Build train-vs-val-vs-test comparison (4 metrics x 3 partitions).
+6. Read val and test eval reports from the cluster (handles both old
+   and new schemas; Row 1 values are identical across schemas).
+7. Build train-vs-val-vs-test comparison (8 metrics x 3 partitions).
 8. Save partition_comparison.{json,csv,png}.
 
 Usage
 -----
-  python train_eval.py --variant MultiScaleTCN
-  python train_eval.py --variant MultiScaleTCNWithAttention
-  python train_eval.py --variant TCN                       # future
-  python train_eval.py --variant TCNWithAttention          # future
+  python raw_segment_level_3partitions.py --variant MultiScaleTCN
+  python raw_segment_level_3partitions.py --variant MultiScaleTCNWithAttention
+  python raw_segment_level_3partitions.py --variant TCN                       # future
+  python raw_segment_level_3partitions.py --variant TCNWithAttention          # future
 
 Override CLI flags only if defaults don't match (see VARIANT_CONFIG below).
 """
@@ -172,8 +194,8 @@ def resolve_paths(args):
 # ---------------------------------------------------------------------------
 def setup_logging(output_dir, prefix):
     output_dir.mkdir(parents=True, exist_ok=True)
-    log_path = output_dir / f"{prefix}_train_eval.log"
-    logger = logging.getLogger("train_eval")
+    log_path = output_dir / f"{prefix}_raw_segment_level_3partitions.log"
+    logger = logging.getLogger("raw_segment_level_3partitions")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
     fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s",
@@ -285,7 +307,7 @@ def main():
     logger, log_path = setup_logging(paths["output_dir"], paths["prefix"])
 
     logger.info("=" * 65)
-    logger.info("train_eval.py")
+    logger.info("raw_segment_level_3partitions.py")
     logger.info("Variant     : %s", args.variant)
     logger.info("Weights     : %s", paths["weights"])
     logger.info("Params      : %s", paths["params"])
