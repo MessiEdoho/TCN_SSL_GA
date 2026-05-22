@@ -62,8 +62,6 @@ import torch
 from tcn_utils import set_seed, make_loader
 from interpretability_analysis import (
     SEED,
-    BEST_MS_PATH,
-    BEST_MS_ATTN_PATH,
     DEFAULT_BRANCH1,
     DEFAULT_BRANCH2,
     DEFAULT_BRANCH3,
@@ -90,11 +88,11 @@ DEFAULT_SPLITS_PATH = Path(
     "/scratch/22206468/INPUT_DATA/data_splits_outputs/"
     "data_splits_nonictal_sampled_filtered_enriched.json")
 
-# Per-model OUTPUT_ROOT and trained-weights paths. These mirror the constants
-# used by the training scripts (MultiScaleTCN.py, MultiScaleTCNAttention.py)
-# and the evaluation scripts (MultiScaleTCN_evaluation.py,
-# MultiScaleTCNAttention_evaluation.py), so artefacts produced here land in
-# the same per-model hierarchy on the cluster.
+# Per-model OUTPUT_ROOT, trained-weights paths, and tuning-output (best-
+# hyperparameter) paths. These mirror the constants used by the training
+# scripts (MultiScaleTCN.py:168,173,188; MultiScaleTCNAttention.py:160,174,175)
+# and the evaluation scripts, so artefacts produced here land in the same
+# per-model hierarchy on the cluster.
 CLUSTER_OUTPUT = Path("/home/people/22206468/scratch/OUTPUT")
 OUTPUT_ROOTS = {
     "M3": CLUSTER_OUTPUT / "MODEL3_OUTPUT" / "MultiScaleTCN",
@@ -104,6 +102,14 @@ WEIGHTS_PATHS = {
     "M3": OUTPUT_ROOTS["M3"] / "multiscale_tcn_final_weights.pt",
     "M4": OUTPUT_ROOTS["M4"] / "ms_attn_final_weights.pt",
 }
+# Best-hyperparameter JSONs live in sibling tuning-output directories under
+# each MODEL*_OUTPUT root, NOT inside the per-model OUTPUT_ROOT.
+BEST_MS_PATH = (CLUSTER_OUTPUT / "MODEL3_OUTPUT"
+                / "MultiScaleTCNtuning_outputs" / "best_multiscale_params.json")
+BEST_MS_ATTN_PATH = (CLUSTER_OUTPUT / "MODEL4_OUTPUT"
+                     / "multiscale_attention_tuning_outputs"
+                     / "best_multiscale_attn_params.json")
+
 # Subdirectory under each model's OUTPUT_ROOT for branch-ablation /
 # Shapley artefacts. Partition (val|test) is appended as a sibling
 # subdirectory so val and test artefacts are never mixed.
