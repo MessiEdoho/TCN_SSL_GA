@@ -353,6 +353,72 @@ def compute_entropy(weights, logger):
 
 
 # ---------------------------------------------------------------------------
+# compute_branch_outputs / forward_with_branch_mask
+# ---------------------------------------------------------------------------
+def compute_branch_outputs(model, x):
+    """Run the three branch TCN stacks once and return their outputs.
+
+    Used by callers that want to reuse branch outputs across multiple
+    fusion-mask configurations without re-running the branch convolutions
+    (e.g. Shapley value computation needs 8 coalitions but only 3 distinct
+    branch forward passes).
+
+    Returns (o1, o2, o3), each shape (batch, num_filters, T).
+    """
+    bb = model.backbone if hasattr(model, "backbone") else model
+    o1 = bb.branch1(x)
+    o2 = bb.branch2(x)
+    o3 = bb.branch3(x)
+    return o1, o2, o3
+
+
+def forward_with_branch_mask(model, x, zeroed_branches, branch_outputs=None):
+    """M3/M4 forward pass with selected branches zeroed before fusion.
+
+    Parameters
+    ----------
+    model            : MultiScaleTCN or MultiScaleTCNWithAttention
+    x                : torch.Tensor, shape (batch, 1, T) on the model's device
+    zeroed_branches  : iterable of ints from {1, 2, 3} -- branches to zero
+    branch_outputs   : optional pre-computed (o1, o2, o3) from compute_branch_outputs;
+                       if provided, the branch TCN stacks are not re-run (saves ~7/8 of
+                       the compute when looping many masks over the same input).
+
+    Returns
+    -------
+    logits : torch.Tensor, shape (batch,) -- binary logits before sigmoid.
+    """
+    bb = model.backbone if hasattr(model, "backbone") else model
+    if branch_outputs is None:
+        o1, o2, o3 = compute_branch_outputs(model, x)
+    else:
+        o1, o2, o3 = branch_outputs
+    if 1 in zeroed_branches:
+        o1 = torch.zeros_like(o1)
+    if 2 in zeroed_branches:
+        o2 = torch.zeros_like(o2)
+    if 3 in zeroed_branches:
+        o3 = torch.zeros_like(o3)
+    if bb.fusion == "concat":
+        fused = torch.cat([o1, o2, o3], dim=1)
+        fused = bb.fusion_conv(fused)
+    else:
+        fused = (o1 + o2 + o3) / 3.0
+    if hasattr(model, "attention_fc"):
+        feat_t = fused.transpose(1, 2)
+        e = torch.tanh(model.attention_fc(feat_t))
+        e = model.attention_v(e)
+        alpha = torch.softmax(e, dim=1)
+        context = (feat_t * alpha).sum(dim=1)
+        context = model.attention_drop(context)
+        logits = model.classifier(context).squeeze(-1)
+    else:
+        pooled = fused.mean(dim=-1)
+        logits = bb.classifier(pooled).squeeze(-1)
+    return logits
+
+
+# ---------------------------------------------------------------------------
 # run_branch_ablation
 # ---------------------------------------------------------------------------
 def run_branch_ablation(model, loader, y_true, device, model_name,
@@ -366,49 +432,16 @@ def run_branch_ablation(model, loader, y_true, device, model_name,
                        "threshold-selection bias. Use --partition test for paper results.", model_name)
 
     def _eval_ablated(zeroed_branches):
-        """Evaluate model with specified branches zeroed before fusion. Returns macro F1.
-
-        This bypasses model.forward() and manually computes branch outputs, fusion,
-        and pooling so that individual branches can be selectively zeroed.
-        """
-        model.eval()                                   # disable dropout for deterministic evaluation
-        all_true, all_pred = [], []                    # accumulate labels and predictions
-        with torch.no_grad():                          # no gradients needed
-            for x, y in loader:                        # iterate over partition batches
-                x = x.to(device)                       # transfer input to GPU
-                # For M4, branches are inside self.backbone; for M3, directly on model
-                bb = model.backbone if hasattr(model, "backbone") else model
-                o1 = bb.branch1(x)                     # (batch, num_filters, T) -- fine scale
-                o2 = bb.branch2(x)                     # (batch, num_filters, T) -- medium scale
-                o3 = bb.branch3(x)                     # (batch, num_filters, T) -- coarse scale
-                # Zero the specified branches to measure their contribution
-                if 1 in zeroed_branches:
-                    o1 = torch.zeros_like(o1)          # ablate fine-scale branch
-                if 2 in zeroed_branches:
-                    o2 = torch.zeros_like(o2)          # ablate medium-scale branch
-                if 3 in zeroed_branches:
-                    o3 = torch.zeros_like(o3)          # ablate coarse-scale branch
-                # Fuse branch outputs using the model's learned fusion strategy
-                if bb.fusion == "concat":              # concat + 1x1 Conv1d projection
-                    fused = torch.cat([o1, o2, o3], dim=1)  # (batch, 3*F, T)
-                    fused = bb.fusion_conv(fused)      # (batch, F, T)
-                else:                                  # element-wise average
-                    fused = (o1 + o2 + o3) / 3.0       # (batch, F, T)
-                # Pooling: temporal attention (M4) or global average pooling (M3)
-                if hasattr(model, "attention_fc"):     # M4 has attention layers on the model itself
-                    feat_t = fused.transpose(1, 2)     # (batch, T, F) for attention
-                    e = torch.tanh(model.attention_fc(feat_t))  # tanh energy scoring
-                    e = model.attention_v(e)           # scalar score per time step
-                    alpha = torch.softmax(e, dim=1)    # softmax over T
-                    context = (feat_t * alpha).sum(dim=1)  # attention-weighted sum
-                    context = model.attention_drop(context)  # dropout regularisation
-                    logits = model.classifier(context).squeeze(-1)  # binary logit
-                else:                                  # M3 uses global average pooling
-                    pooled = fused.mean(dim=-1)        # GAP over time
-                    logits = bb.classifier(pooled).squeeze(-1)  # binary logit
-                preds = (torch.sigmoid(logits) >= 0.5).long()  # binarise at threshold 0.5
-                all_true.extend(y.numpy())             # accumulate ground truth
-                all_pred.extend(preds.cpu().numpy())   # accumulate predictions
+        """Evaluate model with specified branches zeroed before fusion. Returns macro F1."""
+        model.eval()
+        all_true, all_pred = [], []
+        with torch.no_grad():
+            for x, y in loader:
+                x = x.to(device)
+                logits = forward_with_branch_mask(model, x, zeroed_branches)
+                preds = (torch.sigmoid(logits) >= 0.5).long()
+                all_true.extend(y.numpy())
+                all_pred.extend(preds.cpu().numpy())
         return f1_score(np.array(all_true), np.array(all_pred), average="macro", zero_division=0)
 
     # Single-branch ablation: zero one branch, keep the other two

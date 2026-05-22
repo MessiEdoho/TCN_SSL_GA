@@ -2880,5 +2880,188 @@ A.10 Receptive field
     seizure patterns that evolve over longer timescales.
 
 ================================================================================
+13. INTERPRETABILITY ANALYSIS -- PER-PREDICTION BRANCH ATTRIBUTION
+--------------------------------------------------------------------------------
+
+13.1 Motivation
+
+    The multi-scale architecture used in M3 and M4 (Section 6) contains
+    three parallel temporal-convolutional branches with distinct
+    dilation schedules: branch 1 [1, 2, 4] (fine), branch 2
+    [8, 16, 32] (medium), and branch 3 [32, 64, 128] (coarse). The
+    aggregate branch-ablation routine (interpretability_analysis.py,
+    run_branch_ablation) reports a single macro-F1 contribution per
+    branch over the entire partition. That measurement answers "which
+    branch matters most on average across the dataset" but cannot
+    answer "which temporal scale drove THIS prediction." The per-
+    prediction question is required to (i) differentiate the temporal
+    scale that triggered a true-positive seizure call from the scale
+    that misled a false-positive, and (ii) justify the multi-scale
+    design by demonstrating that different seizure morphologies
+    recruit different branches rather than depending uniformly on the
+    single most informative scale.
+
+13.2 Method -- exact Shapley value attribution over three branches
+
+    For each segment, the contribution of each branch to the model's
+    pre-sigmoid logit was attributed using the Shapley value (Shapley,
+    1953). A coalition v(S) was defined as the logit produced when only
+    the branches in subset S are active, with the remaining branches'
+    outputs zeroed before fusion. With K = 3 branches the power set
+    contains 2^K = 8 coalitions, so the Shapley value of each branch is
+    computed exactly per sample without any sampling approximation:
+
+        phi_k = sum over S subset of N\{k} of
+                [ |S|! (K - |S| - 1)! / K! ] * ( v(S U {k}) - v(S) )
+
+    By the efficiency axiom, phi_B1 + phi_B2 + phi_B3 equals
+    v({1,2,3}) - v(empty) for every sample. This identity is logged at
+    run time as a numerical sanity check; the maximum and mean absolute
+    residuals are recorded in the per-model JSON summary.
+
+13.3 Justification of Shapley over alternative attribution methods
+
+    Three branch-level attribution methods were considered: leave-one-
+    out (LOO) ablation, Shapley value attribution, and gradient-based
+    methods (Integrated Gradients, DeepLIFT). Shapley was selected for
+    the following reasons.
+
+    The M3 and M4 branches do not span disjoint frequency bands.
+    Branch 2 uses dilations [8, 16, 32] and branch 3 uses dilations
+    [32, 64, 128]. The shared dilation = 32 means the two branches
+    sense overlapping temporal scales, and the learned fusion layer
+    may carry redundant information across the pair. LOO measures only
+    the marginal effect of removing one branch with the other two
+    intact, which systematically under-attributes redundant branches:
+    zeroing one of a redundant pair produces only a small drop because
+    the other branch compensates. Shapley averages the marginal
+    contribution across all 2^K coalitions and therefore credits each
+    branch fairly when redundancy is present.
+
+    Integrated Gradients and DeepLIFT were designed for attribution to
+    input features. Applying them at the branch-output level requires
+    (i) selecting a reference activation (zero, mean ictal, mean non-
+    ictal -- each choice changes the attribution), and (ii) aggregating
+    element-wise gradients across the (num_filters, T) branch-output
+    tensor into a single per-branch number (sum, L1 norm, mean --
+    another arbitrary choice). Both are free parameters that weaken
+    the methodological defence.
+
+    Shapley over K = 3 branches is exactly computable in eight forward
+    passes per batch, has no free hyperparameters beyond the value
+    function (the model's logit), and satisfies the efficiency, dummy,
+    symmetry, and additivity axioms.
+
+    Reference:
+        Shapley, L. S. (1953). A Value for n-Person Games. In Kuhn,
+            H. W. & Tucker, A. W. (eds), Contributions to the Theory
+            of Games, Volume II, pp. 307-317. Princeton University
+            Press.
+
+13.4 Implementation
+
+    The Shapley computation is implemented in
+    branch_shapley_analysis.py. Two helpers were added to
+    interpretability_analysis.py:
+
+        compute_branch_outputs(model, x)
+            Runs the three branch TCN stacks once and returns
+            (o1, o2, o3) for re-use across multiple fusion masks.
+
+        forward_with_branch_mask(model, x, zeroed_branches,
+                                 branch_outputs=None)
+            Performs the M3 or M4 forward pass with the listed branches
+            zeroed before fusion. Accepts pre-computed branch outputs
+            so the branch convolutions are not repeated across the
+            eight coalitions.
+
+    The existing run_branch_ablation function was refactored to call
+    forward_with_branch_mask internally; its JSON output and aggregate
+    F1 semantics are preserved unchanged. branch_shapley_analysis.py
+    reuses the same model-loading (load_model_weights) and data-
+    loading (load_partition_data) utilities so that the per-prediction
+    attribution is computed on the same model state and the same data
+    ordering as the aggregate ablation.
+
+    Branch outputs are computed once per batch and reused across the
+    eight coalitions, so the wall-time cost is approximately 1.3 times
+    a standard test-set inference pass per model rather than eight
+    times. All forward passes run on GPU under torch.no_grad().
+
+13.5 Outputs
+
+    For each model (M3, M4) and each partition (val, test), the
+    script writes a streaming CSV with one row per segment and a JSON
+    summary of population-level aggregates:
+
+        outputs/interpretability/<partition>/branch_shapley/
+            <model>_shapley_<partition>.csv
+            <model>_shapley_<partition>_summary.json
+            logs/branch_shapley_<model>_<partition>.log
+
+    CSV columns:
+        segment_id          Sequential index in the partition loader.
+        mouse_id            Subject identifier parsed from filename.
+        label               "ictal" or "nonictal" parsed from filename.
+        seg_index           Per-subject segment index from filename.
+        file_basename       Stem of the .npy file.
+        y_true              Ground-truth label (0 / 1).
+        y_pred              Binary prediction at threshold 0.5.
+        p_seizure           sigmoid(logit_full).
+        logit_full          v({1,2,3}) -- full-model pre-sigmoid logit.
+        logit_empty         v(empty) -- logit with all branches zeroed
+                            (out-of-distribution baseline; reported for
+                            transparency, used only as the Shapley
+                            reference value).
+        phi_B1, phi_B2,     Shapley values of the fine, medium, and
+        phi_B3              coarse branches in logit units. Signed:
+                            positive means the branch pushed the logit
+                            toward the seizure class.
+        winner_branch_abs   argmax_k |phi_k| -- the most influential
+                            branch by magnitude.
+        dominance_abs       max_k |phi_k|.
+        category            TP, FP, TN, or FN at threshold 0.5.
+
+    The JSON summary aggregates by category (TP / FP / TN / FN) the
+    mean signed and absolute Shapley values per branch, the winner-
+    branch histogram, and the efficiency-axiom residuals as a
+    numerical sanity check.
+
+13.6 Decision threshold
+
+    The TP / FP / TN / FN categorisation uses threshold = 0.5 on
+    sigmoid(logit_full) to match the convention of the aggregate
+    branch-ablation reported by run_branch_ablation. The raw logit and
+    sigmoid probability are written to the CSV so the categorisation
+    can be recomputed at any other operating threshold without
+    re-running the inference pass.
+
+13.7 Caveat -- out-of-distribution coalition baseline
+
+    The empty coalition v(empty) is produced by zeroing all three
+    branch outputs before fusion. The fusion layer was trained on the
+    joint distribution of three non-zero branch outputs, so v(empty)
+    is an out-of-distribution input. Shapley values that quantify the
+    relative dominance of one branch over another within the same
+    sample (phi_Bi - phi_Bj) are unaffected, because v(empty) enters
+    all three phi_k with the same weight and cancels in the
+    difference. Absolute phi_k values, by contrast, depend on the
+    baseline and should be interpreted as the trained model's reliance
+    on each branch rather than as the architecture's necessity of each
+    branch. A retrained ablation (training three separate models, each
+    with one branch removed) would be required to make the latter
+    claim, and is outside the scope of this analysis.
+
+13.8 Partition policy
+
+    Per-prediction Shapley attribution is reported on the held-out
+    test partition (Section 2). Running on the validation partition is
+    supported but carries the same threshold-selection bias as any
+    other validation-set evaluation (Section 7); validation-partition
+    Shapley results are intended for pipeline verification, not for
+    publication. The script logs a warning when invoked with
+    --partition val.
+
+================================================================================
 END OF STUDY REPORT
 ================================================================================
