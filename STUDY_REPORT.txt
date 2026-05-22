@@ -2978,10 +2978,20 @@ A.10 Receptive field
     The existing run_branch_ablation function was refactored to call
     forward_with_branch_mask internally; its JSON output and aggregate
     F1 semantics are preserved unchanged. branch_shapley_analysis.py
-    reuses the same model-loading (load_model_weights) and data-
-    loading (load_partition_data) utilities so that the per-prediction
-    attribution is computed on the same model state and the same data
-    ordering as the aggregate ablation.
+    reuses the model-loading helper (load_model_weights) and reads the
+    canonical enriched splits manifest used by all training and
+    evaluation scripts:
+
+        /scratch/22206468/INPUT_DATA/data_splits_outputs/
+            data_splits_nonictal_sampled_filtered_enriched.json
+
+    Using this manifest -- rather than the raw data_splits.json
+    consumed by interpretability_analysis.py for the aggregate
+    ablation -- guarantees that the per-prediction attribution is
+    computed on exactly the same val / test segments as the headline
+    MultiScaleTCN_evaluation.py / MultiScaleTCNAttention_evaluation.py
+    results, and inherits the per-record fields mouse_id, chrono_idx,
+    and t_start_sec added by enrich_manifest.py.
 
     Branch outputs are computed once per batch and reused across the
     eight coalitions, so the wall-time cost is approximately 1.3 times
@@ -3001,9 +3011,15 @@ A.10 Receptive field
 
     CSV columns:
         segment_id          Sequential index in the partition loader.
-        mouse_id            Subject identifier parsed from filename.
-        label               "ictal" or "nonictal" parsed from filename.
-        seg_index           Per-subject segment index from filename.
+        mouse_id            Subject identifier from the enriched
+                            manifest record.
+        chrono_idx          True chronological position of the segment
+                            within the recording, from the per-mouse
+                            chronology file (enrich_manifest.py); -1
+                            if unmatched.
+        t_start_sec         Segment start time in seconds from
+                            recording start (enrich_manifest.py); -1.0
+                            if unmatched.
         file_basename       Stem of the .npy file.
         y_true              Ground-truth label (0 / 1).
         y_pred              Binary prediction at threshold 0.5.

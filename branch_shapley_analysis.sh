@@ -83,7 +83,9 @@ echo "Model argument     : ${MODEL}"
 #   outputs/MultiScaleTCNAttention/multiscale_tcn_attention_final_weights.pt (M4)
 #   outputs/best_multiscale_params.json
 #   outputs/best_multiscale_attn_params.json
-#   data_splits_outputs/data_splits.json (test_status must be "complete" for --partition test)
+#   /scratch/22206468/INPUT_DATA/data_splits_outputs/data_splits_nonictal_sampled_filtered_enriched.json
+#       (the canonical enriched manifest used by all training and evaluation
+#        scripts; overrideable via --splits-path)
 # Writes:
 #   outputs/interpretability/${PARTITION}/branch_shapley/
 #       {m3,m4}_shapley_${PARTITION}.csv

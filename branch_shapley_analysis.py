@@ -45,20 +45,18 @@ import csv
 import datetime
 import json
 import logging
-import re
 import sys
 from pathlib import Path
 
 import numpy as np
 import torch
 
-from tcn_utils import set_seed
+from tcn_utils import set_seed, make_loader
 from interpretability_analysis import (
     SEED,
     INTERP_BASE,
     M3_WEIGHTS,
     M4_WEIGHTS,
-    BEST_TCN_PATH,
     BEST_MS_PATH,
     BEST_MS_ATTN_PATH,
     DEFAULT_BRANCH1,
@@ -66,7 +64,6 @@ from interpretability_analysis import (
     DEFAULT_BRANCH3,
     M4_AVAILABLE,
     load_model_weights,
-    load_partition_data,
     compute_branch_outputs,
     forward_with_branch_mask,
 )
@@ -77,7 +74,16 @@ from interpretability_analysis import (
 # ---------------------------------------------------------------------------
 DECISION_THRESHOLD = 0.5     # raw-output threshold matching run_branch_ablation
 BATCH_SIZE = 32              # inherits the existing interpretability batch size
-FNAME_REGEX = re.compile(r"^(m\d+)_(ictal|nonictal)_(\d+)")
+
+# Canonical splits manifest used by all training and evaluation scripts
+# (TCN.py, TCNTemporalAttention.py, MultiScaleTCN.py, MultiScaleTCNAttention.py,
+# MultiScaleTCN_evaluation.py, MultiScaleTCNAttention_evaluation.py). The
+# enriched suffix indicates that each val/test record carries the
+# chronology fields {mouse_id, chrono_idx, t_start_sec} added by
+# enrich_manifest.py. Override with --splits-path if needed.
+DEFAULT_SPLITS_PATH = Path(
+    "/scratch/22206468/INPUT_DATA/data_splits_outputs/"
+    "data_splits_nonictal_sampled_filtered_enriched.json")
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +97,10 @@ def parse_args():
                              "test: paper reporting.")
     parser.add_argument("--model", choices=["M3", "M4", "all"], default="all",
                         help="Which multi-scale model to attribute (default: all).")
+    parser.add_argument("--splits-path", type=Path, default=DEFAULT_SPLITS_PATH,
+                        help="Path to the enriched splits manifest. Must match "
+                             "the manifest used by the training and evaluation "
+                             "scripts. Default: %(default)s")
     return parser.parse_args()
 
 
@@ -128,19 +138,54 @@ def setup_logging(interp_root, partition, model_name):
 
 
 # ---------------------------------------------------------------------------
-# parse_filepath_metadata
+# load_partition_records
 # ---------------------------------------------------------------------------
-def parse_filepath_metadata(filepath):
-    """Extract (mouse_id, label_str, seg_index, basename) from a segment .npy path.
+def load_partition_records(splits_path, partition, batch_size, device, logger):
+    """Load the enriched manifest and build a sequential DataLoader.
 
-    Filenames follow the preprocessing_binary*.py convention:
-        {mouse_id}_ictal_{index:05d}.npy   or   {mouse_id}_nonictal_{index:05d}.npy
+    Asserts that the manifest is the enriched variant (the canonical one used
+    by all training and evaluation scripts) by requiring (i) the path ends in
+    '_enriched.json' and (ii) the val/test records carry the 'chrono_idx' /
+    'mouse_id' / 't_start_sec' fields added by enrich_manifest.py.
+
+    Returns
+    -------
+    records : list of dict -- full enriched records (mouse_id, chrono_idx,
+              t_start_sec, filepath, label), aligned 1:1 with the loader.
+    loader  : DataLoader -- shuffle=False so order matches `records`.
     """
-    basename = Path(filepath).stem
-    m = FNAME_REGEX.match(basename)
-    if m is None:
-        return ("unknown", "unknown", -1, basename)
-    return (m.group(1), m.group(2), int(m.group(3)), basename)
+    if not str(splits_path).endswith("_enriched.json"):
+        logger.error("Splits path must end in '_enriched.json' "
+                     "(canonical manifest used by training and evaluation). "
+                     "Got: %s", splits_path)
+        sys.exit(1)
+    if not splits_path.exists():
+        logger.error("Splits manifest not found: %s", splits_path)
+        sys.exit(1)
+
+    with open(splits_path, "r", encoding="utf-8") as f:
+        splits = json.load(f)
+
+    records = list(splits.get(partition, []))
+    if not records:
+        logger.error("Partition '%s' is empty in %s", partition, splits_path)
+        sys.exit(1)
+    required = ("mouse_id", "chrono_idx", "t_start_sec", "filepath", "label")
+    missing = [k for k in required if k not in records[0]]
+    if missing:
+        logger.error("Enriched fields missing on first record (%s). "
+                     "Re-run enrich_manifest.py.", missing)
+        sys.exit(1)
+
+    pairs = [(r["filepath"], r["label"]) for r in records]
+    loader = make_loader(pairs, batch_size, False, device)
+    n_ictal = sum(1 for _, l in pairs if l == 1)
+    n_nonictal = len(pairs) - n_ictal
+    logger.info("Splits manifest: %s", splits_path)
+    logger.info("Partition: %s | Total: %d | Ictal: %d (%.2f%%) | Non-ictal: %d",
+                partition.upper(), len(pairs), n_ictal,
+                100.0 * n_ictal / len(pairs), n_nonictal)
+    return records, loader
 
 
 # ---------------------------------------------------------------------------
@@ -218,12 +263,16 @@ def categorise_prediction(y_true_i, y_pred_i):
 # ---------------------------------------------------------------------------
 # run_for_model
 # ---------------------------------------------------------------------------
-def run_for_model(model, model_name, pairs, loader, partition, out_dir,
+def run_for_model(model, model_name, records, loader, partition, out_dir,
                   device, logger):
     """Stream per-segment Shapley rows to CSV; return a population summary dict.
 
     Efficiency-axiom sanity check is logged: per sample,
         phi_B1 + phi_B2 + phi_B3 == logit_full - logit_empty (within fp32 tolerance).
+
+    `records` is the list of enriched manifest entries (one per segment, in
+    loader order) -- mouse_id / chrono_idx / t_start_sec are read from each
+    entry rather than parsed from the filename.
     """
     csv_path = out_dir / ("%s_shapley_%s.csv" % (model_name.lower(), partition))
     summary_path = out_dir / ("%s_shapley_%s_summary.json" % (model_name.lower(), partition))
@@ -243,8 +292,9 @@ def run_for_model(model, model_name, pairs, loader, partition, out_dir,
     with open(csv_path, "w", newline="", encoding="utf-8") as fcsv:
         writer = csv.writer(fcsv)
         writer.writerow([
-            "segment_id", "mouse_id", "label", "seg_index", "file_basename",
-            "y_true", "y_pred", "p_seizure", "logit_full", "logit_empty",
+            "segment_id", "mouse_id", "chrono_idx", "t_start_sec",
+            "file_basename", "y_true", "y_pred", "p_seizure",
+            "logit_full", "logit_empty",
             "phi_B1", "phi_B2", "phi_B3",
             "winner_branch_abs", "dominance_abs", "category",
         ])
@@ -264,15 +314,19 @@ def run_for_model(model, model_name, pairs, loader, partition, out_dir,
 
                 for j in range(x.shape[0]):
                     fp_idx = n_seen + j
-                    filepath, _label = pairs[fp_idx]
-                    mouse_id, label_str, seg_idx, basename = parse_filepath_metadata(filepath)
+                    rec = records[fp_idx]
+                    basename = Path(rec["filepath"]).stem
                     cat = categorise_prediction(int(y_true[j]), int(y_pred[j]))
                     counts[cat] += 1
                     abs_sum[cat] += abs_phis[j]
                     signed_sum[cat] += phis[j]
                     winner_counts[cat]["B%d" % (winners[j] + 1)] += 1
                     writer.writerow([
-                        fp_idx, mouse_id, label_str, seg_idx, basename,
+                        fp_idx,
+                        rec["mouse_id"],
+                        int(rec["chrono_idx"]),
+                        "%.4f" % float(rec["t_start_sec"]),
+                        basename,
                         int(y_true[j]), int(y_pred[j]),
                         "%.6f" % float(p[j]),
                         "%.6f" % float(out["logit_full"][j]),
@@ -286,10 +340,10 @@ def run_for_model(model, model_name, pairs, loader, partition, out_dir,
                     ])
                 n_seen += x.shape[0]
                 if n_seen % (BATCH_SIZE * 500) == 0:
-                    logger.info("  ...processed %d / %d segments", n_seen, len(pairs))
+                    logger.info("  ...processed %d / %d segments", n_seen, len(records))
 
-    if n_seen != len(pairs):
-        logger.error("Sample count mismatch: processed %d, expected %d.", n_seen, len(pairs))
+    if n_seen != len(records):
+        logger.error("Sample count mismatch: processed %d, expected %d.", n_seen, len(records))
     logger.info("Wrote %d rows -> %s", n_seen, csv_path)
 
     residuals = np.asarray(efficiency_residuals, dtype=np.float64)
@@ -360,10 +414,6 @@ def main():
         top_logger.info("Device: CPU (Shapley analysis will be slow)")
     top_logger.info("PyTorch: %s", torch.__version__)
 
-    # Hyperparameters (mirror interpretability_analysis.main()).
-    with open(BEST_TCN_PATH, "r", encoding="utf-8") as f:
-        _ = json.load(f)["hyperparameters"]  # not used directly, but kept for parity
-
     ms_hp = None
     branch_dilations = {"branch1": DEFAULT_BRANCH1,
                         "branch2": DEFAULT_BRANCH2,
@@ -384,11 +434,11 @@ def main():
             ms_attn_hp = json.load(f)["hyperparameters"]
         top_logger.info("Loaded multiscale attention HP from %s", BEST_MS_ATTN_PATH)
 
-    # Shared data load (so the test set is read once for both models).
-    pairs, loader, _y_true, _x_all, n_ictal, n_nonictal = load_partition_data(
-        partition, batch_size=BATCH_SIZE, device=device, logger=top_logger)
-    top_logger.info("Loaded %s partition: %d segments (%d ictal, %d non-ictal)",
-                    partition, len(pairs), n_ictal, n_nonictal)
+    # Shared data load from the enriched manifest (canonical across the
+    # training and evaluation pipeline). Read once and reused across models.
+    records, loader = load_partition_records(
+        args.splits_path, partition, batch_size=BATCH_SIZE,
+        device=device, logger=top_logger)
 
     summaries = {}
     for mname in requested:
@@ -400,7 +450,7 @@ def main():
             model = load_model_weights("M3", M3_WEIGHTS, ms_hp, device, mlogger,
                                        branch_dilations=branch_dilations)
             summaries["M3"] = run_for_model(
-                model, "M3", pairs, loader, partition, m_out_dir, device, mlogger)
+                model, "M3", records, loader, partition, m_out_dir, device, mlogger)
             del model
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -419,7 +469,7 @@ def main():
                                        attn_hp=ms_attn_hp,
                                        branch_dilations=branch_dilations)
             summaries["M4"] = run_for_model(
-                model, "M4", pairs, loader, partition, m_out_dir, device, mlogger)
+                model, "M4", records, loader, partition, m_out_dir, device, mlogger)
             del model
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
