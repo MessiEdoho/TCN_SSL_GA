@@ -20,12 +20,20 @@ call, and which scale drove THIS false alarm?" The output is a streaming CSV
 with one row per segment, suitable for downstream stratification by TP / FP /
 TN / FN or by mouse.
 
-Outputs
--------
-outputs/interpretability/<partition>/branch_shapley/
-    <model>_shapley_<partition>.csv      streaming per-segment CSV
-    <model>_shapley_<partition>_summary.json  population-level aggregates
-    logs/branch_shapley_<model>_<partition>.log  FileHandler log
+Outputs (under the canonical per-model OUTPUT_ROOTs used by the training
+and evaluation scripts)
+------------------------------------------------------------------------
+/home/people/22206468/scratch/OUTPUT/MODEL3_OUTPUT/MultiScaleTCN/
+    interpret_branch_ablation/<partition>/
+        m3_shapley_<partition>.csv               streaming per-segment CSV
+        m3_shapley_<partition>_summary.json      population-level aggregates
+        logs/branch_shapley_m3_<partition>.log   FileHandler log
+
+/home/people/22206468/scratch/OUTPUT/MODEL4_OUTPUT/MultiScaleTCNAttention/
+    interpret_branch_ablation/<partition>/
+        m4_shapley_<partition>.csv
+        m4_shapley_<partition>_summary.json
+        logs/branch_shapley_m4_<partition>.log
 
 Usage
 -----
@@ -35,9 +43,9 @@ python branch_shapley_analysis.py --partition test --model all
 
 Prerequisites
 -------------
-Trained weights at the paths inherited from interpretability_analysis.py:
-    outputs/MultiScaleTCN/multiscale_tcn_final_weights.pt           (M3)
-    outputs/MultiScaleTCNAttention/multiscale_tcn_attention_final_weights.pt  (M4)
+Trained weights at the canonical per-model OUTPUT_ROOTs:
+    MODEL3_OUTPUT/MultiScaleTCN/multiscale_tcn_final_weights.pt           (M3)
+    MODEL4_OUTPUT/MultiScaleTCNAttention/ms_attn_final_weights.pt          (M4)
 """
 
 import argparse
@@ -54,9 +62,6 @@ import torch
 from tcn_utils import set_seed, make_loader
 from interpretability_analysis import (
     SEED,
-    INTERP_BASE,
-    M3_WEIGHTS,
-    M4_WEIGHTS,
     BEST_MS_PATH,
     BEST_MS_ATTN_PATH,
     DEFAULT_BRANCH1,
@@ -85,6 +90,25 @@ DEFAULT_SPLITS_PATH = Path(
     "/scratch/22206468/INPUT_DATA/data_splits_outputs/"
     "data_splits_nonictal_sampled_filtered_enriched.json")
 
+# Per-model OUTPUT_ROOT and trained-weights paths. These mirror the constants
+# used by the training scripts (MultiScaleTCN.py, MultiScaleTCNAttention.py)
+# and the evaluation scripts (MultiScaleTCN_evaluation.py,
+# MultiScaleTCNAttention_evaluation.py), so artefacts produced here land in
+# the same per-model hierarchy on the cluster.
+CLUSTER_OUTPUT = Path("/home/people/22206468/scratch/OUTPUT")
+OUTPUT_ROOTS = {
+    "M3": CLUSTER_OUTPUT / "MODEL3_OUTPUT" / "MultiScaleTCN",
+    "M4": CLUSTER_OUTPUT / "MODEL4_OUTPUT" / "MultiScaleTCNAttention",
+}
+WEIGHTS_PATHS = {
+    "M3": OUTPUT_ROOTS["M3"] / "multiscale_tcn_final_weights.pt",
+    "M4": OUTPUT_ROOTS["M4"] / "ms_attn_final_weights.pt",
+}
+# Subdirectory under each model's OUTPUT_ROOT for branch-ablation /
+# Shapley artefacts. Partition (val|test) is appended as a sibling
+# subdirectory so val and test artefacts are never mixed.
+BRANCH_ABLATION_SUBDIR = "interpret_branch_ablation"
+
 
 # ---------------------------------------------------------------------------
 # parse_args
@@ -107,8 +131,17 @@ def parse_args():
 # ---------------------------------------------------------------------------
 # setup_logging
 # ---------------------------------------------------------------------------
-def setup_logging(interp_root, partition, model_name):
-    out_dir = interp_root / "branch_shapley"
+def setup_logging(model_name, partition):
+    """Create the per-model output directory under the model's OUTPUT_ROOT and
+    configure a logger that writes to a FileHandler inside it.
+
+    Layout:
+        {OUTPUT_ROOTS[model_name]}/{BRANCH_ABLATION_SUBDIR}/{partition}/
+            logs/branch_shapley_{model}_{partition}.log
+            {model}_shapley_{partition}.csv
+            {model}_shapley_{partition}_summary.json
+    """
+    out_dir = OUTPUT_ROOTS[model_name] / BRANCH_ABLATION_SUBDIR / partition
     log_dir = out_dir / "logs"
     out_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -129,7 +162,8 @@ def setup_logging(interp_root, partition, model_name):
     logger.info("branch_shapley_analysis.py -- %s / partition: %s",
                 model_name, partition.upper())
     logger.info("Timestamp: %s", datetime.datetime.now().isoformat())
-    logger.info("Log file:  %s", log_file)
+    logger.info("Output dir: %s", out_dir)
+    logger.info("Log file:   %s", log_file)
     if partition == "val":
         logger.warning("PARTITION: VALIDATION -- carries threshold-selection bias. "
                        "Use --partition test for paper-quality attributions.")
@@ -381,103 +415,121 @@ def run_for_model(model, model_name, records, loader, partition, out_dir,
 
 
 # ---------------------------------------------------------------------------
+# log_gpu_diagnostics
+# ---------------------------------------------------------------------------
+def log_gpu_diagnostics(logger):
+    if torch.cuda.is_available():
+        logger.info("GPU  : %s", torch.cuda.get_device_name(0))
+        logger.info("VRAM : %.2f GB", torch.cuda.get_device_properties(0).total_memory / 1e9)
+        logger.info("CUDA : %s", torch.version.cuda)
+        try:
+            _free_bytes, _total_bytes = torch.cuda.mem_get_info(0)
+            _free_gb = _free_bytes / 1e9
+            _total_gb = _total_bytes / 1e9
+            logger.info("GPU memory free: %.2f / %.2f GB", _free_gb, _total_gb)
+            if _free_gb < 8.0:
+                logger.warning("GPU has only %.2f GB free (< 8 GB threshold). "
+                               "Another process may be sharing this GPU, or VRAM "
+                               "is fragmented. Inference may fail with CUDA OOM.",
+                               _free_gb)
+        except Exception as _e:
+            logger.warning("Could not query GPU memory: %s", _e)
+    else:
+        logger.info("Device: CPU (Shapley analysis will be slow)")
+    logger.info("PyTorch: %s", torch.__version__)
+
+
+# ---------------------------------------------------------------------------
+# load_hps
+# ---------------------------------------------------------------------------
+def load_hps(model_name, logger):
+    """Load the hyperparameter JSONs needed to instantiate `model_name`.
+
+    Returns (ms_hp, ms_attn_hp_or_None, branch_dilations). For M3, ms_attn_hp
+    is always None. For M4, ms_attn_hp must be present or the caller should
+    skip M4.
+    """
+    branch_dilations = {"branch1": DEFAULT_BRANCH1,
+                        "branch2": DEFAULT_BRANCH2,
+                        "branch3": DEFAULT_BRANCH3}
+    if not BEST_MS_PATH.exists():
+        logger.error("best_multiscale_params.json missing: %s", BEST_MS_PATH)
+        sys.exit(1)
+    with open(BEST_MS_PATH, "r", encoding="utf-8") as f:
+        ms_cfg = json.load(f)
+    ms_hp = ms_cfg["hyperparameters"]
+    branch_dilations = ms_cfg.get("branch_dilations", branch_dilations)
+    logger.info("Loaded multiscale HP from %s", BEST_MS_PATH)
+
+    ms_attn_hp = None
+    if model_name == "M4":
+        if not BEST_MS_ATTN_PATH.exists():
+            logger.error("best_multiscale_attn_params.json missing: %s. "
+                         "Cannot instantiate M4.", BEST_MS_ATTN_PATH)
+            return ms_hp, None, branch_dilations
+        with open(BEST_MS_ATTN_PATH, "r", encoding="utf-8") as f:
+            ms_attn_hp = json.load(f)["hyperparameters"]
+        logger.info("Loaded multiscale attention HP from %s", BEST_MS_ATTN_PATH)
+    return ms_hp, ms_attn_hp, branch_dilations
+
+
+# ---------------------------------------------------------------------------
+# run_session -- one complete model session: log -> data -> model -> shapley
+# ---------------------------------------------------------------------------
+def run_session(model_name, partition, splits_path, device):
+    """Self-contained session for a single model. Each session writes its
+    own complete log to {OUTPUT_ROOT}/interpret_branch_ablation/{partition}/logs/.
+    """
+    if model_name not in OUTPUT_ROOTS:
+        raise ValueError("Unknown model: %s" % model_name)
+    logger, out_dir = setup_logging(model_name, partition)
+    log_gpu_diagnostics(logger)
+
+    # Hyperparameters
+    ms_hp, ms_attn_hp, branch_dilations = load_hps(model_name, logger)
+    if model_name == "M4" and ms_attn_hp is None:
+        logger.error("Skipping M4 (attention HPs unavailable).")
+        return None
+    if model_name == "M4" and not M4_AVAILABLE:
+        logger.error("MultiScaleTCNWithAttention class unavailable. Skipping M4.")
+        return None
+
+    weights_path = WEIGHTS_PATHS[model_name]
+    if not weights_path.exists():
+        logger.error("%s weights not found: %s. Skipping.", model_name, weights_path)
+        return None
+
+    # Data (read once per session; the per-session cost is just JSON parse
+    # plus DataLoader setup, no segment-file reads).
+    records, loader = load_partition_records(
+        splits_path, partition, batch_size=BATCH_SIZE, device=device, logger=logger)
+
+    # Model
+    model = load_model_weights(model_name, weights_path, ms_hp, device, logger,
+                               attn_hp=ms_attn_hp,
+                               branch_dilations=branch_dilations)
+
+    summary = run_for_model(
+        model, model_name, records, loader, partition, out_dir, device, logger)
+    del model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return summary
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 def main():
     args = parse_args()
     partition = args.partition
-    interp_root = INTERP_BASE / partition
-
     requested = ["M3", "M4"] if args.model == "all" else [args.model]
+
     set_seed(SEED)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Set up a top-level logger for the data-loading phase shared across models.
-    top_logger, out_dir = setup_logging(interp_root, partition, "shared")
-    if torch.cuda.is_available():
-        top_logger.info("GPU  : %s", torch.cuda.get_device_name(0))
-        top_logger.info("VRAM : %.2f GB", torch.cuda.get_device_properties(0).total_memory / 1e9)
-        top_logger.info("CUDA : %s", torch.version.cuda)
-        try:
-            _free_bytes, _total_bytes = torch.cuda.mem_get_info(0)
-            _free_gb = _free_bytes / 1e9
-            _total_gb = _total_bytes / 1e9
-            top_logger.info("GPU memory free: %.2f / %.2f GB", _free_gb, _total_gb)
-            if _free_gb < 8.0:
-                top_logger.warning("GPU has only %.2f GB free (< 8 GB threshold). "
-                                   "Another process may be sharing this GPU, or VRAM "
-                                   "is fragmented. Inference may fail with CUDA OOM.",
-                                   _free_gb)
-        except Exception as _e:
-            top_logger.warning("Could not query GPU memory: %s", _e)
-    else:
-        top_logger.info("Device: CPU (Shapley analysis will be slow)")
-    top_logger.info("PyTorch: %s", torch.__version__)
-
-    ms_hp = None
-    branch_dilations = {"branch1": DEFAULT_BRANCH1,
-                        "branch2": DEFAULT_BRANCH2,
-                        "branch3": DEFAULT_BRANCH3}
-    if BEST_MS_PATH.exists():
-        with open(BEST_MS_PATH, "r", encoding="utf-8") as f:
-            ms_cfg = json.load(f)
-        ms_hp = ms_cfg["hyperparameters"]
-        branch_dilations = ms_cfg.get("branch_dilations", branch_dilations)
-        top_logger.info("Loaded multiscale HP from %s", BEST_MS_PATH)
-    else:
-        top_logger.error("best_multiscale_params.json missing: %s", BEST_MS_PATH)
-        sys.exit(1)
-
-    ms_attn_hp = None
-    if BEST_MS_ATTN_PATH.exists():
-        with open(BEST_MS_ATTN_PATH, "r", encoding="utf-8") as f:
-            ms_attn_hp = json.load(f)["hyperparameters"]
-        top_logger.info("Loaded multiscale attention HP from %s", BEST_MS_ATTN_PATH)
-
-    # Shared data load from the enriched manifest (canonical across the
-    # training and evaluation pipeline). Read once and reused across models.
-    records, loader = load_partition_records(
-        args.splits_path, partition, batch_size=BATCH_SIZE,
-        device=device, logger=top_logger)
-
-    summaries = {}
     for mname in requested:
-        if mname == "M3":
-            if not M3_WEIGHTS.exists():
-                top_logger.error("M3 weights not found: %s. Skipping.", M3_WEIGHTS)
-                continue
-            mlogger, m_out_dir = setup_logging(interp_root, partition, "M3")
-            model = load_model_weights("M3", M3_WEIGHTS, ms_hp, device, mlogger,
-                                       branch_dilations=branch_dilations)
-            summaries["M3"] = run_for_model(
-                model, "M3", records, loader, partition, m_out_dir, device, mlogger)
-            del model
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        elif mname == "M4":
-            if not M4_AVAILABLE:
-                top_logger.error("MultiScaleTCNWithAttention class unavailable. Skipping M4.")
-                continue
-            if not M4_WEIGHTS.exists():
-                top_logger.error("M4 weights not found: %s. Skipping.", M4_WEIGHTS)
-                continue
-            if ms_attn_hp is None:
-                top_logger.error("best_multiscale_attn_params.json missing. Skipping M4.")
-                continue
-            mlogger, m_out_dir = setup_logging(interp_root, partition, "M4")
-            model = load_model_weights("M4", M4_WEIGHTS, ms_hp, device, mlogger,
-                                       attn_hp=ms_attn_hp,
-                                       branch_dilations=branch_dilations)
-            summaries["M4"] = run_for_model(
-                model, "M4", records, loader, partition, m_out_dir, device, mlogger)
-            del model
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-    top_logger.info("=" * 70)
-    top_logger.info("Branch Shapley analysis complete.")
-    top_logger.info("Models processed: %s", list(summaries.keys()))
-    top_logger.info("Outputs under: %s", out_dir)
+        run_session(mname, partition, args.splits_path, device)
 
 
 if __name__ == "__main__":

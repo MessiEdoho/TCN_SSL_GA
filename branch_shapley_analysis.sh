@@ -79,18 +79,22 @@ echo "Partition argument : ${PARTITION}"
 echo "Model argument     : ${MODEL}"
 
 # Reads:
-#   outputs/MultiScaleTCN/multiscale_tcn_final_weights.pt           (M3)
-#   outputs/MultiScaleTCNAttention/multiscale_tcn_attention_final_weights.pt (M4)
-#   outputs/best_multiscale_params.json
-#   outputs/best_multiscale_attn_params.json
+#   /home/people/22206468/scratch/OUTPUT/MODEL3_OUTPUT/MultiScaleTCN/multiscale_tcn_final_weights.pt   (M3)
+#   /home/people/22206468/scratch/OUTPUT/MODEL4_OUTPUT/MultiScaleTCNAttention/ms_attn_final_weights.pt  (M4)
+#   /home/people/22206468/scratch/OUTPUT/MODEL3_OUTPUT/MultiScaleTCNtuning_outputs/best_multiscale_params.json
+#   /home/people/22206468/scratch/OUTPUT/MODEL4_OUTPUT/multiscale_attention_tuning_outputs/best_multiscale_attn_params.json
 #   /scratch/22206468/INPUT_DATA/data_splits_outputs/data_splits_nonictal_sampled_filtered_enriched.json
 #       (the canonical enriched manifest used by all training and evaluation
 #        scripts; overrideable via --splits-path)
-# Writes:
-#   outputs/interpretability/${PARTITION}/branch_shapley/
-#       {m3,m4}_shapley_${PARTITION}.csv
-#       {m3,m4}_shapley_${PARTITION}_summary.json
-#       logs/branch_shapley_{m3,m4}_${PARTITION}.log
+# Writes (under the canonical per-model OUTPUT_ROOTs):
+#   /home/people/22206468/scratch/OUTPUT/MODEL3_OUTPUT/MultiScaleTCN/interpret_branch_ablation/${PARTITION}/
+#       m3_shapley_${PARTITION}.csv
+#       m3_shapley_${PARTITION}_summary.json
+#       logs/branch_shapley_m3_${PARTITION}.log
+#   /home/people/22206468/scratch/OUTPUT/MODEL4_OUTPUT/MultiScaleTCNAttention/interpret_branch_ablation/${PARTITION}/
+#       m4_shapley_${PARTITION}.csv
+#       m4_shapley_${PARTITION}_summary.json
+#       logs/branch_shapley_m4_${PARTITION}.log
 python branch_shapley_analysis.py --partition "${PARTITION}" --model "${MODEL}"
 
 echo "===== JOB END ====="

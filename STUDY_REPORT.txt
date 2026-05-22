@@ -3002,12 +3002,28 @@ A.10 Receptive field
 
     For each model (M3, M4) and each partition (val, test), the
     script writes a streaming CSV with one row per segment and a JSON
-    summary of population-level aggregates:
+    summary of population-level aggregates. Outputs land under the
+    canonical per-model OUTPUT_ROOTs that hold all training- and
+    evaluation-script artefacts for that model:
 
-        outputs/interpretability/<partition>/branch_shapley/
-            <model>_shapley_<partition>.csv
-            <model>_shapley_<partition>_summary.json
-            logs/branch_shapley_<model>_<partition>.log
+        /home/people/22206468/scratch/OUTPUT/MODEL3_OUTPUT/MultiScaleTCN/
+            interpret_branch_ablation/<partition>/
+                m3_shapley_<partition>.csv
+                m3_shapley_<partition>_summary.json
+                logs/branch_shapley_m3_<partition>.log
+
+        /home/people/22206468/scratch/OUTPUT/MODEL4_OUTPUT/MultiScaleTCNAttention/
+            interpret_branch_ablation/<partition>/
+                m4_shapley_<partition>.csv
+                m4_shapley_<partition>_summary.json
+                logs/branch_shapley_m4_<partition>.log
+
+    The partition (val | test) appears as a sibling subdirectory
+    inside interpret_branch_ablation/ so that val and test artefacts
+    are never mixed in the same folder, matching the project's
+    val/test separation rule. Branch-attribution analysis is not run
+    for M1 or M2 because those architectures do not contain parallel
+    branches.
 
     CSV columns:
         segment_id          Sequential index in the partition loader.
