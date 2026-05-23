@@ -80,11 +80,13 @@ from sklearn.metrics import f1_score
 from MultiScaleTCN import (
     SEED, MODEL_NAME, OUTPUT_ROOT,
     WEIGHTS_PATH,
-    SEGMENT_LEN, SEGMENT_SEC, FS,
+    SEGMENT_LEN, SEGMENT_SEC, FS, STEP_SEC,
     MIN_EVENT_SEC, REFRACTORY_SEC, SMOOTHING_WIN,
+    MOUSE_METADATA_PATH, ANNOT_DIR,
     load_splits, load_best_params, build_model,
     run_postprocessing_evaluations, save_all_results, plot_all_figures,
 )
+from eval_utils import evaluate_event_level, write_event_level_bundle
 from tcn_utils import (
     set_seed, count_parameters, EEGSegmentDataset,
     make_classreport_barplot,
@@ -624,6 +626,41 @@ def main():
         row1_metrics, row2_metrics,
         RESULT_CLASSREPORT_DIR / "multiscale_tcn_classreport_barplot.png",
         title_prefix="Multi-Scale TCN", logger=logger)
+
+    # -- Step 10: Canonical 4-file event-level bundle ----------------------
+    # val_summary.json, val_event_details.csv,
+    # val_classification_report_row{1,2}.json under POST_EVAL_DIR --
+    # same schema as the M3 training script's val_ bundle and as the
+    # postproc_sweep cells. Runs per-mouse-chronological evaluation
+    # (eval_utils.evaluate_event_level) on the cached predictions, so it
+    # produces the per-mouse breakdown + matched-event details with
+    # datetimes + detection latency that the older Step 7 path lacks.
+    logger.info("-" * 65)
+    logger.info("Step 10: Canonical event-level 4-file bundle (per-mouse "
+                "evaluation against ground-truth annotations)")
+    try:
+        _train_pairs, _val_pairs, val_records = load_splits(logger)
+        if not MOUSE_METADATA_PATH.exists():
+            raise FileNotFoundError(str(MOUSE_METADATA_PATH))
+        mouse_metadata = json.loads(MOUSE_METADATA_PATH.read_text(encoding="utf-8"))
+        val_eval_result = evaluate_event_level(
+            val_records, y_true, y_prob, ANNOT_DIR, mouse_metadata, logger,
+            order="min_then_refractory")
+        write_event_level_bundle(
+            POST_EVAL_DIR, "val", "M3 (MultiScaleTCN)",
+            val_eval_result, logger,
+            order="min_then_refractory",
+            min_event_duration_sec=MIN_EVENT_SEC,
+            refractory_period_sec=REFRACTORY_SEC,
+            smoothing_window=SMOOTHING_WIN,
+            threshold=0.5,
+            step_sec=STEP_SEC,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Canonical 4-file bundle emission skipped (%s). Segment-level "
+            "outputs (Step 8) and Result_classReport bar plot (Step 9) "
+            "remain valid.", exc)
 
     # -- Final summary ------------------------------------------------------
     logger.info("=" * 65)

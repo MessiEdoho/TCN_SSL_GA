@@ -2400,8 +2400,10 @@ configurations.
     Checkpoint selection     Best validation macro F1
     Seed                     42 (all RNG streams)
     cuDNN determinism        deterministic = True, benchmark = False
-    Post-processing          3-stage: smoothing (W=3) -> merging
-                             (30 s refractory) -> min duration (10 s)
+    Post-processing          3-stage: smoothing (W=3) -> min duration
+                             (25 s) -> merging (30 s refractory).
+                             min-then-refractory order locked by the
+                             Pareto-knee sweep on val (Section 7.6.10).
     Threshold selection      Macro F1 on validation set (see Section 7.6.10
                              for rationale: Youden's J was the original
                              choice but produced degenerate operating points

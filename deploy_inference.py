@@ -59,6 +59,7 @@ from scipy.stats import median_abs_deviation
 import tcn_utils
 from eval_utils import (
     detect_events_in_chunk,
+    emit_deploy_event_bundle,
     AMPLITUDE_THRESHOLD,
     FS, WIN_LEN, STEP, STEP_SEC,
     THRESHOLD, SMOOTHING_WIN, REFRACTORY_SEC, MIN_EVENT_SEC,
@@ -393,34 +394,34 @@ def main():
         evt["start_datetime"] = (rec_start + datetime.timedelta(seconds=evt["start_sec"])).isoformat()
         evt["end_datetime"]   = (rec_start + datetime.timedelta(seconds=evt["end_sec"])).isoformat()
 
-    # -- Write outputs -------------------------------------------------------
-    metadata = {
-        "edf_path":           str(args.edf),
-        "variant":            args.variant,
-        "weights_path":       str(args.weights),
-        "n_samples":          n_samples,
-        "fs_hz":              fs,
-        "recording_start_dt": rec_start.isoformat(),
-        "recording_duration_hours": round(n_samples / fs / 3600.0, 4),
-        "n_segments":         int(len(y_prob)),
-        "n_segments_sanitised": int(n_sanitised),
-        "n_detected_events":  int(len(events)),
-        "inference_seconds":  round(float(eval_seconds), 1),
-        "post_processing": {
-            "threshold":              THRESHOLD,
-            "smoothing_window":       SMOOTHING_WIN,
-            "refractory_period_sec":  REFRACTORY_SEC,
-            "min_event_duration_sec": MIN_EVENT_SEC,
-            "step_sec":               STEP_SEC,
-        },
-        "timestamp":          datetime.datetime.now().isoformat(),
+    # -- Write outputs (canonical 2-file deploy bundle) ----------------------
+    # Use the shared writer in eval_utils so the deploy event_details CSV
+    # uses the exact same 17-column schema as training / evaluation /
+    # recovery / sweep outputs (GT-related cells left empty in deploy).
+    recording_metadata = {
+        "edf_path":                 str(args.edf),
+        "recording_start_datetime": rec_start.isoformat(),
+        "recording_duration_sec":   round(n_samples / fs, 4),
+        "n_samples":                int(n_samples),
+        "fs_hz":                    float(fs),
+        "n_segments":               int(len(y_prob)),
+        "n_segments_sanitised":     int(n_sanitised),
+        "inference_seconds":        round(float(eval_seconds), 1),
+        "variant":                  args.variant,
+        "weights_path":             str(args.weights),
     }
-    events_csv_path  = args.output_dir / "events.csv"
-    events_json_path = args.output_dir / "events.json"
-    write_events_csv(events_csv_path, events)
-    write_events_json(events_json_path, events, metadata)
-    logger.info("Saved events: %s (%d rows) + %s",
-                events_csv_path, len(events), events_json_path)
+    emit_deploy_event_bundle(
+        args.output_dir, mouse_id, events,
+        recording_metadata=recording_metadata,
+        model_label=args.variant,
+        logger=logger,
+        order="min_then_refractory",
+        min_event_duration_sec=MIN_EVENT_SEC,
+        refractory_period_sec=REFRACTORY_SEC,
+        smoothing_window=SMOOTHING_WIN,
+        threshold=THRESHOLD,
+        step_sec=STEP_SEC,
+    )
 
     # Cache predictions NPZ for downstream re-analysis
     npz_path = args.output_dir / "predictions.npz"

@@ -68,7 +68,8 @@ import numpy as np
 
 import eval_utils
 from eval_utils import (
-    evaluate_event_level, build_classification_report,
+    evaluate_event_level,
+    write_event_level_bundle,
 )
 
 
@@ -342,60 +343,13 @@ def load_records_and_arrays(npz_path, manifest_path, partition, annot_dir,
     return y_true_kept, y_prob_kept, records
 
 
-def write_summary_json(out_path, model_label, partition, sec, order,
-                       result, logger):
-    payload = {
-        "model":     model_label,
-        "partition": partition,
-        "timestamp": datetime.datetime.now().isoformat(),
-        "post_processing_params": {
-            "order":                  order,
-            "smoothing_window":       eval_utils.SMOOTHING_WIN,
-            "refractory_period_sec":  eval_utils.REFRACTORY_SEC,
-            "min_event_duration_sec": sec,
-            "threshold":              eval_utils.THRESHOLD,
-            "step_sec":               eval_utils.STEP_SEC,
-            "matching_rule":          "any-overlap",
-        },
-        "totals":                result["totals"],
-        "segment_level_metrics": result["segment_level_metrics"],
-        "event_level_metrics":   result["event_level_metrics"],
-        "per_mouse":             result["per_mouse_results"],
-    }
-    out_path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str),
-                        encoding="utf-8")
-    logger.info("      summary -> %s", out_path)
-
-
-def write_event_details_csv(out_path, partition, result, logger):
-    fieldnames = ["mouse_id", "partition", "is_true_alarm", "start_sec", "end_sec",
-                  "duration_sec", "max_prob", "matched_gt_idx",
-                  "matched_gt_start_sec", "matched_gt_end_sec"]
-    with open(out_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in result["all_event_details"]:
-            r = dict(row)
-            r["partition"] = partition
-            writer.writerow(r)
-    logger.info("      event details -> %s (%d rows)",
-                out_path, len(result["all_event_details"]))
-
-
-def write_classification_reports(out_dir, partition, result, logger):
-    seg = result["segment_level_metrics"]
-    reord = result["reordered_arrays"]
-    y_true = reord["y_true"]
-    r1 = build_classification_report(y_true, reord["y_pred_row1"],
-                                     seg["row1_raw_threshold_0_5"])
-    r2 = build_classification_report(y_true, reord["y_pred_row2"],
-                                     seg["row2_postproc_threshold_0_5"])
-    p1 = out_dir / f"{partition}_classification_report_row1.json"
-    p2 = out_dir / f"{partition}_classification_report_row2.json"
-    p1.write_text(json.dumps(r1, indent=2, sort_keys=True, default=str), encoding="utf-8")
-    p2.write_text(json.dumps(r2, indent=2, sort_keys=True, default=str), encoding="utf-8")
-    logger.info("      row1 report -> %s", p1)
-    logger.info("      row2 report -> %s", p2)
+# Inline writers retired -- the four-file bundle (summary.json,
+# event_details.csv, classification_report_row{1,2}.json) is now emitted
+# by eval_utils.write_event_level_bundle, the single source of truth used
+# by postproc_sweep, recover_event_metrics, m4_event_metrics_recovery,
+# the four training scripts, the two _evaluation scripts, and
+# m3_post_eval. See eval_utils.py for the canonical 17-column
+# event_details schema + summary.json shape.
 
 
 def write_comparison_csv(out_path, rows, logger):
@@ -541,12 +495,15 @@ def sweep_partition(partition, npz_path, manifest_path, annot_dir,
             out_dir = output_root / partition / order / f"MIN_EVENT_SEC_{sec}s"
             out_dir.mkdir(parents=True, exist_ok=True)
 
-            write_summary_json(out_dir / f"{partition}_summary.json",
-                               model_label, partition, sec, order,
-                               result, logger)
-            write_event_details_csv(out_dir / f"{partition}_event_details.csv",
-                                    partition, result, logger)
-            write_classification_reports(out_dir, partition, result, logger)
+            write_event_level_bundle(
+                out_dir, partition, model_label, result, logger,
+                order=order,
+                min_event_duration_sec=float(sec),
+                refractory_period_sec=eval_utils.REFRACTORY_SEC,
+                smoothing_window=eval_utils.SMOOTHING_WIN,
+                threshold=eval_utils.THRESHOLD,
+                step_sec=eval_utils.STEP_SEC,
+            )
 
             em = result["event_level_metrics"]
             seg_r2 = result["segment_level_metrics"]["row2_postproc_threshold_0_5"]

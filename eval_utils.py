@@ -64,6 +64,7 @@ Usage
 # ---------------------------------------------------------------------------
 # Imports
 # ---------------------------------------------------------------------------
+import csv
 import datetime
 import json
 import sys
@@ -881,30 +882,51 @@ def evaluate_event_level(partition_records, y_true_all, y_prob_all,
             "n_chunks":                  len(chunks),
         }
 
+        # Convert seconds-from-recording-start to ISO 8601 absolute datetime
+        # (seconds resolution -- microseconds are meaningless at the 2.5 s
+        # post-processing step) using each mouse's recording_start_dt.
+        def _to_iso(sec):
+            return (rec_start + datetime.timedelta(seconds=float(sec))) \
+                .replace(microsecond=0).isoformat()
+
         gt_lookup = {gt_idx: seizure_intervals[gt_idx] for gt_idx, _ in tp}
         for gt_idx, pred in tp:
+            gt_start_sec, gt_end_sec = gt_lookup[gt_idx]
+            latency = round(float(pred["start_sec"]) - float(gt_start_sec), 4)
             all_event_details.append({
-                "mouse_id":             mouse_id,
-                "is_true_alarm":        True,
-                "start_sec":            pred["start_sec"],
-                "end_sec":              pred["end_sec"],
-                "duration_sec":         pred["duration_sec"],
-                "max_prob":             pred["max_prob"],
-                "matched_gt_idx":       gt_idx,
-                "matched_gt_start_sec": round(gt_lookup[gt_idx][0], 4),
-                "matched_gt_end_sec":   round(gt_lookup[gt_idx][1], 4),
+                "mouse_id":                    mouse_id,
+                "is_true_alarm":               True,
+                "start_sec":                   pred["start_sec"],
+                "end_sec":                     pred["end_sec"],
+                "duration_sec":                pred["duration_sec"],
+                "start_datetime":              _to_iso(pred["start_sec"]),
+                "end_datetime":                _to_iso(pred["end_sec"]),
+                "mean_prob":                   pred.get("mean_prob"),
+                "max_prob":                    pred["max_prob"],
+                "matched_gt_idx":              gt_idx,
+                "matched_gt_start_sec":        round(gt_start_sec, 4),
+                "matched_gt_end_sec":          round(gt_end_sec, 4),
+                "matched_gt_start_datetime":   _to_iso(gt_start_sec),
+                "matched_gt_end_datetime":     _to_iso(gt_end_sec),
+                "detection_latency_sec":       latency,
             })
         for pred in fp:
             all_event_details.append({
-                "mouse_id":             mouse_id,
-                "is_true_alarm":        False,
-                "start_sec":            pred["start_sec"],
-                "end_sec":              pred["end_sec"],
-                "duration_sec":         pred["duration_sec"],
-                "max_prob":             pred["max_prob"],
-                "matched_gt_idx":       None,
-                "matched_gt_start_sec": None,
-                "matched_gt_end_sec":   None,
+                "mouse_id":                    mouse_id,
+                "is_true_alarm":               False,
+                "start_sec":                   pred["start_sec"],
+                "end_sec":                     pred["end_sec"],
+                "duration_sec":                pred["duration_sec"],
+                "start_datetime":              _to_iso(pred["start_sec"]),
+                "end_datetime":                _to_iso(pred["end_sec"]),
+                "mean_prob":                   pred.get("mean_prob"),
+                "max_prob":                    pred["max_prob"],
+                "matched_gt_idx":              None,
+                "matched_gt_start_sec":        None,
+                "matched_gt_end_sec":          None,
+                "matched_gt_start_datetime":   None,
+                "matched_gt_end_datetime":     None,
+                "detection_latency_sec":       None,
             })
 
         reord_y_true.append(y_true_mouse)
@@ -992,3 +1014,282 @@ def evaluate_event_level(partition_records, y_true_all, y_prob_all,
         "all_event_details": all_event_details,
         "reordered_arrays":  reordered,
     }
+
+
+# ===========================================================================
+# Canonical event-level output bundle
+# ---------------------------------------------------------------------------
+# Single source of truth for the 4-file (event_details + summary +
+# classification_report_row1 + classification_report_row2) bundle emitted
+# by every event-level evaluation in the repo. postproc_sweep.py,
+# recover_event_metrics.py, m4_event_metrics_recovery.py, the four
+# training scripts, the two _evaluation scripts, and m3_post_eval.py
+# all funnel through the helpers below so any schema change is one edit.
+#
+# deploy_inference.py uses the 2-file deploy variant (no ground truth,
+# so no classification reports and a reduced summary.json) -- same
+# event_details.csv schema with GT cells left empty.
+# ===========================================================================
+
+EVENT_DETAILS_FIELDS = [
+    "event_idx",
+    "mouse_id",
+    "partition",
+    "is_true_alarm",
+    "start_sec",
+    "end_sec",
+    "duration_sec",
+    "start_datetime",
+    "end_datetime",
+    "mean_prob",
+    "max_prob",
+    "matched_gt_idx",
+    "matched_gt_start_sec",
+    "matched_gt_end_sec",
+    "matched_gt_start_datetime",
+    "matched_gt_end_datetime",
+    "detection_latency_sec",
+]
+
+
+def write_event_details_csv(out_path, events, partition, logger):
+    """Write the canonical 17-column event_details.csv.
+
+    Any field absent or equal to None is rendered as an empty cell, so the
+    schema is identical between GT-having (training/eval/recovery/sweep)
+    and GT-less (deploy_inference) contexts. Rows are written in the
+    order supplied; an `event_idx` column is added automatically.
+
+    Parameters
+    ----------
+    out_path : Path or str
+    events : list of dict
+        Each dict may carry any subset of EVENT_DETAILS_FIELDS keys
+        (excluding event_idx, which is generated here, and `partition`,
+        which is injected from the caller).
+    partition : str
+        Value written into the `partition` column for every row
+        (e.g. "val", "test", "deploy").
+    logger : logging.Logger
+    """
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=EVENT_DETAILS_FIELDS)
+        writer.writeheader()
+        for i, evt in enumerate(events):
+            row = {k: "" for k in EVENT_DETAILS_FIELDS}
+            row["event_idx"] = i
+            row["partition"] = partition
+            for k, v in evt.items():
+                if k in EVENT_DETAILS_FIELDS and v is not None:
+                    row[k] = v
+            writer.writerow(row)
+    logger.info("Saved: %s (%d events)", out_path, len(events))
+
+
+def write_summary_json(out_path, payload, logger):
+    """Write a JSON summary (any dict) with deterministic ordering."""
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True, default=str),
+        encoding="utf-8")
+    logger.info("Saved: %s", out_path)
+
+
+def write_classification_reports(out_dir, partition, evaluator_result, logger):
+    """Write {partition}_classification_report_row1.json and _row2.json
+    using the reordered arrays + segment-level metrics from
+    evaluate_event_level's return dict. Delegates to the existing
+    build_classification_report helper for schema consistency."""
+    seg = evaluator_result["segment_level_metrics"]
+    reord = evaluator_result["reordered_arrays"]
+    y_true = reord["y_true"]
+    r1 = build_classification_report(
+        y_true, reord["y_pred_row1"], seg["row1_raw_threshold_0_5"])
+    r2 = build_classification_report(
+        y_true, reord["y_pred_row2"], seg["row2_postproc_threshold_0_5"])
+    p1 = Path(out_dir) / f"{partition}_classification_report_row1.json"
+    p2 = Path(out_dir) / f"{partition}_classification_report_row2.json"
+    write_summary_json(p1, r1, logger)
+    write_summary_json(p2, r2, logger)
+
+
+def write_event_level_bundle(out_dir, partition, model_label,
+                              evaluator_result, logger,
+                              order="min_then_refractory",
+                              min_event_duration_sec=25.0,
+                              refractory_period_sec=30.0,
+                              smoothing_window=3,
+                              threshold=0.5,
+                              step_sec=2.5,
+                              extra_summary_fields=None):
+    """Emit the canonical 4-file bundle:
+
+        {partition}_summary.json
+        {partition}_event_details.csv
+        {partition}_classification_report_row1.json
+        {partition}_classification_report_row2.json
+
+    Parameters
+    ----------
+    out_dir : Path
+    partition : str
+        "val" / "test" / "deploy" -- becomes the filename prefix and the
+        partition column inside event_details.csv.
+    model_label : str
+        Descriptive label written into summary.json's "model" field,
+        e.g. "M3 (MultiScaleTCN)".
+    evaluator_result : dict
+        Return value of evaluate_event_level. Required keys:
+        totals, event_level_metrics, segment_level_metrics,
+        per_mouse_results, all_event_details, reordered_arrays.
+    extra_summary_fields : dict, optional
+        Additional top-level keys to merge into summary.json (e.g. a
+        timestamp from the caller).
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    summary = {
+        "model":     model_label,
+        "partition": partition,
+        "timestamp": datetime.datetime.now().isoformat(),
+        "post_processing_params": {
+            "matching_rule":           "any-overlap",
+            "order":                   order,
+            "min_event_duration_sec":  min_event_duration_sec,
+            "refractory_period_sec":   refractory_period_sec,
+            "smoothing_window":        smoothing_window,
+            "step_sec":                step_sec,
+            "threshold":               threshold,
+        },
+        "event_level_metrics":   evaluator_result["event_level_metrics"],
+        "segment_level_metrics": evaluator_result["segment_level_metrics"],
+        "per_mouse":             evaluator_result["per_mouse_results"],
+        "totals":                evaluator_result["totals"],
+    }
+    if extra_summary_fields:
+        summary.update(extra_summary_fields)
+
+    write_summary_json(
+        out_dir / f"{partition}_summary.json", summary, logger)
+    write_event_details_csv(
+        out_dir / f"{partition}_event_details.csv",
+        evaluator_result["all_event_details"], partition, logger)
+    write_classification_reports(out_dir, partition, evaluator_result, logger)
+
+
+def emit_event_level_bundle(out_dir, partition, model_label,
+                             y_true, y_prob, partition_records,
+                             annotations_dir, mouse_metadata, logger,
+                             order="min_then_refractory",
+                             extra_summary_fields=None):
+    """One-call convenience wrapper: per-mouse evaluation + 4-file bundle.
+
+    Calls evaluate_event_level (which executes the post-processing
+    pipeline at the locked operating point) then write_event_level_bundle
+    to emit the four files. Returns the evaluator_result dict in case the
+    caller wants to inspect or log values from it.
+    """
+    result = evaluate_event_level(
+        partition_records, y_true, y_prob,
+        annotations_dir, mouse_metadata, logger, order=order)
+    write_event_level_bundle(
+        out_dir, partition, model_label, result, logger,
+        order=order, extra_summary_fields=extra_summary_fields)
+    return result
+
+
+def write_deploy_event_bundle(out_dir, stem, events,
+                               recording_metadata, model_label, logger,
+                               order="min_then_refractory",
+                               min_event_duration_sec=25.0,
+                               refractory_period_sec=30.0,
+                               smoothing_window=3,
+                               threshold=0.5,
+                               step_sec=2.5):
+    """Two-file deploy bundle for inference contexts without ground truth.
+
+        {stem}_event_details.csv  (canonical schema, GT cells empty)
+        {stem}_summary.json       (metadata + post-processing params +
+                                   predicted event counts; no event_level
+                                   or per_mouse blocks since no GT)
+
+    Parameters
+    ----------
+    out_dir : Path
+    stem : str
+        Filename prefix (typically the EDF stem); written into
+        event_details.csv's mouse_id column for every row.
+    events : list of dict
+        Output of segment_predictions_to_events (or equivalent). Each
+        event dict must carry start_sec, end_sec, duration_sec,
+        mean_prob, max_prob, and may carry start_datetime / end_datetime
+        for the absolute clock-time columns.
+    recording_metadata : dict
+        Must contain at least edf_path, recording_start_datetime
+        (ISO 8601 string), recording_duration_sec.
+    model_label : str
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Stamp mouse_id (= stem) on every event before writing.
+    deploy_events = []
+    for evt in events:
+        e = dict(evt)
+        e.setdefault("mouse_id", stem)
+        e.setdefault("is_true_alarm", "")          # unknown in deploy
+        deploy_events.append(e)
+
+    total_pred_duration = round(
+        sum(float(e.get("duration_sec", 0.0)) for e in deploy_events), 4)
+
+    summary = {
+        "model":     model_label,
+        "partition": "deploy",
+        "timestamp": datetime.datetime.now().isoformat(),
+        "recording": {
+            "stem":                    stem,
+            "edf_path":                str(recording_metadata.get("edf_path", "")),
+            "recording_start_datetime": recording_metadata.get(
+                "recording_start_datetime"),
+            "recording_duration_sec":  recording_metadata.get(
+                "recording_duration_sec"),
+        },
+        "post_processing_params": {
+            "matching_rule":           "any-overlap",
+            "order":                   order,
+            "min_event_duration_sec":  min_event_duration_sec,
+            "refractory_period_sec":   refractory_period_sec,
+            "smoothing_window":        smoothing_window,
+            "step_sec":                step_sec,
+            "threshold":               threshold,
+        },
+        "predicted_events": {
+            "n_predicted_events":                  len(deploy_events),
+            "total_predicted_event_duration_sec":  total_pred_duration,
+            "predicted_event_starts_datetime":     [
+                e.get("start_datetime", "") for e in deploy_events
+            ],
+        },
+    }
+
+    write_event_details_csv(
+        out_dir / f"{stem}_event_details.csv",
+        deploy_events, partition="deploy", logger=logger)
+    write_summary_json(
+        out_dir / f"{stem}_summary.json", summary, logger)
+
+
+def emit_deploy_event_bundle(out_dir, stem, events,
+                              recording_metadata, model_label, logger,
+                              **post_proc_kwargs):
+    """Alias for write_deploy_event_bundle to mirror emit_event_level_bundle
+    naming. Same behaviour."""
+    write_deploy_event_bundle(
+        out_dir, stem, events, recording_metadata, model_label, logger,
+        **post_proc_kwargs)
+

@@ -122,7 +122,7 @@ from tcn_utils import (
     ema_smooth,                      # TensorBoard-style EMA for noisy training curves
 )
 
-from eval_utils import evaluate_event_level, THRESHOLD
+from eval_utils import evaluate_event_level, write_event_level_bundle, THRESHOLD
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +157,7 @@ FS                = 500                                # native EDF sampling rat
 SEGMENT_LEN       = 2500                               # samples per segment: 5 s * 500 Hz
 SEGMENT_SEC       = 5.0                                # segment duration in seconds
 STEP_SEC          = 2.5                                # step between segment starts: 50% overlap
-MIN_EVENT_SEC     = 10.0                               # discard events shorter than this (seconds)
+MIN_EVENT_SEC     = 25.0                               # locked operating point (Pareto-knee, postproc_sweep.py); applied before refractory merge -- STUDY_REPORT.txt 7.6.10
 REFRACTORY_SEC    = 30.0                               # merge events separated by fewer than this (seconds)
 SMOOTHING_WIN     = 3                                  # segments in probability smoothing kernel
 MODEL_NAME        = "TCNWithTemporalAttention"         # model identifier for filenames and JSON
@@ -1682,6 +1682,26 @@ def main():
                 val_eval_result["totals"]["non_ictal_hours_corrected"])
     logger.info("  Mean detection latency: %s s", em["mean_detection_latency_sec"])
     logger.info("=" * 65)
+
+    # Canonical 4-file bundle (val_summary.json, val_event_details.csv,
+    # val_classification_report_row{1,2}.json) -- same schema across M1-M4
+    # training scripts, evaluation scripts, recovery scripts, and the
+    # postproc_sweep cells. Shared writer in eval_utils.
+    try:
+        write_event_level_bundle(
+            OUTPUT_ROOT, "val", "M2 (TCN+Attention)", val_eval_result, logger,
+            order="min_then_refractory",
+            min_event_duration_sec=MIN_EVENT_SEC,
+            refractory_period_sec=REFRACTORY_SEC,
+            smoothing_window=SMOOTHING_WIN,
+            threshold=0.5,
+            step_sec=STEP_SEC,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Canonical 4-file bundle emission failed (%s). Segment-level "
+            "outputs and the bespoke per-mouse JSON/CSV above remain valid.",
+            exc)
 
     # -- Step 14: Plot standard figures ----------------------------------------
     plot_all_figures(

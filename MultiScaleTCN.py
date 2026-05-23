@@ -108,7 +108,7 @@ from tcn_utils import (
     ema_smooth,
 )
 
-from eval_utils import evaluate_event_level, THRESHOLD
+from eval_utils import evaluate_event_level, write_event_level_bundle, THRESHOLD
 
 
 # ---------------------------------------------------------------------------
@@ -151,10 +151,13 @@ FS                = 500                                # native EDF sampling rat
 SEGMENT_LEN       = 2500                               # samples per segment: 5 s * 500 Hz
 SEGMENT_SEC       = 5.0                                # segment duration in seconds (= SEGMENT_LEN / FS)
 STEP_SEC          = 2.5                                # step between segment starts: 50% overlap for continuity
-# Minimum event duration filter: genuine rodent seizures typically last at
-# least 10 seconds (Luttjohann et al., 2009). Events shorter than this are
-# almost certainly transient artefacts or noise that survived smoothing.
-MIN_EVENT_SEC     = 10.0                               # discard detected events shorter than this (seconds)
+# Minimum event duration filter: locked operating point selected by the
+# 2 x 5 grid sweep on validation (postproc_sweep.py) -- 25 s achieves the
+# Pareto-knee trade-off between event-level recall and false-alarm rate.
+# Applied BEFORE refractory merging (see segment_predictions_to_events
+# in tcn_utils.py) so short candidate events cannot be rescued by the
+# subsequent merge. Reference: STUDY_REPORT.txt Section 7.6.10.
+MIN_EVENT_SEC     = 25.0                               # discard detected events shorter than this (seconds)
 # Refractory period: a single seizure can produce a brief mid-event dip
 # below threshold. Merging events separated by < 30 s prevents one seizure
 # from being counted as multiple alarms.
@@ -1726,6 +1729,29 @@ def main():
     logger.info("  Mean detection latency: %s s", em["mean_detection_latency_sec"])
     logger.info("=" * 65)
 
+    # -- Step 12e: Canonical 4-file bundle (same schema as postproc_sweep) ----
+    # val_summary.json, val_event_details.csv, val_classification_report_-
+    # row{1,2}.json -- emitted via eval_utils.write_event_level_bundle so
+    # every M1-M4 training run, every _evaluation run, every recovery run,
+    # and every postproc_sweep cell produces files in the same schema.
+    # Lives under OUTPUT_ROOT alongside the bespoke evaluation_report and
+    # three_row_summary CSV that older tooling still consumes.
+    try:
+        write_event_level_bundle(
+            OUTPUT_ROOT, "val", "M3 (MultiScaleTCN)", val_eval_result, logger,
+            order="min_then_refractory",
+            min_event_duration_sec=MIN_EVENT_SEC,
+            refractory_period_sec=REFRACTORY_SEC,
+            smoothing_window=SMOOTHING_WIN,
+            threshold=0.5,
+            step_sec=STEP_SEC,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Canonical 4-file bundle emission failed (%s). Segment-level "
+            "outputs and the bespoke per-mouse JSON/CSV above remain valid.",
+            exc)
+
     # -- Step 13: Plot all figures ---------------------------------------------
     plot_all_figures(
         history, best_epoch, best_val_f1,
@@ -1883,11 +1909,13 @@ if __name__ == "__main__":
 # computing event-level false alarm rate:
 # (1) A 3-segment moving average was applied to suppress isolated
 #     single-segment false positives caused by transient artefacts.
-# (2) Consecutive positive segments separated by fewer than 30 seconds
-#     were merged into a single event, preventing one seizure from being
-#     counted as multiple alarms if the probability briefly dips mid-ictal.
-# (3) Events shorter than 10 seconds were discarded, as genuine rodent
-#     seizures typically last at least 10 seconds (Luttjohann et al., 2009)."
+# (2) Candidate event runs shorter than 25 seconds were discarded.
+# (3) Surviving events separated by fewer than 30 seconds were merged
+#     into a single event, preventing one seizure from being counted
+#     as multiple alarms if the probability briefly dips mid-ictal.
+# The min-then-refractory order and the 25 s minimum-duration threshold
+# are the Pareto-knee operating point selected by the 2 x 5 grid sweep
+# on validation (postproc_sweep.py; STUDY_REPORT.txt §7.6.10)."
 #
 # WHY SMOOTHING_WIN = 3:
 #   A 3-segment kernel is the minimum that suppresses isolated 1-segment
@@ -1902,11 +1930,16 @@ if __name__ == "__main__":
 #   a single event. This value exceeds the longest typical inter-burst
 #   interval while remaining short enough not to merge separate seizures.
 #
-# WHY MIN_EVENT_SEC = 10:
-#   Genuine rodent seizures in the UNIQURE dataset last at least 10
-#   seconds (Luttjohann et al., 2009). Events shorter than this are
-#   overwhelmingly noise artefacts. Discarding them reduces FAR/hr
-#   without sacrificing true seizure detections.
+# WHY MIN_EVENT_SEC = 25 (and order = min-then-refractory):
+#   Locked operating point from postproc_sweep.py, a 2 x 5 grid sweep
+#   over (order, MIN_EVENT_SEC) on the validation partition. The chosen
+#   point sits at the Pareto knee between event-level recall and false-
+#   alarm rate: dropping below 25 s admits short artefact runs that
+#   inflate FAR, while raising above 25 s starts to discard short but
+#   genuine seizures. The min-then-refractory order applies the minimum-
+#   duration filter to raw candidate runs BEFORE refractory merging so
+#   short artefacts cannot be rescued by being merged with a neighbour.
+#   Full Pareto analysis: STUDY_REPORT.txt Section 7.6.10.
 #
 # -- THRESHOLD SELECTION (Methods) -----------------------------------------
 # "The classification threshold was selected by maximising the Youden J

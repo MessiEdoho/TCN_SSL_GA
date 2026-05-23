@@ -65,7 +65,8 @@ BRANCH_KEYS = ["B1", "B2", "B3"]
 BRANCH_LABELS = ["B1 (fine, [1,2,4])",
                  "B2 (medium, [8,16,32])",
                  "B3 (coarse, [32,64,128])"]
-BRANCH_COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c"]
+BRANCH_COLORS = [ "#08519C", "#4292C6", "#9ECAE1"]  # dark blue/mid/light
+BRANCH_EDGE = "black"
 CATEGORY_COLORS = {"TP": "#2ca02c", "FP": "#d62728",
                    "TN": "#7f7f7f", "FN": "#ff7f0e"}
 
@@ -176,7 +177,8 @@ def plot_a_mean_abs_phi(df, out_dir, model_name, partition, logger):
     for i, (col, label, color) in enumerate(zip(
             ["abs_B1", "abs_B2", "abs_B3"], BRANCH_LABELS, BRANCH_COLORS)):
         vals = means[col].values
-        bars = ax.bar(x + (i - 1) * bw, vals, bw, label=label, color=color)
+        bars = ax.bar(x + (i - 1) * bw, vals, bw, label=label, color=color,
+                      edgecolor=BRANCH_EDGE, linewidth=0.4)
         for b, v in zip(bars, vals):
             ax.text(b.get_x() + b.get_width() / 2, v, "%.2f" % v,
                     ha="center", va="bottom", fontsize=8)
@@ -207,7 +209,8 @@ def plot_b_winner_histogram(df, out_dir, model_name, partition, logger):
     fig, ax = plt.subplots(figsize=(9, 5))
     for i, (k, label, color) in enumerate(zip(BRANCH_KEYS, BRANCH_LABELS, BRANCH_COLORS)):
         vals = ct[k].values
-        bars = ax.bar(x + (i - 1) * bw, vals, bw, label=label, color=color)
+        bars = ax.bar(x + (i - 1) * bw, vals, bw, label=label, color=color,
+                      edgecolor=BRANCH_EDGE, linewidth=0.4)
         for b, v in zip(bars, vals):
             ax.text(b.get_x() + b.get_width() / 2, v, "%.1f%%" % v,
                     ha="center", va="bottom", fontsize=8)
@@ -240,7 +243,8 @@ def plot_c_mean_signed_phi(df, out_dir, model_name, partition, logger):
     for i, (col, label, color) in enumerate(zip(
             ["phi_B1", "phi_B2", "phi_B3"], BRANCH_LABELS, BRANCH_COLORS)):
         vals = means[col].values
-        bars = ax.bar(x + (i - 1) * bw, vals, bw, label=label, color=color)
+        bars = ax.bar(x + (i - 1) * bw, vals, bw, label=label, color=color,
+                      edgecolor=BRANCH_EDGE, linewidth=0.4)
         for b, v in zip(bars, vals):
             ax.text(b.get_x() + b.get_width() / 2,
                     v + (0.05 if v >= 0 else -0.15),

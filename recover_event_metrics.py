@@ -18,8 +18,10 @@ Pipeline (per partition)
    segments leave gaps that the chunk logic respects).
 3. Within each mouse, split surviving segments into contiguous chunks
    (consecutive chrono_idx). Each chunk is processed independently:
-   smoothing window=3, threshold tau=0.5, run-detection, refractory
-   merge 30 s, min-duration filter 10 s.
+   smoothing window=3, threshold tau=0.5, run-detection, min-duration
+   filter 25 s, refractory merge 30 s. The min-then-refractory order
+   and 25 s minimum are the locked operating point (postproc_sweep.py;
+   STUDY_REPORT.txt §7.6.10).
 4. Match each predicted event against the mouse's Excel seizure_intervals
    using the any-overlap rule. Aggregate event TP / FP / FN per mouse,
    then across mice.
@@ -58,6 +60,13 @@ from sklearn.metrics import (
     classification_report,
 )
 
+# Canonical 4-file output bundle is emitted via the shared writer in
+# eval_utils so postproc_sweep / recover_event_metrics /
+# m4_event_metrics_recovery / training+evaluation scripts all produce
+# identically-named files with identical schemas. Imported under an
+# aliased name to avoid clashing with the script's older inline writers.
+from eval_utils import write_event_level_bundle as eval_utils_write_event_level_bundle
+
 
 # ---------------------------------------------------------------------------
 # Local paths
@@ -90,7 +99,7 @@ STEP_SEC            = STEP / FS      # 2.5
 THRESHOLD           = 0.5
 SMOOTHING_WIN       = 3
 REFRACTORY_SEC      = 30.0
-MIN_EVENT_SEC       = 10.0
+MIN_EVENT_SEC       = 25.0  # locked operating point (Pareto-knee, postproc_sweep.py); STUDY_REPORT.txt 7.6.10
 
 MODEL_NAME          = "MultiScaleTCN"
 
@@ -385,10 +394,11 @@ def build_classification_report(y_true, y_pred, row_metrics):
 # detect_events_in_chunk
 # ---------------------------------------------------------------------------
 def detect_events_in_chunk(t_start, y_prob, mouse_id, chunk_id):
-    """Run smoothing + threshold + run-detection + refractory + min-duration
-    on one chunk's prediction subarray. Returns (events, smoothed_probs,
-    smoothed_preds) so the caller can accumulate per-chunk smoothed
-    arrays for Row 2 segment-level metrics.
+    """Run smoothing + threshold + run-detection + min-duration + refractory
+    on one chunk's prediction subarray (min-then-refractory order, locked
+    by the Pareto-knee sweep -- see STUDY_REPORT.txt 7.6.10). Returns
+    (events, smoothed_probs, smoothed_preds) so the caller can accumulate
+    per-chunk smoothed arrays for Row 2 segment-level metrics.
     """
     n = len(y_prob)
     if n == 0:
@@ -424,8 +434,15 @@ def detect_events_in_chunk(t_start, y_prob, mouse_id, chunk_id):
             "seg_indices": list(seg_idx_in_event),
         })
 
+    # min-duration filter applied BEFORE refractory merge so short artefacts
+    # cannot be rescued by being merged with a neighbour.
+    filtered = [
+        evt for evt in raw_events
+        if (evt["end_sec"] - evt["start_sec"]) >= MIN_EVENT_SEC
+    ]
+
     merged = []
-    for evt in raw_events:
+    for evt in filtered:
         if merged and (evt["start_sec"] - merged[-1]["end_sec"]) < REFRACTORY_SEC:
             merged[-1]["end_sec"] = evt["end_sec"]
             merged[-1]["seg_indices"].extend(evt["seg_indices"])
@@ -439,8 +456,6 @@ def detect_events_in_chunk(t_start, y_prob, mouse_id, chunk_id):
     final = []
     for evt in merged:
         duration = evt["end_sec"] - evt["start_sec"]
-        if duration < MIN_EVENT_SEC:
-            continue
         seg_idx = evt["seg_indices"]
         final.append({
             "mouse_id":     mouse_id,
@@ -592,32 +607,55 @@ def process_partition(partition, manifest, metadata, logger):
             "n_chunks":                    len(chunks),
         }
 
+        # Convert seconds-from-recording-start to ISO 8601 datetime using
+        # the mouse's recording_start_dt (loaded above as rec_start). The
+        # canonical 17-column event_details schema (eval_utils.EVENT_-
+        # DETAILS_FIELDS) requires start_datetime, end_datetime, mean_prob,
+        # matched_gt_*_datetime, detection_latency_sec for each event.
+        def _to_iso(sec):
+            return (rec_start + datetime.timedelta(seconds=float(sec))) \
+                .replace(microsecond=0).isoformat()
+
         gt_lookup = {gt_idx: seizure_intervals[gt_idx] for gt_idx, _ in tp}
         for gt_idx, pred in tp:
+            gt_start_sec, gt_end_sec = gt_lookup[gt_idx]
+            latency = round(float(pred["start_sec"]) - float(gt_start_sec), 4)
             all_event_details.append({
-                "mouse_id":            mouse_id,
-                "partition":           partition,
-                "is_true_alarm":       True,
-                "start_sec":           pred["start_sec"],
-                "end_sec":             pred["end_sec"],
-                "duration_sec":        pred["duration_sec"],
-                "max_prob":            pred["max_prob"],
-                "matched_gt_idx":      gt_idx,
-                "matched_gt_start_sec": round(gt_lookup[gt_idx][0], 4),
-                "matched_gt_end_sec":   round(gt_lookup[gt_idx][1], 4),
+                "mouse_id":                    mouse_id,
+                "partition":                   partition,
+                "is_true_alarm":               True,
+                "start_sec":                   pred["start_sec"],
+                "end_sec":                     pred["end_sec"],
+                "duration_sec":                pred["duration_sec"],
+                "start_datetime":              _to_iso(pred["start_sec"]),
+                "end_datetime":                _to_iso(pred["end_sec"]),
+                "mean_prob":                   pred.get("mean_prob"),
+                "max_prob":                    pred["max_prob"],
+                "matched_gt_idx":              gt_idx,
+                "matched_gt_start_sec":        round(gt_start_sec, 4),
+                "matched_gt_end_sec":          round(gt_end_sec, 4),
+                "matched_gt_start_datetime":   _to_iso(gt_start_sec),
+                "matched_gt_end_datetime":     _to_iso(gt_end_sec),
+                "detection_latency_sec":       latency,
             })
         for pred in fp:
             all_event_details.append({
-                "mouse_id":             mouse_id,
-                "partition":            partition,
-                "is_true_alarm":        False,
-                "start_sec":            pred["start_sec"],
-                "end_sec":              pred["end_sec"],
-                "duration_sec":         pred["duration_sec"],
-                "max_prob":             pred["max_prob"],
-                "matched_gt_idx":       None,
-                "matched_gt_start_sec": None,
-                "matched_gt_end_sec":   None,
+                "mouse_id":                    mouse_id,
+                "partition":                   partition,
+                "is_true_alarm":               False,
+                "start_sec":                   pred["start_sec"],
+                "end_sec":                     pred["end_sec"],
+                "duration_sec":                pred["duration_sec"],
+                "start_datetime":              _to_iso(pred["start_sec"]),
+                "end_datetime":                _to_iso(pred["end_sec"]),
+                "mean_prob":                   pred.get("mean_prob"),
+                "max_prob":                    pred["max_prob"],
+                "matched_gt_idx":              None,
+                "matched_gt_start_sec":        None,
+                "matched_gt_end_sec":          None,
+                "matched_gt_start_datetime":   None,
+                "matched_gt_end_datetime":     None,
+                "detection_latency_sec":       None,
             })
 
         all_predicted.extend(mouse_predicted)
@@ -706,30 +744,32 @@ def process_partition(partition, manifest, metadata, logger):
         "per_mouse": per_mouse_results,
     }
 
-    summary_path = OUTPUT_ROOT / f"recover_event_metrics_{partition}.json"
-    summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
-    logger.info("Saved partition summary: %s", summary_path)
-
-    row1_report = build_classification_report(seg_y_true_concat, row1_pred, row1_metrics)
-    row1_report_path = OUTPUT_ROOT / f"recover_classification_report_{partition}_row1.json"
-    row1_report_path.write_text(json.dumps(row1_report, indent=2, sort_keys=True), encoding="utf-8")
-    logger.info("Saved Row 1 classification report: %s", row1_report_path)
-
-    row2_report = build_classification_report(seg_y_true_concat, seg_smoothed_preds_concat, row2_metrics)
-    row2_report_path = OUTPUT_ROOT / f"recover_classification_report_{partition}_row2.json"
-    row2_report_path.write_text(json.dumps(row2_report, indent=2, sort_keys=True), encoding="utf-8")
-    logger.info("Saved Row 2 classification report: %s", row2_report_path)
-
-    details_path = OUTPUT_ROOT / f"recover_event_details_{partition}.csv"
-    fieldnames = ["mouse_id", "partition", "is_true_alarm", "start_sec", "end_sec",
-                  "duration_sec", "max_prob", "matched_gt_idx",
-                  "matched_gt_start_sec", "matched_gt_end_sec"]
-    with open(details_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in all_event_details:
-            writer.writerow(row)
-    logger.info("Saved per-event details : %s (%d rows)", details_path, len(all_event_details))
+    # Emit the canonical 4-file bundle via the shared writer in eval_utils
+    # so postproc_sweep, recover_event_metrics, m4_event_metrics_recovery,
+    # the training scripts, and the evaluation scripts all produce
+    # identically-named files with identical schemas.
+    evaluator_result = {
+        "totals":                summary["totals"],
+        "event_level_metrics":   summary["event_level_metrics"],
+        "segment_level_metrics": summary["segment_level_metrics"],
+        "per_mouse_results":     per_mouse_results,
+        "all_event_details":     all_event_details,
+        "reordered_arrays": {
+            "y_true":      seg_y_true_concat,
+            "y_pred_row1": row1_pred,
+            "y_pred_row2": seg_smoothed_preds_concat,
+            "y_prob":      seg_y_prob_concat,
+        },
+    }
+    eval_utils_write_event_level_bundle(
+        OUTPUT_ROOT, partition, MODEL_NAME, evaluator_result, logger,
+        order="min_then_refractory",
+        min_event_duration_sec=MIN_EVENT_SEC,
+        refractory_period_sec=REFRACTORY_SEC,
+        smoothing_window=SMOOTHING_WIN,
+        threshold=THRESHOLD,
+        step_sec=STEP_SEC,
+    )
 
     logger.info("-" * 65)
     em = summary["event_level_metrics"]

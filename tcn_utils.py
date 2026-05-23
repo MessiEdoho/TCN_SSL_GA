@@ -1540,19 +1540,20 @@ def run_training(model, train_loader, val_loader, lr, weight_decay,
 # A [smoothing_window]-segment moving average was applied
 # to the predicted probabilities to suppress isolated
 # single-segment spikes caused by transient artefacts.
-# Consecutive positive predictions separated by fewer
-# than [refractory_period_sec] seconds were merged into
-# a single event to prevent a single seizure from being
-# counted as multiple alarms. Events shorter than
-# [min_event_duration_sec] seconds were discarded, as
-# genuine rodent seizures typically last at least 10
-# seconds [CITE]. The classification threshold was
-# selected by maximising the Youden J statistic
-# (J = sensitivity + specificity - 1) on the validation
-# set independently for each model. Event-level false
-# alarm rate per hour (FAR/hr) was computed as the
-# number of false alarm events divided by the total
-# non-ictal recording duration in hours."
+# Candidate event runs shorter than [min_event_duration_sec]
+# seconds were discarded; surviving events separated by
+# fewer than [refractory_period_sec] seconds were then merged
+# into a single event to prevent a single seizure from being
+# counted as multiple alarms. Order: min-then-refractory --
+# short artefacts are dropped BEFORE merging so they cannot
+# be rescued by being merged with a neighbour. Order and
+# min-duration value (25 s) are the Pareto-knee operating
+# point selected by the 2 x 5 grid sweep on validation
+# (postproc_sweep.py; STUDY_REPORT.txt §7.6.10). The
+# classification threshold tau = 0.5 was fixed for all
+# models. Event-level false alarm rate per hour (FAR/hr)
+# was computed as the number of false alarm events divided
+# by the total non-ictal recording duration in hours."
 #
 # Parameters to report in paper
 # ────────────────────────────────────────────────────
@@ -1560,10 +1561,10 @@ def run_training(model, train_loader, val_loader, lr, weight_decay,
 # |----------------------------|-----------------------|
 # | smoothing_window           | 3 segments            |
 # | refractory_period_sec      | 30 seconds            |
-# | min_event_duration_sec     | 10 seconds            |
+# | min_event_duration_sec     | 25 seconds            |
+# | post-processing order      | min-then-refractory   |
 # | step_sec                   | 2.5 s (= seg - overlap)|
-# | threshold objective        | Youden J statistic    |
-# | threshold search range     | 0.1 to 0.9, step 0.01 |
+# | threshold                  | 0.5 (fixed, all models)|
 # | FAR/hr denominator         | non-ictal hours only  |
 #
 # Report all six parameters in Table 1 or the methods
@@ -1606,8 +1607,10 @@ def run_training(model, train_loader, val_loader, lr, weight_decay,
 #   identical across all four models. Do not tune
 #   post-processing parameters per model. Fix them once
 #   (smoothing_window=3, refractory_period_sec=30,
-#   min_event_duration_sec=10) and apply to all models.
-#   Only the threshold may differ per model.
+#   min_event_duration_sec=25) and apply to all models.
+#   Only the threshold may differ per model. Order is
+#   min-then-refractory (see segment_predictions_to_events
+#   docstring + STUDY_REPORT.txt §7.6.10).
 #
 # WARNING 3 — Smoothing introduces boundary uncertainty.
 #   A window of W segments shifts event boundaries by
@@ -1630,7 +1633,7 @@ def segment_predictions_to_events(
         y_prob,
         segment_len_sec,
         step_sec,
-        min_event_duration_sec=10.0,
+        min_event_duration_sec=25.0,
         refractory_period_sec=30.0,
         smoothing_window=3,
         threshold=0.5
@@ -1657,8 +1660,13 @@ def segment_predictions_to_events(
         Duration of each segment in seconds (e.g. 5.0).
     step_sec : float
         Step between consecutive segment starts in seconds (e.g. 2.5).
-    min_event_duration_sec : float, default 10.0
+    min_event_duration_sec : float, default 25.0
         Minimum event duration in seconds; shorter events are discarded.
+        This filter is applied BEFORE the refractory merge so short
+        candidate events cannot be rescued by subsequent merging. The
+        25 s default and the min-then-refractory order are the locked
+        operating point selected by the 2 x 5 grid sweep on validation
+        (see postproc_sweep.py and STUDY_REPORT.txt Section 7.6.10).
     refractory_period_sec : float, default 30.0
         Maximum gap in seconds between consecutive positive runs that
         should be merged into a single event.
@@ -1758,11 +1766,24 @@ def segment_predictions_to_events(
             "seg_indices": list(event_seg_indices),
         })
 
-    # ── Stage 4: Refractory period merging ────────────────────────────────
+    # ── Stage 4: Minimum duration filter ──────────────────────────────────
+    # Drop short candidate events FIRST so they cannot be rescued by the
+    # subsequent refractory merge. The Pareto-knee selection from
+    # postproc_sweep.py (2 x 5 grid over order and threshold on val)
+    # locks this order ("min_then_refractory") with min_event_duration_sec
+    # = 25 s as the chosen operating point; see eval_utils.detect_events_-
+    # in_chunk and STUDY_REPORT.txt Section 7.6.10.
+    filtered_events = [
+        evt for evt in raw_events
+        if (evt["end_sec"] - evt["start_sec"]) >= min_event_duration_sec
+    ]
+
+    # ── Stage 5: Refractory period merging ────────────────────────────────
     # Merging prevents a single seizure from being counted as multiple
     # alarms when the probability briefly dips below threshold mid-seizure.
+    # Runs only over events that already passed the min-duration filter.
     merged_events = []
-    for evt in raw_events:
+    for evt in filtered_events:
         if (merged_events and
                 (evt["start_sec"] - merged_events[-1]["end_sec"]) < refractory_period_sec):
             # Gap is shorter than the refractory period — extend the
@@ -1776,16 +1797,13 @@ def segment_predictions_to_events(
                 "seg_indices": list(evt["seg_indices"]),
             })
 
-    # ── Stage 5: Minimum duration filter ──────────────────────────────────
+    # ── Stage 6: Build final event records with metadata ──────────────────
+    # valid_idx clipping guards against index-out-of-bounds from boundary
+    # segments whose indices may exceed array length after merging across
+    # chunk edges.
     final_events = []
     for evt in merged_events:
         duration = evt["end_sec"] - evt["start_sec"]
-        if duration < min_event_duration_sec:
-            continue
-
-        # valid_idx clipping guards against index-out-of-bounds from
-        # boundary segments whose indices may exceed array length after
-        # merging across chunk edges.
         valid_idx = [idx for idx in evt["seg_indices"] if 0 <= idx < n_segments]
 
         if len(valid_idx) > 0:
@@ -1826,10 +1844,14 @@ def segment_predictions_to_events(
 # ── REPORTING NOTE: segment_predictions_to_events ───
 # Stage 1 smoothing_window: report as "a W-segment
 #   moving average was applied to predicted probabilities"
-# Stage 4 refractory_period_sec: report as "events
+# Stage 4 min_event_duration_sec: report as "candidate
+#   events shorter than D seconds were discarded" (D = 25 s
+#   at the locked operating point; selected by the 2 x 5
+#   grid sweep on validation, see STUDY_REPORT.txt §7.6.10)
+# Stage 5 refractory_period_sec: report as "events
 #   separated by fewer than R seconds were merged"
-# Stage 5 min_event_duration_sec: report as "events
-#   shorter than D seconds were discarded"
+# Order: min-then-refractory (short events are dropped
+#   BEFORE merging so they cannot be rescued).
 # Boundary uncertainty from smoothing: ±floor(W/2)×step_sec
 #   seconds. For W=3, step=2.5s: ±2.5 seconds maximum.
 #   State this limitation in the discussion section.

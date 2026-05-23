@@ -50,6 +50,7 @@ from MultiScaleTCNAttention import (
     set_seed, load_best_params, load_splits, build_model, count_parameters,
 )
 from tcn_utils import ema_smooth
+from eval_utils import write_event_level_bundle
 from eval_utils import (
     AMPLITUDE_THRESHOLD, SafeEEGSegmentDataset, make_safe_loader,
     evaluate_model_safe, verify_manifest_filtered,
@@ -388,6 +389,21 @@ def main():
     with open(ROW2_REPORT_PATH, "w", encoding="utf-8") as f:
         json.dump(row2_report, f, indent=2, default=str)
     logger.info("Saved Row 2 classification report: %s", ROW2_REPORT_PATH)
+
+    # Canonical 4-file output bundle (val_summary.json, val_event_details.csv,
+    # val_classification_report_row{1,2}.json) -- same schema as
+    # postproc_sweep.py / recover_event_metrics.py / the training scripts.
+    # Emitted alongside the bespoke ms_attn_* outputs above so downstream
+    # analysis tooling can rely on the shared schema.
+    write_event_level_bundle(
+        VAL_EVENT_METRICS_DIR, "val", MODEL_NAME, val_eval_result, logger,
+        order="min_then_refractory",
+        min_event_duration_sec=MIN_EVENT_SEC,
+        refractory_period_sec=REFRACTORY_SEC,
+        smoothing_window=SMOOTHING_WIN,
+        threshold=0.5,
+        step_sec=STEP_SEC,
+    )
 
     # Training-dynamics reconstruction from the original M4 training log
     # (per-epoch CSV + training_curves.png + lr_schedule.png). The training

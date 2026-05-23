@@ -122,6 +122,7 @@ from eval_utils import (
     evaluate_model_safe,
     verify_manifest_filtered,
     evaluate_event_level,
+    write_event_level_bundle,
     THRESHOLD,
     STEP_SEC,
 )
@@ -577,6 +578,27 @@ def main():
                 test_eval_result["totals"]["non_ictal_hours_corrected"])
     logger.info("  Mean detection latency: %s s", em["mean_detection_latency_sec"])
     logger.info("=" * 65)
+
+    # Canonical 4-file bundle (test_summary.json, test_event_details.csv,
+    # test_classification_report_row{1,2}.json) under EVALUATION_DIR --
+    # same schema as the training scripts' val_ bundle and as the
+    # postproc_sweep cells. Shared writer in eval_utils.
+    try:
+        write_event_level_bundle(
+            EVALUATION_DIR, "test", "M3 (MultiScaleTCN)",
+            test_eval_result, logger,
+            order="min_then_refractory",
+            min_event_duration_sec=MIN_EVENT_SEC,
+            refractory_period_sec=REFRACTORY_SEC,
+            smoothing_window=SMOOTHING_WIN,
+            threshold=0.5,
+            step_sec=STEP_SEC,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Canonical 4-file bundle emission failed (%s). Segment-level "
+            "outputs and the bespoke per-mouse JSON/CSV above remain valid.",
+            exc)
 
     # -- Step 10: Plot all figures (Row 1 / Row 2; Row 3 retired) ------------
     logger.info("-" * 65)
