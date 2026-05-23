@@ -661,6 +661,169 @@ building unit.
     Ablation: M3 vs M1 isolates the contribution of multi-scale
     temporal processing.
 
+6.5.1 Justification of the branch dilation schedules
+
+    The three dilation schedules -- [1, 2, 4], [8, 16, 32], and
+    [32, 64, 128] -- are not arbitrary. They were selected before
+    hyperparameter search to satisfy four design criteria simultaneously:
+    (i) each branch must sense a temporal scale that is physiologically
+    meaningful for rodent ictal EEG; (ii) the three branches must
+    jointly cover the full range of clinically relevant seizure
+    morphologies from sub-100 ms transients to multi-second envelopes;
+    (iii) the schedules must produce a continuous (gap-free) coverage
+    of temporal resolutions without an excessively redundant overlap;
+    and (iv) the branch receptive fields must collectively span the
+    5 s segment so that no segment is classified using only sub-segment
+    information.
+
+    (a) Why three branches rather than two or four
+
+    Two branches would force the model to compromise between either
+    the spike scale and the burst scale, or the burst scale and the
+    seizure-envelope scale, omitting one entire morphological family.
+    Four or more branches would introduce additional redundancy
+    between adjacent scales (each consecutive pair already overlaps
+    by design -- see (d) below) and inflate parameter count and
+    inference cost without enlarging the covered temporal range,
+    because the maximum useful dilation is bounded above by the 5-s
+    segment length. Three branches are the minimum number that
+    distinguish the three canonical ictal morphological families
+    documented in the electroencephalography literature -- sharp
+    transients (spikes / polyspikes), rhythmic bursts, and sustained
+    ictal evolution -- so each branch is mapped one-to-one to a
+    physiologically distinct phenomenon. The mapping is reported in
+    Table 6.5.1.
+
+    (b) Why an exponential (geometric doubling) progression
+
+    Within each branch the dilation factor doubles between consecutive
+    CausalConvBlocks (d_{i+1} = 2 * d_i). This is the canonical TCN
+    schedule introduced by Bai et al. (2018) and previously adopted in
+    WaveNet (van den Oord et al., 2016) for the same reason: it allows
+    the per-layer receptive field to grow exponentially with depth
+    while parameter count grows only linearly, providing the most
+    parameter-efficient route to large temporal context. Linear or
+    arithmetic dilation progressions (e.g., d = 1, 2, 3, 4) would
+    require many more layers (and therefore many more parameters) to
+    cover the same temporal range, and would also produce uneven
+    coverage -- adjacent layers would sense nearly identical scales,
+    while large scales would remain unreached.
+
+    (c) Mapping of branches to physiological time-scales
+
+    The per-block receptive field of a CausalConvBlock with kernel
+    size k and dilation d is RF_block = 1 + 2*(k-1)*d (two
+    convolutions per block, Section 6.1). This per-block RF is the
+    temporal window each layer effectively "sees" in the input,
+    and is the quantity that must be compared against electrographic
+    feature durations. At the maximum tuned kernel size k = 7, the
+    per-block receptive fields evaluate as:
+
+        Table 6.5.1 -- Per-block receptive field per branch at k=7
+
+        Branch       Dilation   RF_block    RF_block (ms)   Sensed feature
+        ------       --------   --------    -------------   ------------------------
+        Branch 1     d = 1       13 samp        26 ms       individual spikes
+        (fine)       d = 2       25 samp        50 ms       spike + slow wave onset
+                     d = 4       49 samp        98 ms       polyspike clusters
+
+        Branch 2     d = 8       97 samp       194 ms       short rhythmic bursts
+        (medium)     d = 16     193 samp       386 ms       spike-wave complexes
+                     d = 32     385 samp       770 ms       sustained burst trains
+
+        Branch 3     d = 32     385 samp       770 ms       early ictal patterns
+        (coarse)     d = 64     769 samp     1.538 s        evolving ictal rhythms
+                     d = 128   1537 samp     3.074 s        full-segment envelopes
+
+    These windows align with established electrographic feature
+    durations in rodent EEG: inter-ictal spikes typically span
+    20-70 ms with polyspike complexes extending to ~200 ms;
+    ictal rhythmic discharges in rodent models occupy the 3-30 Hz
+    band, corresponding to periodicities of ~33-333 ms, and burst
+    trains commonly persist for hundreds of milliseconds to
+    >1 second; tonic-clonic and absence ictal patterns evolve over
+    seconds. The three branches therefore decompose the input into
+    feature streams whose temporal supports correspond, by design,
+    to these three documented morphological regimes rather than to
+    arbitrary multi-resolution scales.
+
+    (d) Why the schedules start at d = 1, 8, and 32
+
+    The fine branch starts at d = 1 because spike-class transients
+    occupy the finest temporal resolution available; any larger
+    starting dilation would skip the spike scale entirely. The
+    intermediate branch starts at d = 8 (per-block RF = 97 samples
+    = 194 ms at k = 7) -- the smallest dilation at which the
+    per-block RF exceeds the upper duration of a typical polyspike
+    cluster, ensuring that the medium branch begins where the fine
+    branch's coverage saturates. The coarse branch starts at d = 32
+    (per-block RF = 770 ms at k = 7) -- the smallest dilation at
+    which the per-block RF exceeds the upper duration of typical
+    rhythmic burst trains, so that the coarse branch begins where
+    the medium branch's coverage saturates.
+
+    The shared dilation value d = 32 at the upper bound of Branch 2
+    and the lower bound of Branch 3 is deliberate: it guarantees a
+    continuous (gap-free) temporal-coverage curve across the
+    medium-to-coarse transition. Without this overlap, the model
+    would have a blind spot around the ~770 ms scale -- the precise
+    range at which mid-duration burst trains transition into
+    sustained ictal patterns. The overlap is acknowledged as the
+    primary source of inter-branch redundancy that motivated the use
+    of Shapley value attribution rather than leave-one-out ablation
+    for per-prediction interpretability (Section 13.3).
+
+    (e) Full-segment coverage at the cumulative branch level
+
+    The cumulative branch-level receptive field is
+    RF_branch = 1 + 2*(k-1)*sum(dilations). At k = 7 this yields 85
+    samples (170 ms) for Branch 1, 673 samples (1.346 s) for
+    Branch 2, and 2689 samples (5.378 s) for Branch 3. The coarse
+    branch's RF slightly exceeds the 5-s segment, ensuring that
+    every output time step of the coarse branch has access to the
+    full temporal context of the segment at the fusion stage. The
+    medium branch reaches ~27% of the segment, sufficient to span
+    the longest individual burst train but not the full ictal
+    evolution; the fine branch covers ~3.4% of the segment, focused
+    on sub-segment transient morphology. Each branch therefore
+    contributes information at a distinct hierarchical level rather
+    than three nearly identical full-segment representations.
+
+    (f) Why the dilations are fixed rather than tuned
+
+    The dilation schedules were fixed before Optuna search and are
+    treated as architectural design constants, not hyperparameters.
+    Three considerations motivate this choice. First, allowing
+    Optuna to vary the dilations would conflate architectural
+    design decisions with hyperparameter optimisation, weakening
+    the M1-vs-M3 ablation comparison: a measured M3-over-M1
+    improvement would no longer be attributable to multi-scale
+    processing as a concept, but to one specific tuned schedule
+    that may not generalise across studies. Second, the schedules
+    were chosen to map cleanly to documented seizure morphology
+    timescales; tuning them on a single validation partition would
+    likely produce values without a clear physiological
+    interpretation, weakening the interpretability story (Section
+    13). Third, every additional tunable integer in the search
+    space inflates the number of trials needed for convergence;
+    fixing the dilations and tuning only the orthogonal parameters
+    (num_filters, kernel_size, dropout, fusion strategy) keeps the
+    search tractable on the available compute budget.
+
+    Reference:
+        van den Oord, A., Dieleman, S., Zen, H., Simonyan, K.,
+            Vinyals, O., Graves, A., Kalchbrenner, N., Senior, A.,
+            & Kavukcuoglu, K. (2016). WaveNet: A Generative Model
+            for Raw Audio. arXiv:1609.03499.
+        Bai, S., Kolter, J. Z., & Koltun, V. (2018). An Empirical
+            Evaluation of Generic Convolutional and Recurrent
+            Networks for Sequence Modeling. arXiv:1803.01271.
+        Niedermeyer, E. & Lopes da Silva, F. (eds.) (2017).
+            Niedermeyer's Electroencephalography: Basic Principles,
+            Clinical Applications, and Related Fields, 7th ed.
+            Oxford University Press [VERIFY EXACT EDITION BEFORE
+            SUBMISSION].
+
 6.6 M4: Multi-Scale TCN + Temporal Attention
 
     Combines the multi-scale backbone of M3 with the temporal attention
@@ -2150,7 +2313,7 @@ configurations.
     was changed from Youden's J to F1 partway through the study
     (Section 7.6.10) because the Youden operating point degenerated
     on this dataset's ~0.27% ictal prevalence (tau* = 0.10 yielded
-    precision 7.4%); with the F1 objective Row 3 collapses to an
+    precision 7.4%); with the F1 objective Rowl 3 collapses to an
     operating point that is empirically very close to Row 2's
     tau = 0.5 while adding an extra threshold-sweep step that
     overfits tau to the validation partition. All reported numbers
