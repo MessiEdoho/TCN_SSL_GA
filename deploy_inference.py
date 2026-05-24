@@ -366,14 +366,15 @@ def main():
     logger.info("Detected %d events after smoothing/refractory/min-duration filtering.",
                 len(events))
 
-    # Augment events with recording-relative HH:MM:SS.s timestamps so they
-    # can be located directly on the EDF viewer's elapsed-time axis.
+    # Augment events with recording-relative HHhMMmSS.s timestamps so they
+    # can be located on the EDF viewer's elapsed-time axis. The "h"/"m"
+    # separators block Excel from auto-parsing the cell as a duration.
     def _to_hms(sec):
         sec = float(sec)
         h = int(sec // 3600)
         m = int((sec % 3600) // 60)
         s = sec - h * 3600 - m * 60
-        return f"{h:02d}:{m:02d}:{s:04.1f}"
+        return f"{h:02d}h{m:02d}m{s:04.1f}"
     for evt in events:
         evt["start_recording_time"] = _to_hms(evt["start_sec"])
         evt["end_recording_time"]   = _to_hms(evt["end_sec"])

@@ -607,14 +607,14 @@ def process_partition(partition, manifest, metadata, logger):
             "n_chunks":                    len(chunks),
         }
 
-        # Format seconds-from-recording-start as HH:MM:SS.s with overflow
-        # hours (e.g. 73:14:22.5). Matches eval_utils._to_hms.
+        # Format seconds-from-recording-start as HHhMMmSS.s with overflow
+        # hours (e.g. 73h14m22.5). Matches eval_utils._to_hms.
         def _to_hms(sec):
             sec = float(sec)
             h = int(sec // 3600)
             m = int((sec % 3600) // 60)
             s = sec - h * 3600 - m * 60
-            return f"{h:02d}:{m:02d}:{s:04.1f}"
+            return f"{h:02d}h{m:02d}m{s:04.1f}"
 
         gt_lookup = {gt_idx: seizure_intervals[gt_idx] for gt_idx, _ in tp}
         for gt_idx, pred in tp:
