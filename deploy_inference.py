@@ -42,8 +42,6 @@ Usage
 """
 
 import argparse
-import csv
-import datetime
 import json
 import logging
 import sys
@@ -305,27 +303,6 @@ def infer_on_edf(model, edf_path, batch_size, device, logger):
 
 
 # ---------------------------------------------------------------------------
-# write_events_csv / write_events_json
-# ---------------------------------------------------------------------------
-def write_events_csv(out_path, events):
-    fields = ["event_idx", "start_sec", "end_sec", "duration_sec",
-              "start_datetime", "end_datetime", "max_prob", "mean_prob"]
-    with open(out_path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fields)
-        w.writeheader()
-        for i, e in enumerate(events):
-            row = {"event_idx": i}
-            for k in fields[1:]:
-                row[k] = e.get(k, "")
-            w.writerow(row)
-
-
-def write_events_json(out_path, events, metadata):
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump({"metadata": metadata, "events": events}, f, indent=2, default=str)
-
-
-# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 def main():
@@ -389,10 +366,17 @@ def main():
     logger.info("Detected %d events after smoothing/refractory/min-duration filtering.",
                 len(events))
 
-    # Augment events with absolute datetime stamps
+    # Augment events with recording-relative HH:MM:SS.s timestamps so they
+    # can be located directly on the EDF viewer's elapsed-time axis.
+    def _to_hms(sec):
+        sec = float(sec)
+        h = int(sec // 3600)
+        m = int((sec % 3600) // 60)
+        s = sec - h * 3600 - m * 60
+        return f"{h:02d}:{m:02d}:{s:04.1f}"
     for evt in events:
-        evt["start_datetime"] = (rec_start + datetime.timedelta(seconds=evt["start_sec"])).isoformat()
-        evt["end_datetime"]   = (rec_start + datetime.timedelta(seconds=evt["end_sec"])).isoformat()
+        evt["start_recording_time"] = _to_hms(evt["start_sec"])
+        evt["end_recording_time"]   = _to_hms(evt["end_sec"])
 
     # -- Write outputs (canonical 2-file deploy bundle) ----------------------
     # Use the shared writer in eval_utils so the deploy event_details CSV

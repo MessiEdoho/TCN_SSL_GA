@@ -882,12 +882,15 @@ def evaluate_event_level(partition_records, y_true_all, y_prob_all,
             "n_chunks":                  len(chunks),
         }
 
-        # Convert seconds-from-recording-start to ISO 8601 absolute datetime
-        # (seconds resolution -- microseconds are meaningless at the 2.5 s
-        # post-processing step) using each mouse's recording_start_dt.
-        def _to_iso(sec):
-            return (rec_start + datetime.timedelta(seconds=float(sec))) \
-                .replace(microsecond=0).isoformat()
+        # Format seconds-from-recording-start as HH:MM:SS.s with overflow
+        # hours (e.g. 73:14:22.5 for a 3-day recording), so events can be
+        # located directly in the EDF viewer's elapsed-time axis.
+        def _to_hms(sec):
+            sec = float(sec)
+            h = int(sec // 3600)
+            m = int((sec % 3600) // 60)
+            s = sec - h * 3600 - m * 60
+            return f"{h:02d}:{m:02d}:{s:04.1f}"
 
         gt_lookup = {gt_idx: seizure_intervals[gt_idx] for gt_idx, _ in tp}
         for gt_idx, pred in tp:
@@ -899,15 +902,15 @@ def evaluate_event_level(partition_records, y_true_all, y_prob_all,
                 "start_sec":                   pred["start_sec"],
                 "end_sec":                     pred["end_sec"],
                 "duration_sec":                pred["duration_sec"],
-                "start_datetime":              _to_iso(pred["start_sec"]),
-                "end_datetime":                _to_iso(pred["end_sec"]),
+                "start_recording_time":        _to_hms(pred["start_sec"]),
+                "end_recording_time":          _to_hms(pred["end_sec"]),
                 "mean_prob":                   pred.get("mean_prob"),
                 "max_prob":                    pred["max_prob"],
                 "matched_gt_idx":              gt_idx,
                 "matched_gt_start_sec":        round(gt_start_sec, 4),
                 "matched_gt_end_sec":          round(gt_end_sec, 4),
-                "matched_gt_start_datetime":   _to_iso(gt_start_sec),
-                "matched_gt_end_datetime":     _to_iso(gt_end_sec),
+                "matched_gt_start_recording_time": _to_hms(gt_start_sec),
+                "matched_gt_end_recording_time":   _to_hms(gt_end_sec),
                 "detection_latency_sec":       latency,
             })
         for pred in fp:
@@ -917,15 +920,15 @@ def evaluate_event_level(partition_records, y_true_all, y_prob_all,
                 "start_sec":                   pred["start_sec"],
                 "end_sec":                     pred["end_sec"],
                 "duration_sec":                pred["duration_sec"],
-                "start_datetime":              _to_iso(pred["start_sec"]),
-                "end_datetime":                _to_iso(pred["end_sec"]),
+                "start_recording_time":        _to_hms(pred["start_sec"]),
+                "end_recording_time":          _to_hms(pred["end_sec"]),
                 "mean_prob":                   pred.get("mean_prob"),
                 "max_prob":                    pred["max_prob"],
                 "matched_gt_idx":              None,
                 "matched_gt_start_sec":        None,
                 "matched_gt_end_sec":          None,
-                "matched_gt_start_datetime":   None,
-                "matched_gt_end_datetime":     None,
+                "matched_gt_start_recording_time": None,
+                "matched_gt_end_recording_time":   None,
                 "detection_latency_sec":       None,
             })
 
@@ -1039,15 +1042,15 @@ EVENT_DETAILS_FIELDS = [
     "start_sec",
     "end_sec",
     "duration_sec",
-    "start_datetime",
-    "end_datetime",
+    "start_recording_time",
+    "end_recording_time",
     "mean_prob",
     "max_prob",
     "matched_gt_idx",
     "matched_gt_start_sec",
     "matched_gt_end_sec",
-    "matched_gt_start_datetime",
-    "matched_gt_end_datetime",
+    "matched_gt_start_recording_time",
+    "matched_gt_end_recording_time",
     "detection_latency_sec",
 ]
 
@@ -1226,8 +1229,9 @@ def write_deploy_event_bundle(out_dir, stem, events,
     events : list of dict
         Output of segment_predictions_to_events (or equivalent). Each
         event dict must carry start_sec, end_sec, duration_sec,
-        mean_prob, max_prob, and may carry start_datetime / end_datetime
-        for the absolute clock-time columns.
+        mean_prob, max_prob, and may carry start_recording_time /
+        end_recording_time for the elapsed-time columns (HH:MM:SS.s since
+        recording start, overflow hours).
     recording_metadata : dict
         Must contain at least edf_path, recording_start_datetime
         (ISO 8601 string), recording_duration_sec.
@@ -1271,8 +1275,8 @@ def write_deploy_event_bundle(out_dir, stem, events,
         "predicted_events": {
             "n_predicted_events":                  len(deploy_events),
             "total_predicted_event_duration_sec":  total_pred_duration,
-            "predicted_event_starts_datetime":     [
-                e.get("start_datetime", "") for e in deploy_events
+            "predicted_event_starts_recording_time": [
+                e.get("start_recording_time", "") for e in deploy_events
             ],
         },
     }

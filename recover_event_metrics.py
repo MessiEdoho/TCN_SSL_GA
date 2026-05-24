@@ -607,14 +607,14 @@ def process_partition(partition, manifest, metadata, logger):
             "n_chunks":                    len(chunks),
         }
 
-        # Convert seconds-from-recording-start to ISO 8601 datetime using
-        # the mouse's recording_start_dt (loaded above as rec_start). The
-        # canonical 17-column event_details schema (eval_utils.EVENT_-
-        # DETAILS_FIELDS) requires start_datetime, end_datetime, mean_prob,
-        # matched_gt_*_datetime, detection_latency_sec for each event.
-        def _to_iso(sec):
-            return (rec_start + datetime.timedelta(seconds=float(sec))) \
-                .replace(microsecond=0).isoformat()
+        # Format seconds-from-recording-start as HH:MM:SS.s with overflow
+        # hours (e.g. 73:14:22.5). Matches eval_utils._to_hms.
+        def _to_hms(sec):
+            sec = float(sec)
+            h = int(sec // 3600)
+            m = int((sec % 3600) // 60)
+            s = sec - h * 3600 - m * 60
+            return f"{h:02d}:{m:02d}:{s:04.1f}"
 
         gt_lookup = {gt_idx: seizure_intervals[gt_idx] for gt_idx, _ in tp}
         for gt_idx, pred in tp:
@@ -627,15 +627,15 @@ def process_partition(partition, manifest, metadata, logger):
                 "start_sec":                   pred["start_sec"],
                 "end_sec":                     pred["end_sec"],
                 "duration_sec":                pred["duration_sec"],
-                "start_datetime":              _to_iso(pred["start_sec"]),
-                "end_datetime":                _to_iso(pred["end_sec"]),
+                "start_recording_time":        _to_hms(pred["start_sec"]),
+                "end_recording_time":          _to_hms(pred["end_sec"]),
                 "mean_prob":                   pred.get("mean_prob"),
                 "max_prob":                    pred["max_prob"],
                 "matched_gt_idx":              gt_idx,
                 "matched_gt_start_sec":        round(gt_start_sec, 4),
                 "matched_gt_end_sec":          round(gt_end_sec, 4),
-                "matched_gt_start_datetime":   _to_iso(gt_start_sec),
-                "matched_gt_end_datetime":     _to_iso(gt_end_sec),
+                "matched_gt_start_recording_time": _to_hms(gt_start_sec),
+                "matched_gt_end_recording_time":   _to_hms(gt_end_sec),
                 "detection_latency_sec":       latency,
             })
         for pred in fp:
@@ -646,15 +646,15 @@ def process_partition(partition, manifest, metadata, logger):
                 "start_sec":                   pred["start_sec"],
                 "end_sec":                     pred["end_sec"],
                 "duration_sec":                pred["duration_sec"],
-                "start_datetime":              _to_iso(pred["start_sec"]),
-                "end_datetime":                _to_iso(pred["end_sec"]),
+                "start_recording_time":        _to_hms(pred["start_sec"]),
+                "end_recording_time":          _to_hms(pred["end_sec"]),
                 "mean_prob":                   pred.get("mean_prob"),
                 "max_prob":                    pred["max_prob"],
                 "matched_gt_idx":              None,
                 "matched_gt_start_sec":        None,
                 "matched_gt_end_sec":          None,
-                "matched_gt_start_datetime":   None,
-                "matched_gt_end_datetime":     None,
+                "matched_gt_start_recording_time": None,
+                "matched_gt_end_recording_time":   None,
                 "detection_latency_sec":       None,
             })
 
