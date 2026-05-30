@@ -504,9 +504,18 @@ building unit.
       - Differential attention analysis (ictal minus non-ictal mean
         attention, highlighting time steps where the model attends
         more to seizure segments)
+      - Event-level attention profiles stratified by detection
+        outcome (TP, FP, FN), reconstructed across overlapping
+        windows via overlap-add and aligned at event onset
+        (Section 7.6.13). This view distinguishes saliency for
+        correct detections from the two failure modes, which the
+        class-averaged view cannot.
 
-    These visualisations are produced automatically during training
-    (Figure 13 in the training scripts).
+    The first three visualisations are produced automatically
+    during training (Figure 13 in the training scripts). The event-
+    level outcome-stratified analysis is a separate post-training
+    pass (event_attention_saliency.py) run on both val and test;
+    see Section 7.6.13.
 
     6.4.5 Architecture diagram
 
@@ -2410,6 +2419,214 @@ configurations.
                              at this dataset's ~0.27% ictal prevalence)
     Evaluation rows          3 (raw / post-processed / optimal threshold)
     Test-set access          Reserved for final_evaluation.py only
+
+7.6.13 Event-level attention saliency stratified by detection outcome
+
+    Motivation. The class-averaged temporal-attention saliency described
+    in Section 6.4.4 contrasts mean alpha_t between ictal and non-
+    ictal segments and answers the question "where inside a 5-second
+    window does the model attend, on average, for each class?". It
+    does not, however, distinguish between attention profiles for
+    seizures the model detected correctly (true positives), false
+    alarms (false positives), and seizures the model missed (false
+    negatives). For interpretability of the deployed system -- and
+    for diagnosing failure modes -- it is the per-outcome attention
+    profile that is most informative: a true-positive profile that
+    concentrates shortly after seizure onset, a false-positive
+    profile that concentrates on a different, transient feature, and
+    a false-negative profile that is flat (the model never "looked
+    at" the missed seizure) jointly characterise the model's
+    behaviour at the event level. This subsection describes the
+    methodology used to compute and aggregate that per-outcome
+    saliency on both validation and test partitions
+    (event_attention_saliency.py).
+
+    7.6.13.1 Per-window attention is a window-relative signal
+
+    The temporal-attention layer in MultiScaleTCNWithAttention
+    produces, for each input window of length WIN_LEN = 2,500
+    samples (5 s at FS = 500 Hz), a vector alpha_t of length T such
+    that sum_t alpha_t = 1. The MultiScaleTCN backbone applies
+    dilated causal convolutions with no stride and no pooling, and
+    fuses the three branches with a 1x1 convolution; the temporal
+    dimension is therefore preserved end-to-end, so T = WIN_LEN =
+    2,500 and attention is already at raw EEG sample resolution. No
+    upsampling between attention and input timescales is required.
+
+    7.6.13.2 Per-event windows are 50%-overlapped, requiring overlap-
+    add to reconstruct a sample-resolution saliency timeline
+
+    The segmentation grid uses STEP = 1,250 samples (2.5 s) with
+    WIN_LEN = 2,500 samples (5 s), so any interior recording sample
+    is covered by exactly two windows. Naively concatenating per-
+    window saliency vectors along the recording timeline would
+    double-count every interior sample. The correct reconstruction
+    is overlap-add with count normalisation. For each window w with
+    start sample t_w and saliency vector alpha_w[0..WIN_LEN-1],
+    accumulate
+
+        S[t_w + k] += alpha_w[k]
+        C[t_w + k] += 1                    for k = 0..WIN_LEN-1
+
+    over all windows in the mouse. The continuous saliency stream is
+    then
+
+        saliency[t] = S[t] / C[t]    where C[t] > 0,
+
+    which is the mean of the per-window attention values that
+    physically cover sample t. Mean -- not sum -- so the two
+    contributions at every interior sample are not double counted.
+    The reconstruction is performed independently per mouse and per
+    filter-gap-free chunk (using split_into_chunks from eval_utils),
+    never bridging across recordings or across artefact-removed
+    segments.
+
+    7.6.13.3 Event source: post-processed events define WHERE; raw
+    attention defines WHAT
+
+    The TP / FP / FN labels under which saliency crops are
+    stratified come from the canonical event_details_row2.csv bundle
+    (per Section 7.6.9 the row-2 events are the post-processed event
+    list -- smoothing -> min-duration filter -> refractory merge --
+    that the deployed system would emit). TPs and FPs are read
+    directly from the CSV via the is_true_alarm flag. FNs are not
+    persisted in event_details.csv because the canonical schema
+    holds predicted events only; they are re-derived at runtime by
+    re-loading the seizure annotations and calling
+    match_events_to_ground_truth(predicted, gt_intervals), whose
+    unmatched-GT output is the FN set. The matching rule is the
+    same any-overlap convention used throughout Section 7.6.9, so
+    no inconsistency can be introduced between the saliency
+    analysis and the operational evaluation.
+
+    The attention values used to populate S in 7.6.13.2 are the raw
+    alpha_t tensor returned by get_attention_weights, with no
+    smoothing, thresholding, or post-processing applied. The
+    distinction is deliberate: post-processing tells us which events
+    to interpret (the deployed system's operational output); the raw
+    attention values are what the model actually attended to inside
+    each event. Filtering or smoothing the attention values before
+    visualisation would obscure exactly the model-internal focus
+    that interpretability is meant to reveal.
+
+    7.6.13.4 Window selection and compute
+
+    The full test partition contains 9,753,796 segments; running
+    attention extraction on all of them and materialising the
+    resulting (9.75M, 2,500) float32 tensor requires ~97 GB of host
+    RAM, which exceeded the node's memory in an earlier evaluation
+    pass. The corrected pipeline performs attention extraction on
+    only the windows whose 5-second span overlaps a TP, FP, or FN
+    interval; for the M4 test set this reduces the forward-pass
+    workload from ~9.75M to ~20,000 windows (~0.2%) and runtime
+    from ~22 hours to ~15-30 minutes on a V100. Window selection
+    uses the enriched manifest's t_start_sec field directly and the
+    inclusion test wt < event_start + MIN_EVENT_SEC AND wt +
+    SEGMENT_SEC > event_start.
+
+    The per-mouse working set is bounded: the attention cache for
+    one mouse holds at most a few thousand 2,500-sample float32
+    vectors (~tens of MB); the per-event accumulator arrays are
+    CROP_LEN_SAMPLES = MIN_EVENT_SEC * FS = 12,500 samples (~50 KB
+    each). Memory therefore stays under 1 GB regardless of partition
+    size.
+
+    7.6.13.5 Aggregation: align at onset, truncate to MIN_EVENT_SEC,
+    pool across mice
+
+    Each event crop is constructed by overlap-add on a per-event
+    local accumulator: for each event with start sample t_e the
+    accumulators S_e and C_e of length CROP_LEN_SAMPLES are zero-
+    initialised; every overlapping window contributes alpha[src_lo:
+    src_hi] into S_e[tgt_lo:tgt_hi] (with src/tgt indices chosen to
+    intersect the window's WIN_LEN span with the event's [0,
+    CROP_LEN_SAMPLES) range), and the per-sample mean S_e / max(C_e,
+    1) is the crop. Samples that fall outside the union of
+    overlapping windows are recorded as NaN so they can be masked
+    out at aggregation time.
+
+    Crops are pooled across all mice within each class. Aggregation
+    is NaN-aware: mean and standard error of the mean are computed
+    via nanmean and nanstd along the event axis, so partially-
+    covered tails do not bias the curve. Onset alignment plus
+    truncation to MIN_EVENT_SEC (25 s, the minimum post-processed
+    event duration enforced by the row-2 pipeline) guarantees that
+    every event contributes equally to every sample of the resulting
+    curve, removing the need for resampling-to-fixed-length
+    normalisation and preserving the absolute time axis. The chosen
+    truncation makes the analysis comparable across events of widely
+    differing durations without distorting the per-event temporal
+    structure: every event in the row-2 pipeline is, by construction,
+    at least MIN_EVENT_SEC seconds long.
+
+    7.6.13.6 Outputs
+
+    For each partition (val, test) the script writes the following
+    artefacts under
+    MODEL4_OUTPUT/MultiScaleTCNAttention/saliency_interprete/{val,
+    test}/:
+
+      event_attention_saliency.log    Per-run log with mouse-by-mouse
+                                      counts, window-selection statistics,
+                                      and forward-pass timing.
+      event_saliency_curves.png       Top panel: mean alpha_t +- SEM for
+                                      TP, FP, FN over the 0--MIN_EVENT_SEC
+                                      window. Bottom panel: number of
+                                      events contributing at each time
+                                      bin (constant within MIN_EVENT_SEC by
+                                      construction).
+      tp_fp_fn_difference.png         Differential profiles TP - FP and
+                                      TP - FN, highlighting where in the
+                                      event the model's attention pattern
+                                      diverges between successful detections
+                                      and the two failure modes.
+      per_event_saliency.npz          Stacked per-event crops (TP_crops,
+                                      FP_crops, FN_crops -- shape
+                                      n_events x CROP_LEN_SAMPLES each),
+                                      class-level mean / SEM curves, per-
+                                      sample event counts, and time-axis
+                                      array (TP_meta etc. carry mouse_id +
+                                      start/end seconds for each crop).
+      event_saliency_summary.json     Per-class event counts, mean
+                                      saliency amplitude, peak amplitude
+                                      and peak time, and provenance fields
+                                      (weights path, splits path,
+                                      event_details source).
+
+    7.6.13.7 Partition co-location
+
+    The val and test artefacts are co-located under a single
+    saliency_interprete/{val,test}/ sub-tree inside the model's
+    OUTPUT_ROOT (i.e., not under EVALUATION_DIR). The repo's general
+    val/test artefact separation rule applies to performance-
+    reporting artefacts (test_classification_report.json,
+    test_event_details.csv, test_summary.json), which remain under
+    EVALUATION_DIR for the test partition. Interpretability
+    artefacts are a distinct category -- they characterise model
+    behaviour rather than scoring it, and val/test interpretability
+    outputs are typically read side-by-side -- so the saliency_
+    interprete sub-tree is treated as a carve-out from that rule.
+    The val/test subdirectories preserve partition-level separation
+    at the file-system level.
+
+    7.6.13.8 Reading guidance for the paper
+
+    For the discussion section, the three curves are most useful
+    when read together. A TP curve that rises shortly after the
+    aligned t = 0 onset and decays toward the tail evidences early-
+    onset detection, supporting the architectural claim that
+    temporal attention captures seizure-relevant dynamics
+    (Section 6.4.4). An FP curve whose peak is shifted relative to
+    the TP curve indicates that the model's false alarms are not
+    "weak versions of true detections" but a temporally distinct
+    failure mode -- typically attention concentrating on a high-
+    amplitude transient that lacks the post-onset structure of a
+    genuine ictal evolution. An FN curve that is flat or low across
+    the entire MIN_EVENT_SEC window indicates that the model
+    assigned little attention to the GT-annotated region; this is
+    consistent with subthreshold ictal morphology (electrographic
+    seizures with low spectral power or atypical waveform), which
+    is the canonical hard case for surface-EEG seizure detection.
 
 References:
     Akiba, T., Sano, S., Yanase, T., Ohta, T., & Koyama, M. (2019).
