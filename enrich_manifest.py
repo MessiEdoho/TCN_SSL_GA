@@ -9,8 +9,12 @@ gains three additional fields from the per-mouse chronology files:
     "chrono_idx"   -- 0..n_grid-1, true chronological position
     "t_start_sec"  -- segment start time in seconds from recording start
 
-Train records are passed through unchanged (chronology is not built for
-train mice -- they are downsampled and shuffled at training time).
+By default train records are passed through unchanged (chronology is
+not built for train mice in the standard pipeline -- they are
+downsampled and shuffled at training time). With --include-train and
+the appropriate --input / --output overrides, train records are also
+enriched (full-train evaluation use-case; requires that
+build_chronology.py was run with --include-train first).
 
 Existing fields ("filepath", "label") are preserved, so consumers
 expecting the original schema continue to work; consumers expecting the
@@ -18,15 +22,22 @@ new fields (Phase B/C/D production code) read them directly.
 
 Inputs
 ------
-  data_splits_nonictal_sampled_filtered.json
+  data_splits_nonictal_sampled_filtered.json    (default)
   /home/people/22206468/scratch/INPUT_DATA/Data_diagnostic/chronologies/{mouse_id}_chronology.npz
+
+CLI overrides (full-train enrichment)
+-------------------------------------
+  --include-train     : also enrich the train partition
+  --input <path>      : override SPLITS_PATH (e.g. data_splits.json un-downsampled)
+  --output <path>     : override OUT_PATH
 
 Outputs
 -------
-  data_splits_nonictal_sampled_filtered_enriched.json   (alongside original)
+  data_splits_nonictal_sampled_filtered_enriched.json   (default)
   enrich_manifest.log
 """
 
+import argparse
 import json
 import logging
 import sys
@@ -45,6 +56,18 @@ CHRONOLOGY_DIR = Path("/home/people/22206468/scratch/INPUT_DATA/Data_diagnostic/
 LOG_PATH       = Path("/home/people/22206468/scratch/INPUT_DATA/Data_diagnostic/enrich_manifest.log")
 
 PARTITIONS_TO_ENRICH = ("val", "test")
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--include-train", action="store_true",
+                   help="Also enrich the train partition (default off).")
+    p.add_argument("--input",  type=Path, default=None,
+                   help="Override SPLITS_PATH (e.g. un-downsampled data_splits.json).")
+    p.add_argument("--output", type=Path, default=None,
+                   help="Override OUT_PATH.")
+    return p.parse_args()
 
 
 # ---------------------------------------------------------------------------
@@ -122,26 +145,31 @@ def enrich_partition(partition, records, logger):
 # main
 # ---------------------------------------------------------------------------
 def main():
+    args = parse_args()
+    splits_path = args.input  or SPLITS_PATH
+    out_path    = args.output or OUT_PATH
+    partitions  = (("train",) + PARTITIONS_TO_ENRICH) if args.include_train else PARTITIONS_TO_ENRICH
+
     logger = setup_logging()
     logger.info("=" * 65)
     logger.info("enrich_manifest.py")
-    logger.info("Splits manifest : %s", SPLITS_PATH)
+    logger.info("Splits manifest : %s", splits_path)
     logger.info("Chronology dir  : %s", CHRONOLOGY_DIR)
-    logger.info("Output          : %s", OUT_PATH)
+    logger.info("Output          : %s", out_path)
     logger.info("Log             : %s", LOG_PATH)
-    logger.info("Partitions      : %s (train passed through unchanged)",
-                PARTITIONS_TO_ENRICH)
+    logger.info("Partitions      : %s%s", partitions,
+                "" if args.include_train else " (train passed through unchanged)")
     logger.info("=" * 65)
 
-    if not SPLITS_PATH.exists():
-        logger.error("Splits manifest missing: %s", SPLITS_PATH); sys.exit(1)
+    if not splits_path.exists():
+        logger.error("Splits manifest missing: %s", splits_path); sys.exit(1)
     if not CHRONOLOGY_DIR.exists():
         logger.error("Chronology dir missing: %s. Run build_chronology.py first.",
                      CHRONOLOGY_DIR); sys.exit(1)
 
-    manifest = json.loads(SPLITS_PATH.read_text(encoding="utf-8"))
+    manifest = json.loads(splits_path.read_text(encoding="utf-8"))
 
-    for partition in PARTITIONS_TO_ENRICH:
+    for partition in partitions:
         records = manifest.get(partition, [])
         if not records:
             logger.warning("Partition '%s' is empty.", partition); continue
@@ -151,11 +179,13 @@ def main():
         manifest["metadata"] = {}
     manifest["metadata"]["enriched_with_chronology"] = True
     manifest["metadata"]["chronology_dir"]           = str(CHRONOLOGY_DIR)
+    manifest["metadata"]["enriched_partitions"]      = list(partitions)
 
-    OUT_PATH.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    size_mb = OUT_PATH.stat().st_size / 1e6
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    size_mb = out_path.stat().st_size / 1e6
     logger.info("-" * 65)
-    logger.info("Wrote enriched manifest: %s (%.2f MB)", OUT_PATH, size_mb)
+    logger.info("Wrote enriched manifest: %s (%.2f MB)", out_path, size_mb)
     logger.info("=" * 65)
 
 

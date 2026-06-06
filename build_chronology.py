@@ -11,16 +11,26 @@ training/eval scripts.
 
 Inputs
 ------
-  data_splits_nonictal_sampled_filtered.json
+  data_splits_nonictal_sampled_filtered.json  (default)
   mouse_recording_metadata.json                (per-mouse n_samples, fs_hz,
                                                 recording_start_dt from EDF
                                                 headers; produced by
                                                 extract_mouse_metadata.py)
   /home/people/22206468/scratch/seizure_times_updated/{mouse}_xlsx.xlsx
 
+CLI overrides (full-train chronology build)
+-------------------------------------------
+  --include-train          : add train mice to PARTITIONS_OF_INTEREST.
+                             Default is val+test only (the train pipeline
+                             usually downsamples and shuffles, so train
+                             chronology is not needed). Required for the
+                             full un-downsampled train evaluation.
+  --input-splits <path>    : override SPLITS_PATH. For full-train use,
+                             point at the un-downsampled data_splits.json.
+
 Output (under OUT_DIR)
 ----------------------
-  {mouse_id}_chronology.npz   -- one per val/test mouse, with arrays:
+  {mouse_id}_chronology.npz   -- one per mouse-of-interest, with arrays:
       fnames        : numpy string array, sorted by chronological position
       chrono_idx    : int64,  values 0..n_grid-1 (== the array index)
       t_start_sec   : float64, segment start time in seconds from
@@ -32,6 +42,7 @@ Output (under OUT_DIR)
   build_chronology.log        -- persistent log
 """
 
+import argparse
 import json
 import logging
 import sys
@@ -52,6 +63,16 @@ OUT_DIR        = Path("/home/people/22206468/scratch/INPUT_DATA/Data_diagnostic/
 LOG_PATH       = Path("/home/people/22206468/scratch/INPUT_DATA/Data_diagnostic/build_chronology.log")
 
 PARTITIONS_OF_INTEREST = ("val", "test")
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--include-train", action="store_true",
+                   help="Add train mice to PARTITIONS_OF_INTEREST (default off).")
+    p.add_argument("--input-splits", type=Path, default=None,
+                   help="Override SPLITS_PATH (e.g. un-downsampled data_splits.json).")
+    return p.parse_args()
 
 
 # ---------------------------------------------------------------------------
@@ -124,23 +145,28 @@ def save_chronology_npz(out_path, fname_to_chrono, mouse_id, mouse_meta,
 # main
 # ---------------------------------------------------------------------------
 def main():
+    args = parse_args()
+    splits_path = args.input_splits or SPLITS_PATH
+    partitions  = (("train",) + PARTITIONS_OF_INTEREST) if args.include_train else PARTITIONS_OF_INTEREST
+
     logger = setup_logging()
     logger.info("=" * 65)
     logger.info("build_chronology.py")
-    logger.info("Splits manifest : %s", SPLITS_PATH)
+    logger.info("Splits manifest : %s", splits_path)
     logger.info("Mouse metadata  : %s", METADATA_PATH)
     logger.info("Annotations dir : %s", ANNOT_DIR)
     logger.info("Output dir      : %s", OUT_DIR)
     logger.info("Log             : %s", LOG_PATH)
-    logger.info("Partitions      : %s (train excluded)", PARTITIONS_OF_INTEREST)
+    logger.info("Partitions      : %s%s", partitions,
+                "" if args.include_train else " (train excluded)")
     logger.info("=" * 65)
 
-    for p in [SPLITS_PATH, METADATA_PATH, ANNOT_DIR]:
+    for p in [splits_path, METADATA_PATH, ANNOT_DIR]:
         if not p.exists():
             logger.error("Required input missing: %s", p); sys.exit(1)
 
     metadata = json.loads(METADATA_PATH.read_text(encoding="utf-8"))
-    mouse_to_partitions = collect_mouse_ids(SPLITS_PATH, PARTITIONS_OF_INTEREST, logger)
+    mouse_to_partitions = collect_mouse_ids(splits_path, partitions, logger)
 
     failures = []
     completed = 0

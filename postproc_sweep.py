@@ -2,14 +2,17 @@
 postproc_sweep.py
 =================
 Sweep post-processing parameters (refractory-vs-min-duration order;
-MIN_EVENT_SEC) for any of the four model variants, on both val and test
-partitions in a single run. Reads cached _full predictions NPZ -- no
-model forward pass, no GPU.
+MIN_EVENT_SEC) for any of the four model variants. By default sweeps
+val + test from cached _full predictions NPZ; pass --include-train to
+additionally sweep the full un-downsampled train partition (separate
+cached NPZ produced by full_train_eval_*.py). CPU-only, no model
+forward, no GPU.
 
 Sweep grid per partition:
     order ∈ {refractory_then_min, min_then_refractory}
     MIN_EVENT_SEC ∈ {10, 15, 20, 25, 30}    (seconds)
-= 10 configurations per partition × 2 partitions = 20 evaluations.
+= 10 configurations per partition × 2 partitions = 20 evaluations
+  (40 if --include-train).
 
 Smoothing window (W=3), threshold (tau=0.5), refractory period (30 s),
 and FAR/hr denominator (step_sec = 2.5 s) are held at canonical values;
@@ -48,9 +51,19 @@ Outputs (per variant, under <output-dir>)
     test/
         refractory_then_min/  MIN_EVENT_SEC_10s/  15s/  20s/  30s/
         min_then_refractory/  MIN_EVENT_SEC_10s/  15s/  20s/  30s/
-    comparison_val_vs_test.csv         (16 rows: partition x order x sec)
+    comparison_val_vs_test.csv         (20 rows: partition x order x sec)
     impact_val_vs_test.png             (2x3 panels: rows = partitions)
     postproc_sweep.log
+
+Train sweep (with --include-train) is written to a SIBLING output root
+post_process_varing_sec_train/ under each variant, so it never mixes
+with the val/test artefacts:
+    full_train_evaluation/post_process_varing_sec_train/
+        train/  refractory_then_min/  MIN_EVENT_SEC_*s/
+                min_then_refractory/  MIN_EVENT_SEC_*s/
+        comparison_train.csv           (10 rows)
+        impact_train.png               (1x3 panels)
+        postproc_sweep.log
 """
 
 import argparse
@@ -113,13 +126,26 @@ def parse_args():
                    help="Override the cluster OUTPUT root (default /home/people/22206468/scratch/OUTPUT).")
     p.add_argument("--val-npz",        type=Path, default=None, help="Override val NPZ path.")
     p.add_argument("--test-npz",       type=Path, default=None, help="Override test NPZ path.")
+    p.add_argument("--train-npz",      type=Path, default=None,
+                   help="Override train NPZ path (only used with --include-train).")
     p.add_argument("--metadata",       type=Path, default=None, help="Override mouse metadata JSON path.")
     p.add_argument("--val-annot-dir",  type=Path, default=None, help="Override val annotations dir.")
     p.add_argument("--test-annot-dir", type=Path, default=None, help="Override test annotations dir.")
+    p.add_argument("--train-annot-dir",type=Path, default=None,
+                   help="Override train annotations dir (only used with --include-train).")
     p.add_argument("--manifest",       type=Path, default=None,
                    help="Override manifest path (enriched preferred). Used only "
                         "for _raw-format NPZs that lack embedded chronology.")
-    p.add_argument("--output-dir",     type=Path, default=None, help="Override output root.")
+    p.add_argument("--train-manifest", type=Path, default=None,
+                   help="Override train manifest path (only used with --include-train). "
+                        "Default points at data_splits_full_train_enriched.json.")
+    p.add_argument("--output-dir",     type=Path, default=None, help="Override output root (val/test).")
+    p.add_argument("--train-output-dir", type=Path, default=None,
+                   help="Override train output root (only used with --include-train). "
+                        "Default = <variant>/full_train_evaluation/post_process_varing_sec_train.")
+    p.add_argument("--include-train", action="store_true",
+                   help="Additionally sweep the full un-downsampled train partition. "
+                        "Writes to a sibling output root, untouched val/test outputs.")
     return p.parse_args()
 
 
@@ -134,65 +160,81 @@ def variant_config(local_root, cluster_root, cluster_mode):
         m2 = cluster_root / "MODEL2_OUTPUT" / "TCNAttention"
         m3 = cluster_root / "MODEL3_OUTPUT" / "MultiScaleTCN"
         m4 = cluster_root / "MODEL4_OUTPUT" / "MultiScaleTCNAttention"
-        val_annot  = CLUSTER_SCRATCH / "seizure_times_updated"
-        test_annot = CLUSTER_SCRATCH / "seizure_times_updated"
-        metadata   = CLUSTER_SCRATCH / "INPUT_DATA" / "Data_diagnostic" / "mouse_recording_metadata.json"
-        manifest   = CLUSTER_SCRATCH / "INPUT_DATA" / "data_splits_outputs" / "data_splits_nonictal_sampled_filtered_enriched.json"
+        val_annot   = CLUSTER_SCRATCH / "seizure_times_updated"
+        test_annot  = CLUSTER_SCRATCH / "seizure_times_updated"
+        train_annot = CLUSTER_SCRATCH / "seizure_times_updated"
+        metadata    = CLUSTER_SCRATCH / "INPUT_DATA" / "Data_diagnostic" / "mouse_recording_metadata.json"
+        manifest    = CLUSTER_SCRATCH / "INPUT_DATA" / "data_splits_outputs" / "data_splits_nonictal_sampled_filtered_enriched.json"
+        train_manifest = CLUSTER_SCRATCH / "INPUT_DATA" / "data_splits_outputs" / "data_splits_full_train_enriched.json"
     else:
         m1 = local_root / "TCN"
         m2 = local_root / "TCNAttention"
         m3 = local_root / "MultiScaleTCN"
         m4 = local_root / "MultiScaleTCNAttention"
-        val_annot  = local_root / "val_seizure_annot_updated"
-        test_annot = local_root / "test_seizure_annot_updated"
-        metadata   = local_root / "mouse_recording_metadata.json"
-        manifest   = local_root / "data_splits_nonictal_sampled_filtered_enriched.json"
+        val_annot   = local_root / "val_seizure_annot_updated"
+        test_annot  = local_root / "test_seizure_annot_updated"
+        train_annot = local_root / "train_seizure_annot_updated"
+        metadata    = local_root / "mouse_recording_metadata.json"
+        manifest    = local_root / "data_splits_nonictal_sampled_filtered_enriched.json"
+        train_manifest = local_root / "data_splits_full_train_enriched.json"
 
     variants = {
         "TCN": {
             "model_label": "M1 (TCN)",
-            "val_npz":  m1 / "tcn_val_predictions_full.npz",
-            "test_npz": m1 / "evaluation" / "tcn_test_predictions_full.npz",
-            "output":   m1 / "evaluation" / "post_process_varing_sec",
+            "val_npz":   m1 / "tcn_val_predictions_full.npz",
+            "test_npz":  m1 / "evaluation" / "tcn_test_predictions_full.npz",
+            "train_npz": m1 / "full_train_evaluation" / "tcn_full_train_predictions_full.npz",
+            "output":         m1 / "evaluation" / "post_process_varing_sec",
+            "output_train":   m1 / "full_train_evaluation" / "post_process_varing_sec_train",
         },
         "TCNWithAttention": {
             "model_label": "M2 (TCNAttention)",
-            "val_npz":  m2 / "tcn_attention_val_predictions_full.npz",
-            "test_npz": m2 / "evaluation" / "tcn_attention_test_predictions_full.npz",
-            "output":   m2 / "evaluation" / "post_process_varing_sec",
+            "val_npz":   m2 / "tcn_attention_val_predictions_full.npz",
+            "test_npz":  m2 / "evaluation" / "tcn_attention_test_predictions_full.npz",
+            "train_npz": m2 / "full_train_evaluation" / "tcn_attention_full_train_predictions_full.npz",
+            "output":         m2 / "evaluation" / "post_process_varing_sec",
+            "output_train":   m2 / "full_train_evaluation" / "post_process_varing_sec_train",
         },
         "MultiScaleTCN": {
             "model_label": "M3 (MultiScaleTCN)",
             # Cluster has the older _raw NPZ format (manifest-order, no
             # chronology fields). load_records_and_arrays auto-detects this
             # and falls back to manifest-based enrichment.
-            "val_npz":  m3 / "multiscale_tcn_predictions_raw.npz",
-            "test_npz": m3 / "evaluation" / "multiscale_tcn_test_predictions_raw.npz",
-            "output":   m3 / "evaluation" / "post_process_varing_sec",
+            "val_npz":   m3 / "multiscale_tcn_predictions_raw.npz",
+            "test_npz":  m3 / "evaluation" / "multiscale_tcn_test_predictions_raw.npz",
+            "train_npz": m3 / "full_train_evaluation" / "multiscale_tcn_full_train_predictions_full.npz",
+            "output":         m3 / "evaluation" / "post_process_varing_sec",
+            "output_train":   m3 / "full_train_evaluation" / "post_process_varing_sec_train",
         },
         "MultiScaleTCNWithAttention": {
             "model_label": "M4 (MultiScaleTCNAttention)",
-            "val_npz":  m4 / "val_event_metrics" / "ms_attn_val_predictions_full.npz",
-            "test_npz": m4 / "evaluation" / "ms_attn_test_predictions_full.npz",
-            "output":   m4 / "evaluation" / "post_process_varing_sec",
+            "val_npz":   m4 / "val_event_metrics" / "ms_attn_val_predictions_full.npz",
+            "test_npz":  m4 / "evaluation" / "ms_attn_test_predictions_full.npz",
+            "train_npz": m4 / "full_train_evaluation" / "ms_attn_full_train_predictions_full.npz",
+            "output":         m4 / "evaluation" / "post_process_varing_sec",
+            "output_train":   m4 / "full_train_evaluation" / "post_process_varing_sec_train",
         },
     }
-    return variants, val_annot, test_annot, metadata, manifest
+    return variants, val_annot, test_annot, train_annot, metadata, manifest, train_manifest
 
 
 def resolve_paths(args):
-    variants, val_annot, test_annot, metadata, manifest = variant_config(
+    variants, val_annot, test_annot, train_annot, metadata, manifest, train_manifest = variant_config(
         args.local_root, args.cluster_root, args.cluster)
     vcfg = variants[args.variant]
     return {
-        "model_label":    vcfg["model_label"],
-        "val_npz":        args.val_npz        or vcfg["val_npz"],
-        "test_npz":       args.test_npz       or vcfg["test_npz"],
-        "val_annot_dir":  args.val_annot_dir  or val_annot,
-        "test_annot_dir": args.test_annot_dir or test_annot,
-        "metadata":       args.metadata       or metadata,
-        "manifest":       args.manifest       or manifest,
-        "output":         args.output_dir     or vcfg["output"],
+        "model_label":     vcfg["model_label"],
+        "val_npz":         args.val_npz         or vcfg["val_npz"],
+        "test_npz":        args.test_npz        or vcfg["test_npz"],
+        "train_npz":       args.train_npz       or vcfg["train_npz"],
+        "val_annot_dir":   args.val_annot_dir   or val_annot,
+        "test_annot_dir":  args.test_annot_dir  or test_annot,
+        "train_annot_dir": args.train_annot_dir or train_annot,
+        "metadata":        args.metadata        or metadata,
+        "manifest":        args.manifest        or manifest,
+        "train_manifest":  args.train_manifest  or train_manifest,
+        "output":          args.output_dir      or vcfg["output"],
+        "output_train":    args.train_output_dir or vcfg["output_train"],
     }
 
 
@@ -459,6 +501,86 @@ def plot_impact(rows, out_path, model_label, logger):
     logger.info("Saved impact figure: %s", out_path)
 
 
+def plot_impact_train_only(rows, out_path, model_label, logger):
+    """Single-row variant of plot_impact: 1 row (train) x 3 cols. Used when
+    the train sweep is run on its own (no val/test in the row set)."""
+    def _subset(order):
+        sub = [r for r in rows if r["partition"] == "train" and r["order"] == order]
+        sub.sort(key=lambda r: r["min_event_sec"])
+        return sub
+
+    _, axes = plt.subplots(1, 3, figsize=(15, 4.8))
+
+    ax = axes[0]
+    for order in ORDERINGS:
+        sub = _subset(order)
+        if not sub:
+            continue
+        secs = [r["min_event_sec"]   for r in sub]
+        prec = [r["event_precision"] for r in sub]
+        rec  = [r["event_recall"]    for r in sub]
+        f1v  = [r["event_f1"]        for r in sub]
+        ls = ORDER_LINESTYLE[order]; mk = ORDER_MARKER[order]
+        lbl = ORDER_LABEL[order]
+        ax.plot(secs, prec, linestyle=ls, marker=mk, color="#5A7DC8",
+                linewidth=1.6, label=f"Precision ({lbl})")
+        ax.plot(secs, rec,  linestyle=ls, marker=mk, color="#5AC880",
+                linewidth=1.6, label=f"Recall ({lbl})")
+        ax.plot(secs, f1v,  linestyle=ls, marker=mk, color="#C8A05A",
+                linewidth=1.6, label=f"F1 ({lbl})")
+    ax.set_xlabel("MIN_EVENT_SEC (s)"); ax.set_ylabel("Score")
+    ax.set_title("[TRAIN] Event Precision / Recall / F1")
+    ax.set_xticks(SWEEP_SECS); ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=7, ncol=3, loc="upper center",
+              bbox_to_anchor=(0.5, -0.18), frameon=True)
+
+    ax = axes[1]
+    for order in ORDERINGS:
+        sub = _subset(order)
+        if not sub:
+            continue
+        secs = [r["min_event_sec"]      for r in sub]
+        fars = [r["event_far_per_hour"] for r in sub]
+        ax.plot(secs, fars,
+                linestyle=ORDER_LINESTYLE[order],
+                marker=ORDER_MARKER[order],
+                color=ORDER_COLOR[order],
+                linewidth=1.6,
+                label=ORDER_LABEL[order])
+    ax.set_xlabel("MIN_EVENT_SEC (s)"); ax.set_ylabel("Event-level FAR/hr")
+    ax.set_title("[TRAIN] Event-level FAR/hr")
+    ax.set_xticks(SWEEP_SECS); ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8, loc="best")
+
+    ax = axes[2]
+    for order in ORDERINGS:
+        sub = _subset(order)
+        if not sub:
+            continue
+        recs = [r["event_recall"]       for r in sub]
+        fars = [r["event_far_per_hour"] for r in sub]
+        secs = [r["min_event_sec"]      for r in sub]
+        ax.scatter(recs, fars, s=80, color=ORDER_COLOR[order],
+                   marker=ORDER_MARKER[order], zorder=3,
+                   label=ORDER_LABEL[order])
+        for s, x_, y_ in zip(secs, recs, fars):
+            ax.annotate(f"{s}s", xy=(x_, y_), xytext=(6, 4),
+                        textcoords="offset points", fontsize=9,
+                        color=ORDER_COLOR[order])
+    ax.set_xlabel("Event recall (sensitivity)")
+    ax.set_ylabel("Event-level FAR/hr")
+    ax.set_title("[TRAIN] Recall vs FAR/hr Pareto\n(bottom-right = ideal)")
+    ax.grid(True, alpha=0.3); ax.legend(fontsize=8, loc="best")
+
+    plt.suptitle("Impact of post-processing order x MIN_EVENT_SEC on %s "
+                 "-- FULL TRAIN (un-downsampled)" % model_label,
+                 fontsize=13)
+    plt.tight_layout(rect=(0, 0, 1, 0.94))
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    logger.info("Saved impact figure (train-only): %s", out_path)
+
+
 def sweep_partition(partition, npz_path, manifest_path, annot_dir,
                     mouse_metadata, output_root, model_label, logger):
     """Run the 2-order x N-sec sweep (N = len(SWEEP_SECS)) for one
@@ -550,6 +672,11 @@ def main():
     logger.info("Mode            : %s", "cluster" if args.cluster else "local")
     logger.info("Val NPZ         : %s", paths["val_npz"])
     logger.info("Test NPZ        : %s", paths["test_npz"])
+    if args.include_train:
+        logger.info("Train NPZ       : %s", paths["train_npz"])
+        logger.info("Train manifest  : %s", paths["train_manifest"])
+        logger.info("Train annot dir : %s", paths["train_annot_dir"])
+        logger.info("Train output    : %s", paths["output_train"])
     logger.info("Metadata        : %s", paths["metadata"])
     logger.info("Manifest        : %s", paths["manifest"])
     logger.info("Val annot dir   : %s", paths["val_annot_dir"])
@@ -558,6 +685,7 @@ def main():
     logger.info("Log             : %s", log_path)
     logger.info("Orderings       : %s", ORDERINGS)
     logger.info("Sweep secs      : %s", SWEEP_SECS)
+    logger.info("Include train   : %s", args.include_train)
     logger.info("=" * 65)
 
     if not paths["metadata"].exists():
@@ -579,11 +707,33 @@ def main():
         all_rows.extend(rows)
 
     if not all_rows:
-        logger.error("No sweep rows produced -- comparison CSV / plot will not be written.")
-        sys.exit(1)
+        logger.error("No val/test sweep rows produced -- comparison CSV / plot will not be written.")
+    else:
+        write_comparison_csv(comparison_csv, all_rows, logger)
+        plot_impact(all_rows, impact_plot, paths["model_label"], logger)
 
-    write_comparison_csv(comparison_csv, all_rows, logger)
-    plot_impact(all_rows, impact_plot, paths["model_label"], logger)
+    if args.include_train:
+        train_output_root  = paths["output_train"]
+        train_log, _ = setup_logging(train_output_root)
+        logger.info("#" * 65)
+        logger.info("PARTITION: TRAIN (sibling output root: %s)", train_output_root)
+        logger.info("#" * 65)
+        train_rows = sweep_partition(
+            "train", paths["train_npz"], paths["train_manifest"],
+            paths["train_annot_dir"],
+            mouse_metadata, train_output_root, paths["model_label"], train_log)
+        if not train_rows:
+            logger.error("No train sweep rows produced -- train comparison CSV / plot "
+                         "will not be written.")
+        else:
+            train_comparison_csv = train_output_root / "comparison_train.csv"
+            train_impact_plot    = train_output_root / "impact_train.png"
+            write_comparison_csv(train_comparison_csv, train_rows, train_log)
+            plot_impact_train_only(train_rows, train_impact_plot,
+                                   paths["model_label"], train_log)
+
+    if not all_rows and not (args.include_train):
+        sys.exit(1)
 
     logger.info("=" * 65)
     logger.info("DONE")
