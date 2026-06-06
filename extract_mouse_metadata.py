@@ -18,8 +18,19 @@ proceed without it.
 
 Inputs
 ------
-  data_splits_nonictal_sampled_filtered.json   (val + test partitions)
+  data_splits_nonictal_sampled_filtered.json   (default; val + test mice)
   EDF files under /home/people/22206468/scratch/Raw EDF/
+
+CLI overrides (full-train metadata coverage)
+--------------------------------------------
+  --include-train         : add train mice to PARTITIONS_OF_INTEREST.
+                            Required when downstream full-train pipeline
+                            (build_chronology --include-train,
+                            enrich_manifest --include-train,
+                            full_train_eval_*.py) needs metadata for the
+                            ~72 train-only mice.
+  --input-splits <path>   : override SPLITS_PATH. For full-train use,
+                            point at the un-downsampled data_splits.json.
 
 Output
 ------
@@ -27,6 +38,7 @@ Output
   /home/people/22206468/scratch/INPUT_DATA/Data_diagnostic/extract_mouse_metadata.log
 """
 
+import argparse
 import json
 import logging
 import sys
@@ -44,9 +56,21 @@ OUT_DIR     = Path("/home/people/22206468/scratch/INPUT_DATA/Data_diagnostic")
 OUT_PATH    = OUT_DIR / "mouse_recording_metadata.json"
 LOG_PATH    = OUT_DIR / "extract_mouse_metadata.log"
 
-# Partitions to extract metadata for. Train is excluded -- it is downsampled
-# and shuffled at training time, so chronological order is not used there.
+# Partitions to extract metadata for. Train is excluded by default -- it is
+# downsampled and shuffled at training time, so chronological order is not
+# used there. Pass --include-train to add it (required for the full-train
+# eval + sweep pipeline).
 PARTITIONS_OF_INTEREST = ("val", "test")
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--include-train", action="store_true",
+                   help="Add train mice to PARTITIONS_OF_INTEREST (default off).")
+    p.add_argument("--input-splits", type=Path, default=None,
+                   help="Override SPLITS_PATH (e.g. un-downsampled data_splits.json).")
+    return p.parse_args()
 
 
 # ---------------------------------------------------------------------------
@@ -163,22 +187,26 @@ def extract_one_mouse(mouse_id, edf_path, partitions, logger):
 # main
 # ---------------------------------------------------------------------------
 def main():
+    args = parse_args()
+    splits_path = args.input_splits or SPLITS_PATH
+    partitions  = (("train",) + PARTITIONS_OF_INTEREST) if args.include_train else PARTITIONS_OF_INTEREST
+
     logger = setup_logging()
     logger.info("=" * 65)
     logger.info("extract_mouse_metadata.py")
-    logger.info("Splits manifest : %s", SPLITS_PATH)
+    logger.info("Splits manifest : %s", splits_path)
     logger.info("EDF root        : %s", EDF_ROOT)
     logger.info("Output JSON     : %s", OUT_PATH)
     logger.info("Output log      : %s", LOG_PATH)
-    logger.info("Partitions      : %s (train excluded -- not chronologically used)",
-                PARTITIONS_OF_INTEREST)
+    logger.info("Partitions      : %s%s", partitions,
+                "" if args.include_train else " (train excluded)")
     logger.info("=" * 65)
 
     if not EDF_ROOT.exists():
         logger.error("EDF root does not exist: %s", EDF_ROOT)
         sys.exit(1)
 
-    mouse_to_partitions = collect_mouse_ids(SPLITS_PATH, PARTITIONS_OF_INTEREST, logger)
+    mouse_to_partitions = collect_mouse_ids(splits_path, partitions, logger)
     if not mouse_to_partitions:
         logger.error("No mice collected from the manifest. Aborting.")
         sys.exit(1)
