@@ -51,7 +51,19 @@ import mne
 # Paths
 # ---------------------------------------------------------------------------
 SPLITS_PATH = Path("/scratch/22206468/INPUT_DATA/data_splits_outputs/data_splits_nonictal_sampled_filtered.json")
-EDF_ROOT    = Path("/home/people/22206468/scratch/Raw EDF")
+
+# Candidate EDF root directories. Search order: Raw EDF first (where the
+# val/test mice live), then the five EEG_TRAINING* batches (where train
+# mice are split across). find_edf_for_mouse returns the first hit.
+EDF_ROOTS = (
+    Path("/home/people/22206468/scratch/Raw EDF"),
+    Path("/home/people/22206468/scratch/EEG_TRAINING"),
+    Path("/home/people/22206468/scratch/EEG_TRAINING_2"),
+    Path("/home/people/22206468/scratch/EEG_TRAINING_3"),
+    Path("/home/people/22206468/scratch/EEG_TRAINING_4"),
+    Path("/home/people/22206468/scratch/EEG_TRAINING_5"),
+)
+
 OUT_DIR     = Path("/home/people/22206468/scratch/INPUT_DATA/Data_diagnostic")
 OUT_PATH    = OUT_DIR / "mouse_recording_metadata.json"
 LOG_PATH    = OUT_DIR / "extract_mouse_metadata.log"
@@ -136,15 +148,20 @@ def collect_mouse_ids(splits_path, partitions, logger):
 # ---------------------------------------------------------------------------
 # find_edf_for_mouse
 # ---------------------------------------------------------------------------
-def find_edf_for_mouse(mouse_id, edf_root, logger):
-    """Locate the EDF file for a given mouse_id under edf_root. Files
-    are named {mouse_id}.edf (e.g. m1.edf, m223.edf).
+def find_edf_for_mouse(mouse_id, edf_roots, logger):
+    """Locate the EDF file for a given mouse_id under any of the candidate
+    roots. Files are named {mouse_id}.edf (e.g. m1.edf, m223.edf). Returns
+    the first match in iteration order.
     """
-    edf_path = edf_root / f"{mouse_id}.edf"
-    if not edf_path.exists():
-        logger.error("No EDF found for mouse %s at %s", mouse_id, edf_path)
-        return None
-    return edf_path
+    for root in edf_roots:
+        if not root.exists():
+            continue
+        edf_path = root / f"{mouse_id}.edf"
+        if edf_path.exists():
+            return edf_path
+    logger.error("No EDF found for mouse %s under any of %d roots: %s",
+                 mouse_id, len(edf_roots), [str(r) for r in edf_roots])
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -179,7 +196,7 @@ def extract_one_mouse(mouse_id, edf_path, partitions, logger):
     }
     logger.info("  %-8s : %d samples @ %.0f Hz (%.1f h) | start=%s | edf=%s",
                 mouse_id, n_samples, fs_hz, record["duration_hr"],
-                record["recording_start_dt"], edf_path.name)
+                record["recording_start_dt"], edf_path)
     return record
 
 
@@ -195,15 +212,18 @@ def main():
     logger.info("=" * 65)
     logger.info("extract_mouse_metadata.py")
     logger.info("Splits manifest : %s", splits_path)
-    logger.info("EDF root        : %s", EDF_ROOT)
+    logger.info("EDF roots       : %d candidates", len(EDF_ROOTS))
+    for r in EDF_ROOTS:
+        logger.info("                  %s  (exists=%s)", r, r.exists())
     logger.info("Output JSON     : %s", OUT_PATH)
     logger.info("Output log      : %s", LOG_PATH)
     logger.info("Partitions      : %s%s", partitions,
                 "" if args.include_train else " (train excluded)")
     logger.info("=" * 65)
 
-    if not EDF_ROOT.exists():
-        logger.error("EDF root does not exist: %s", EDF_ROOT)
+    if not any(r.exists() for r in EDF_ROOTS):
+        logger.error("None of the configured EDF roots exist: %s",
+                     [str(r) for r in EDF_ROOTS])
         sys.exit(1)
 
     mouse_to_partitions = collect_mouse_ids(splits_path, partitions, logger)
@@ -217,7 +237,7 @@ def main():
     metadata = {}
     failures = []
     for mouse_id in sorted(mouse_to_partitions):
-        edf_path = find_edf_for_mouse(mouse_id, EDF_ROOT, logger)
+        edf_path = find_edf_for_mouse(mouse_id, EDF_ROOTS, logger)
         if edf_path is None:
             failures.append(mouse_id)
             continue

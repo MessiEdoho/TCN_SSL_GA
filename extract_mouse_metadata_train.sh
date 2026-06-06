@@ -45,7 +45,13 @@ cd ~/TCN_SSL_GA
 
 # Reads:
 #   /scratch/22206468/INPUT_DATA/data_splits_outputs/data_splits.json   (UN-DOWNSAMPLED)
-#   /home/people/22206468/scratch/Raw EDF/*.edf                         (train + val + test mice)
+#   EDF files searched across 6 roots (first hit wins):
+#     /home/people/22206468/scratch/Raw EDF/                            (val + test mice)
+#     /home/people/22206468/scratch/EEG_TRAINING/                       (train mice batch 1)
+#     /home/people/22206468/scratch/EEG_TRAINING_2/                     (train mice batch 2)
+#     /home/people/22206468/scratch/EEG_TRAINING_3/                     (train mice batch 3)
+#     /home/people/22206468/scratch/EEG_TRAINING_4/                     (train mice batch 4)
+#     /home/people/22206468/scratch/EEG_TRAINING_5/                     (train mice batch 5)
 # Writes:
 #   /home/people/22206468/scratch/INPUT_DATA/Data_diagnostic/mouse_recording_metadata.json
 #                                                                       (overwrites; superset of prior file)
