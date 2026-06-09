@@ -528,24 +528,36 @@ def main():
                 row2_metrics.get("far_per_hour_event", float("nan")))
     logger.info("=" * 65)
 
-    pfx = "multiscale_tcn_full_train"
+    # Two prefixes coexist in this directory:
+    #   * pfx_bespoke : files this script writes directly (carry "full_train")
+    #   * pfx_helpers : files produced by MultiScaleTCN.save_all_results /
+    #                   plot_all_figures, whose internal prefix is hard-coded
+    #                   to "multiscale_tcn" and is not overridden by the
+    #                   path-globals rebind in _redirect_outputs_to_full_train_eval
+    pfx_bespoke = "multiscale_tcn_full_train"
+    pfx_helpers = "multiscale_tcn"
     all_outputs = [
-        FULL_TRAIN_EVAL_DIR / "multiscale_tcn_full_train_evaluation_report.json",
-        FULL_TRAIN_EVAL_DIR / "multiscale_tcn_full_train_three_row_summary.csv",
-        FULL_TRAIN_EVAL_DIR / "multiscale_tcn_full_train_classification_report_row1.json",
-        FULL_TRAIN_EVAL_DIR / "multiscale_tcn_full_train_classification_report_row2.json",
-        FULL_TRAIN_EVAL_DIR / "multiscale_tcn_full_train_event_details_row2.csv",
+        FULL_TRAIN_EVAL_DIR / f"{pfx_bespoke}_evaluation_report.json",
+        FULL_TRAIN_EVAL_DIR / f"{pfx_bespoke}_three_row_summary.csv",
+        FULL_TRAIN_EVAL_DIR / f"{pfx_helpers}_classification_report_row1.json",
+        FULL_TRAIN_EVAL_DIR / f"{pfx_helpers}_classification_report_row2.json",
+        FULL_TRAIN_EVAL_DIR / f"{pfx_bespoke}_event_details_row2.csv",
+        # Canonical 4-file bundle (write_event_level_bundle, "train" partition)
+        FULL_TRAIN_EVAL_DIR / "train_summary.json",
+        FULL_TRAIN_EVAL_DIR / "train_event_details.csv",
+        FULL_TRAIN_EVAL_DIR / "train_classification_report_row1.json",
+        FULL_TRAIN_EVAL_DIR / "train_classification_report_row2.json",
         FULL_TRAIN_PREDICTIONS_NPZ,
-        FULL_TRAIN_EVAL_FIGURE_DIR / ("%s_confusion_matrix_row1.png" % pfx),
-        FULL_TRAIN_EVAL_FIGURE_DIR / ("%s_confusion_matrix_row2.png" % pfx),
-        FULL_TRAIN_EVAL_FIGURE_DIR / ("%s_roc_curve.png" % pfx),
-        FULL_TRAIN_EVAL_FIGURE_DIR / ("%s_metrics_comparison.png" % pfx),
-        FULL_TRAIN_EVAL_FIGURE_DIR / ("%s_pr_curve.png" % pfx),
-        FULL_TRAIN_EVAL_FIGURE_DIR / ("%s_calibration_curve.png" % pfx),
-        FULL_TRAIN_EVAL_FIGURE_DIR / ("%s_far_comparison.png" % pfx),
-        FULL_TRAIN_EVAL_FIGURE_DIR / ("%s_segment_length_analysis.png" % pfx),
-        FULL_TRAIN_EVAL_FIGURE_DIR / ("%s_branch_rf_diagram.png" % pfx),
-        FULL_TRAIN_EVAL_CLASSREPORT_DIR / ("%s_classreport_barplot.png" % pfx),
+        FULL_TRAIN_EVAL_FIGURE_DIR / f"{pfx_helpers}_confusion_matrix_row1.png",
+        FULL_TRAIN_EVAL_FIGURE_DIR / f"{pfx_helpers}_confusion_matrix_row2.png",
+        FULL_TRAIN_EVAL_FIGURE_DIR / f"{pfx_helpers}_roc_curve.png",
+        FULL_TRAIN_EVAL_FIGURE_DIR / f"{pfx_helpers}_metrics_comparison.png",
+        FULL_TRAIN_EVAL_FIGURE_DIR / f"{pfx_helpers}_pr_curve.png",
+        FULL_TRAIN_EVAL_FIGURE_DIR / f"{pfx_helpers}_calibration_curve.png",
+        FULL_TRAIN_EVAL_FIGURE_DIR / f"{pfx_helpers}_far_comparison.png",
+        FULL_TRAIN_EVAL_FIGURE_DIR / f"{pfx_helpers}_segment_length_analysis.png",
+        FULL_TRAIN_EVAL_FIGURE_DIR / f"{pfx_helpers}_branch_rf_diagram.png",
+        FULL_TRAIN_EVAL_CLASSREPORT_DIR / f"{pfx_bespoke}_classreport_barplot.png",
         FULL_TRAIN_EVAL_LOG_PATH,
     ]
     for p in all_outputs:

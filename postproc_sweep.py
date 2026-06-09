@@ -2,17 +2,26 @@
 postproc_sweep.py
 =================
 Sweep post-processing parameters (refractory-vs-min-duration order;
-MIN_EVENT_SEC) for any of the four model variants. By default sweeps
-val + test from cached _full predictions NPZ; pass --include-train to
-additionally sweep the full un-downsampled train partition (separate
-cached NPZ produced by full_train_eval_*.py). CPU-only, no model
-forward, no GPU.
+MIN_EVENT_SEC) for any of the four model variants on a user-selected
+subset of partitions. Reads cached _full predictions NPZ; CPU-only,
+no model forward, no GPU.
+
+Partition selection (--partitions)
+----------------------------------
+Multi-value flag, default 'val test'. Each selected partition runs
+independently and writes to its own output root (val/test share the
+'evaluation/post_process_varing_sec' root; train uses the sibling
+'full_train_evaluation/post_process_varing_sec_train' root). Examples:
+
+    --partitions val test          (default; historical behaviour)
+    --partitions train             (train only; no val/test refresh)
+    --partitions val test train    (refresh all three)
+    --partitions test              (test only)
 
 Sweep grid per partition:
     order ∈ {refractory_then_min, min_then_refractory}
     MIN_EVENT_SEC ∈ {10, 15, 20, 25, 30}    (seconds)
-= 10 configurations per partition × 2 partitions = 20 evaluations
-  (40 if --include-train).
+= 10 configurations per partition. Total evaluations = 10 × |partitions|.
 
 Smoothing window (W=3), threshold (tau=0.5), refractory period (30 s),
 and FAR/hr denominator (step_sec = 2.5 s) are held at canonical values;
@@ -127,25 +136,30 @@ def parse_args():
     p.add_argument("--val-npz",        type=Path, default=None, help="Override val NPZ path.")
     p.add_argument("--test-npz",       type=Path, default=None, help="Override test NPZ path.")
     p.add_argument("--train-npz",      type=Path, default=None,
-                   help="Override train NPZ path (only used with --include-train).")
+                   help="Override train NPZ path (used when train is in --partitions).")
     p.add_argument("--metadata",       type=Path, default=None, help="Override mouse metadata JSON path.")
     p.add_argument("--val-annot-dir",  type=Path, default=None, help="Override val annotations dir.")
     p.add_argument("--test-annot-dir", type=Path, default=None, help="Override test annotations dir.")
     p.add_argument("--train-annot-dir",type=Path, default=None,
-                   help="Override train annotations dir (only used with --include-train).")
+                   help="Override train annotations dir (used when train is in --partitions).")
     p.add_argument("--manifest",       type=Path, default=None,
                    help="Override manifest path (enriched preferred). Used only "
                         "for _raw-format NPZs that lack embedded chronology.")
     p.add_argument("--train-manifest", type=Path, default=None,
-                   help="Override train manifest path (only used with --include-train). "
+                   help="Override train manifest path (used when train is in --partitions). "
                         "Default points at data_splits_full_train_enriched.json.")
     p.add_argument("--output-dir",     type=Path, default=None, help="Override output root (val/test).")
     p.add_argument("--train-output-dir", type=Path, default=None,
-                   help="Override train output root (only used with --include-train). "
+                   help="Override train output root (used when train is in --partitions). "
                         "Default = <variant>/full_train_evaluation/post_process_varing_sec_train.")
-    p.add_argument("--include-train", action="store_true",
-                   help="Additionally sweep the full un-downsampled train partition. "
-                        "Writes to a sibling output root, untouched val/test outputs.")
+    p.add_argument("--partitions", nargs="+",
+                   choices=["val", "test", "train"],
+                   default=["val", "test"],
+                   help="Which partitions to sweep. Each partition runs "
+                        "independently and writes to its own output root. "
+                        "Default: 'val test' (preserves historical behaviour). "
+                        "Pass '--partitions train' to sweep train only, or "
+                        "'--partitions val test train' to refresh all three.")
     return p.parse_args()
 
 
@@ -412,16 +426,21 @@ def write_comparison_csv(out_path, rows, logger):
     logger.info("Saved comparison CSV: %s (%d rows)", out_path, len(rows))
 
 
-def plot_impact(rows, out_path, model_label, logger):
-    """2 rows (val/test) x 3 cols (P/R/F1 lines, FAR line, Pareto)."""
+def plot_impact(rows, out_path, model_label, partitions, logger):
+    """N rows (one per partition) x 3 cols (P/R/F1 lines, FAR line, Pareto).
+    partitions is the ordered list of partitions to plot (e.g. ['val',
+    'test'] or just ['val'])."""
     def _subset(partition, order):
         sub = [r for r in rows if r["partition"] == partition and r["order"] == order]
         sub.sort(key=lambda r: r["min_event_sec"])
         return sub
 
-    fig, axes = plt.subplots(2, 3, figsize=(15, 9))
+    n_rows = len(partitions)
+    fig, axes = plt.subplots(n_rows, 3, figsize=(15, 4.5 * n_rows + 0.5))
+    if n_rows == 1:
+        axes = axes.reshape(1, 3)
 
-    for row_i, partition in enumerate(PARTITIONS):
+    for row_i, partition in enumerate(partitions):
         ax = axes[row_i, 0]
         for order in ORDERINGS:
             sub = _subset(partition, order)
@@ -486,13 +505,22 @@ def plot_impact(rows, out_path, model_label, logger):
         ax.set_title(f"[{partition.upper()}] Recall vs FAR/hr Pareto\n(bottom-right = ideal)")
         ax.grid(True, alpha=0.3); ax.legend(fontsize=8, loc="best")
 
-    plt.suptitle("Impact of post-processing order x MIN_EVENT_SEC on %s "
-                 "-- val (top) vs test (bottom)" % model_label,
-                 fontsize=13)
+    if n_rows == 2 and partitions == ["val", "test"]:
+        suptitle = ("Impact of post-processing order x MIN_EVENT_SEC on %s "
+                    "-- val (top) vs test (bottom)" % model_label)
+    elif n_rows == 1:
+        suptitle = ("Impact of post-processing order x MIN_EVENT_SEC on %s "
+                    "-- %s" % (model_label, partitions[0].upper()))
+    else:
+        suptitle = ("Impact of post-processing order x MIN_EVENT_SEC on %s "
+                    "-- %s" % (model_label, " / ".join(p.upper() for p in partitions)))
+    plt.suptitle(suptitle, fontsize=13)
     plt.tight_layout(rect=(0, 0, 1, 0.96))
-    # Add vertical breathing room between the two rows so the [VAL] P/R/F1
-    # legend (sitting below its axes) doesn't crowd the [TEST] row's titles.
-    fig.subplots_adjust(hspace=0.55)
+    if n_rows > 1:
+        # Vertical breathing room between rows so the per-row P/R/F1
+        # legend (sitting below its axes) doesn't crowd the next row's
+        # titles. Only needed for multi-row plots.
+        fig.subplots_adjust(hspace=0.55)
     # bbox_inches="tight" expands the saved figure to fit the below-axis
     # legend on the bottom row (which would otherwise sit outside the
     # default canvas).
@@ -657,82 +685,119 @@ def sweep_partition(partition, npz_path, manifest_path, annot_dir,
     return rows
 
 
-def main():
-    args   = parse_args()
-    paths  = resolve_paths(args)
-    logger, log_path = setup_logging(paths["output"])
+def _comparison_filename(partitions):
+    """Return (csv_name, png_name) for a group of partitions sharing one
+    output root. Preserves the historical 'val_vs_test' form when both
+    val and test are present; otherwise joins partition names with '_'.
+    """
+    if set(partitions) == {"val", "test"}:
+        return "comparison_val_vs_test.csv", "impact_val_vs_test.png"
+    joined = "_".join(partitions)
+    return f"comparison_{joined}.csv", f"impact_{joined}.png"
 
-    output_root    = paths["output"]
-    comparison_csv = output_root / "comparison_val_vs_test.csv"
-    impact_plot    = output_root / "impact_val_vs_test.png"
+
+def main():
+    args  = parse_args()
+    paths = resolve_paths(args)
+
+    # Partition routing. val/test share the 'evaluation/post_process_varing_sec'
+    # output root and a single comparison CSV + impact plot. train uses its
+    # own sibling root and writes its own comparison/plot. Each side runs
+    # independently of the other; one can be selected without the other.
+    val_test_partitions = [p for p in args.partitions if p != "train"]
+    run_train           = "train" in args.partitions
+
+    # Primary log goes wherever the (first or only) partition group writes:
+    # - any val/test partitions selected -> primary log in val/test output root
+    # - train-only run                   -> primary log in train sibling root
+    primary_log_dir = paths["output"] if val_test_partitions else paths["output_train"]
+    logger, log_path = setup_logging(primary_log_dir)
 
     logger.info("=" * 65)
     logger.info("postproc_sweep.py")
     logger.info("Variant         : %s (%s)", args.variant, paths["model_label"])
     logger.info("Mode            : %s", "cluster" if args.cluster else "local")
-    logger.info("Val NPZ         : %s", paths["val_npz"])
-    logger.info("Test NPZ        : %s", paths["test_npz"])
-    if args.include_train:
-        logger.info("Train NPZ       : %s", paths["train_npz"])
-        logger.info("Train manifest  : %s", paths["train_manifest"])
-        logger.info("Train annot dir : %s", paths["train_annot_dir"])
-        logger.info("Train output    : %s", paths["output_train"])
+    logger.info("Partitions      : %s", args.partitions)
     logger.info("Metadata        : %s", paths["metadata"])
-    logger.info("Manifest        : %s", paths["manifest"])
-    logger.info("Val annot dir   : %s", paths["val_annot_dir"])
-    logger.info("Test annot dir  : %s", paths["test_annot_dir"])
-    logger.info("Output root     : %s", output_root)
+    if val_test_partitions:
+        logger.info("Val/test output : %s", paths["output"])
+        logger.info("Manifest        : %s", paths["manifest"])
+        for p in val_test_partitions:
+            logger.info("  %s NPZ         : %s", p, paths[f"{p}_npz"])
+            logger.info("  %s annot dir   : %s", p, paths[f"{p}_annot_dir"])
+    if run_train:
+        logger.info("Train output    : %s", paths["output_train"])
+        logger.info("  train NPZ      : %s", paths["train_npz"])
+        logger.info("  train manifest : %s", paths["train_manifest"])
+        logger.info("  train annot dir: %s", paths["train_annot_dir"])
     logger.info("Log             : %s", log_path)
     logger.info("Orderings       : %s", ORDERINGS)
     logger.info("Sweep secs      : %s", SWEEP_SECS)
-    logger.info("Include train   : %s", args.include_train)
     logger.info("=" * 65)
 
     if not paths["metadata"].exists():
         logger.error("Required input missing: %s", paths["metadata"]); sys.exit(1)
     mouse_metadata = json.loads(paths["metadata"].read_text(encoding="utf-8"))
 
-    npz_map        = {"val": paths["val_npz"],       "test": paths["test_npz"]}
-    annot_dir_map  = {"val": paths["val_annot_dir"], "test": paths["test_annot_dir"]}
+    any_rows_written = False
 
-    all_rows = []
-    for partition in PARTITIONS:
-        logger.info("#" * 65)
-        logger.info("PARTITION: %s", partition.upper())
-        logger.info("#" * 65)
-        rows = sweep_partition(
-            partition, npz_map[partition], paths["manifest"],
-            annot_dir_map[partition],
-            mouse_metadata, output_root, paths["model_label"], logger)
-        all_rows.extend(rows)
+    # ── Val/test sweep ────────────────────────────────────────────────
+    if val_test_partitions:
+        npz_map        = {"val": paths["val_npz"],       "test": paths["test_npz"]}
+        annot_dir_map  = {"val": paths["val_annot_dir"], "test": paths["test_annot_dir"]}
 
-    if not all_rows:
-        logger.error("No val/test sweep rows produced -- comparison CSV / plot will not be written.")
-    else:
-        write_comparison_csv(comparison_csv, all_rows, logger)
-        plot_impact(all_rows, impact_plot, paths["model_label"], logger)
+        all_rows = []
+        for partition in val_test_partitions:
+            logger.info("#" * 65)
+            logger.info("PARTITION: %s", partition.upper())
+            logger.info("#" * 65)
+            rows = sweep_partition(
+                partition, npz_map[partition], paths["manifest"],
+                annot_dir_map[partition],
+                mouse_metadata, paths["output"], paths["model_label"], logger)
+            all_rows.extend(rows)
 
-    if args.include_train:
-        train_output_root  = paths["output_train"]
-        train_log, _ = setup_logging(train_output_root)
-        logger.info("#" * 65)
-        logger.info("PARTITION: TRAIN (sibling output root: %s)", train_output_root)
-        logger.info("#" * 65)
+        if all_rows:
+            comp_name, impact_name = _comparison_filename(val_test_partitions)
+            write_comparison_csv(paths["output"] / comp_name, all_rows, logger)
+            plot_impact(all_rows, paths["output"] / impact_name,
+                        paths["model_label"], val_test_partitions, logger)
+            any_rows_written = True
+        else:
+            logger.error("No %s sweep rows produced -- comparison CSV / plot "
+                         "will not be written.", "/".join(val_test_partitions))
+
+    # ── Train sweep (sibling output root, fully independent) ──────────
+    if run_train:
+        train_output_root = paths["output_train"]
+        # If val/test already initialised the primary logger at output_root,
+        # add a file handler for the train sibling root too so the train
+        # leg's log is accessible alongside its artefacts.
+        if val_test_partitions:
+            train_log, _ = setup_logging(train_output_root)
+        else:
+            train_log = logger
+
+        train_log.info("#" * 65)
+        train_log.info("PARTITION: TRAIN (sibling output root: %s)", train_output_root)
+        train_log.info("#" * 65)
         train_rows = sweep_partition(
             "train", paths["train_npz"], paths["train_manifest"],
             paths["train_annot_dir"],
             mouse_metadata, train_output_root, paths["model_label"], train_log)
-        if not train_rows:
-            logger.error("No train sweep rows produced -- train comparison CSV / plot "
-                         "will not be written.")
-        else:
-            train_comparison_csv = train_output_root / "comparison_train.csv"
-            train_impact_plot    = train_output_root / "impact_train.png"
-            write_comparison_csv(train_comparison_csv, train_rows, train_log)
-            plot_impact_train_only(train_rows, train_impact_plot,
+        if train_rows:
+            write_comparison_csv(train_output_root / "comparison_train.csv",
+                                 train_rows, train_log)
+            plot_impact_train_only(train_rows,
+                                   train_output_root / "impact_train.png",
                                    paths["model_label"], train_log)
+            any_rows_written = True
+        else:
+            train_log.error("No train sweep rows produced -- train comparison "
+                            "CSV / plot will not be written.")
 
-    if not all_rows and not (args.include_train):
+    if not any_rows_written:
+        logger.error("No sweep rows produced for any selected partition.")
         sys.exit(1)
 
     logger.info("=" * 65)

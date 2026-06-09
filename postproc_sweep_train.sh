@@ -10,13 +10,12 @@
 #SBATCH --partition=cs
 
 # Sweep post-processing order x MIN_EVENT_SEC for the given variant
-# (M3 or M4) on the FULL UN-DOWNSAMPLED TRAIN partition. Writes to a
-# sibling output root post_process_varing_sec_train/, leaving the
-# val/test outputs untouched. Also re-runs the val/test sweep in the
-# same job so a single invocation refreshes all three partitions.
+# (M3 or M4) on the FULL UN-DOWNSAMPLED TRAIN partition ONLY. Writes
+# to the sibling output root post_process_varing_sec_train/. Does NOT
+# touch the val/test artefacts -- run postproc_sweep.sh for those.
 #
 # Wall time estimate: ~10-15 h for the train sweep (10 configs x
-# ~60-90 min/config at 28.7M segments). Val + test add ~30 min.
+# ~60-90 min/config at 28.7M segments).
 #SBATCH -t 1-00:00:00
 
 #SBATCH --output=/home/people/22206468/slurm-postproc_sweep_tr-%j.out
@@ -54,16 +53,18 @@ conda activate torch_v100_py310
 cd ~/TCN_SSL_GA
 
 # Reads:
-#   <variant>/evaluation/<test_NPZ> + <variant>/<val_NPZ> + <variant>/full_train_evaluation/<train_NPZ>
-#   /scratch/22206468/INPUT_DATA/data_splits_outputs/data_splits_nonictal_sampled_filtered_enriched.json
+#   <variant>/full_train_evaluation/<train_NPZ>
 #   /scratch/22206468/INPUT_DATA/data_splits_outputs/data_splits_full_train_enriched.json
 #   mouse_recording_metadata.json
 #   /home/people/22206468/scratch/seizure_times_updated/{mouse}_xlsx.xlsx
 # Writes:
-#   <variant>/evaluation/post_process_varing_sec/           (val + test bundles + comparison_val_vs_test.{csv,png})
 #   <variant>/full_train_evaluation/post_process_varing_sec_train/
-#                                                            (train bundles + comparison_train.{csv,png} + log)
-python postproc_sweep.py --variant "$VARIANT" --cluster --include-train
+#       train/refractory_then_min/MIN_EVENT_SEC_{10,15,20,25,30}s/
+#       train/min_then_refractory/MIN_EVENT_SEC_{10,15,20,25,30}s/
+#       comparison_train.csv
+#       impact_train.png
+#       postproc_sweep.log
+python postproc_sweep.py --variant "$VARIANT" --cluster --partitions train
 
 echo "===== JOB END ====="
 date
