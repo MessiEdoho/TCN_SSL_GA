@@ -230,53 +230,89 @@ def main():
     logger.info("Step 1: Load best M3 hyperparameters")
     _config, hp, branch_dilations = load_best_params(logger)
 
-    logger.info("-" * 65)
-    logger.info("Step 2: Verify trained weights file")
-    if not WEIGHTS_PATH.exists():
-        logger.error("Weights file not found: %s.", WEIGHTS_PATH); sys.exit(1)
-    weights_size_mb = WEIGHTS_PATH.stat().st_size / 1e6
-    logger.info("Weights OK: %s (%.2f MB)", WEIGHTS_PATH, weights_size_mb)
-
-    logger.info("-" * 65)
-    logger.info("Step 3: Layer 1 SKIPPED for train (train was never apply_val_test_filter'd). "
-                "Layers 2-4 still active.")
-
-    logger.info("-" * 65)
-    logger.info("Step 4: Build MultiScaleTCN and load final weights")
-    model = build_model(hp, branch_dilations, device, logger)
-    state_dict = torch.load(WEIGHTS_PATH, map_location=device)
-    model.load_state_dict(state_dict)
-    model.eval()
-    n_params = count_parameters(model)
-    logger.info("Loaded %s state_dict into model (%s trainable params).",
-                WEIGHTS_PATH.name, "{:,}".format(n_params))
-
-    logger.info("-" * 65)
-    logger.info("Step 5: Load FULL TRAIN split and build SafeEEGSegmentDataset loader")
-    train_pairs, train_records = load_full_train_split(logger)
-    batch_size = int(hp["batch_size"])
-    train_loader = make_safe_loader(train_pairs, batch_size, device,
-                                    num_workers=NUM_DATA_WORKERS)
-    logger.info("Train loader: %d batches (batch_size=%d, num_workers=%d)",
-                len(train_loader), batch_size, NUM_DATA_WORKERS)
-
-    logger.info("-" * 65)
-    logger.info("Step 6: FP32 forward pass with per-batch isfinite assert")
-    SafeEEGSegmentDataset.n_sanitised = 0
-    t0_eval = time.time()
-    train_f1_raw, y_true, _y_pred_05, y_prob = evaluate_model_safe(
-        model, train_loader, device, logger, use_amp=USE_AMP_FOR_EVAL)
-    eval_seconds = time.time() - t0_eval
-    logger.info("Forward pass complete: %d segments in %.1f s | "
-                "raw t=0.5 macro F1 = %.4f",
-                len(y_true), eval_seconds, train_f1_raw)
-    sanitised = SafeEEGSegmentDataset.n_sanitised
-    if sanitised:
-        logger.warning("SafeEEGSegmentDataset had to sanitise %d segments. "
-                       "Train data carried NaN/Inf or |x|>1000 segments.",
-                       sanitised)
+    # ---------------------------------------------------------------------
+    # Steps 2-6: forward pass OR resume from cached predictions NPZ
+    # ---------------------------------------------------------------------
+    if FULL_TRAIN_PREDICTIONS_NPZ.exists():
+        logger.info("=" * 65)
+        logger.info("RESUME MODE: cached predictions NPZ exists at %s",
+                    FULL_TRAIN_PREDICTIONS_NPZ)
+        logger.info("Skipping Steps 2-6 (forward pass). Delete this file to "
+                    "force a full re-run.")
+        logger.info("=" * 65)
+        npz = np.load(FULL_TRAIN_PREDICTIONS_NPZ, allow_pickle=True)
+        y_true = np.asarray(npz["y_true"]).astype(np.int64)
+        y_prob = np.asarray(npz["y_prob"]).astype(np.float64)
+        mouse_id_arr    = np.asarray(npz["mouse_id"])
+        chrono_idx_arr  = np.asarray(npz["chrono_idx"]).astype(np.int64)
+        t_start_sec_arr = np.asarray(npz["t_start_sec"]).astype(np.float64)
+        train_records = [
+            {
+                "mouse_id":    str(mouse_id_arr[i]),
+                "chrono_idx":  int(chrono_idx_arr[i]),
+                "t_start_sec": float(t_start_sec_arr[i]),
+                "label":       int(y_true[i]),
+                "filepath":    "",
+            }
+            for i in range(len(y_true))
+        ]
+        logger.info("Loaded %d cached predictions (%d unique mice).",
+                    len(y_true), len({r["mouse_id"] for r in train_records}))
+        # Re-derive n_params from the architecture for the eval report
+        # (no weights load needed; cheap and avoids hard-coding the number).
+        model = build_model(hp, branch_dilations, device, logger)
+        n_params = count_parameters(model)
+        del model
+        eval_seconds = 0.0
+        sanitised = 0
     else:
-        logger.info("SafeEEGSegmentDataset sanitised 0 segments.")
+        logger.info("-" * 65)
+        logger.info("Step 2: Verify trained weights file")
+        if not WEIGHTS_PATH.exists():
+            logger.error("Weights file not found: %s.", WEIGHTS_PATH); sys.exit(1)
+        weights_size_mb = WEIGHTS_PATH.stat().st_size / 1e6
+        logger.info("Weights OK: %s (%.2f MB)", WEIGHTS_PATH, weights_size_mb)
+
+        logger.info("-" * 65)
+        logger.info("Step 3: Layer 1 SKIPPED for train (train was never apply_val_test_filter'd). "
+                    "Layers 2-4 still active.")
+
+        logger.info("-" * 65)
+        logger.info("Step 4: Build MultiScaleTCN and load final weights")
+        model = build_model(hp, branch_dilations, device, logger)
+        state_dict = torch.load(WEIGHTS_PATH, map_location=device)
+        model.load_state_dict(state_dict)
+        model.eval()
+        n_params = count_parameters(model)
+        logger.info("Loaded %s state_dict into model (%s trainable params).",
+                    WEIGHTS_PATH.name, "{:,}".format(n_params))
+
+        logger.info("-" * 65)
+        logger.info("Step 5: Load FULL TRAIN split and build SafeEEGSegmentDataset loader")
+        train_pairs, train_records = load_full_train_split(logger)
+        batch_size = int(hp["batch_size"])
+        train_loader = make_safe_loader(train_pairs, batch_size, device,
+                                        num_workers=NUM_DATA_WORKERS)
+        logger.info("Train loader: %d batches (batch_size=%d, num_workers=%d)",
+                    len(train_loader), batch_size, NUM_DATA_WORKERS)
+
+        logger.info("-" * 65)
+        logger.info("Step 6: FP32 forward pass with per-batch isfinite assert")
+        SafeEEGSegmentDataset.n_sanitised = 0
+        t0_eval = time.time()
+        train_f1_raw, y_true, _y_pred_05, y_prob = evaluate_model_safe(
+            model, train_loader, device, logger, use_amp=USE_AMP_FOR_EVAL)
+        eval_seconds = time.time() - t0_eval
+        logger.info("Forward pass complete: %d segments in %.1f s | "
+                    "raw t=0.5 macro F1 = %.4f",
+                    len(y_true), eval_seconds, train_f1_raw)
+        sanitised = SafeEEGSegmentDataset.n_sanitised
+        if sanitised:
+            logger.warning("SafeEEGSegmentDataset had to sanitise %d segments. "
+                           "Train data carried NaN/Inf or |x|>1000 segments.",
+                           sanitised)
+        else:
+            logger.info("SafeEEGSegmentDataset sanitised 0 segments.")
 
     logger.info("-" * 65)
     logger.info("Step 7: Run post-processing evaluation (Row 1 + Row 2)")
@@ -371,8 +407,12 @@ def main():
     fieldnames_evt = ["mouse_id", "is_true_alarm", "start_sec", "end_sec",
                       "duration_sec", "max_prob", "matched_gt_idx",
                       "matched_gt_start_sec", "matched_gt_end_sec"]
+    # extrasaction="ignore": evaluate_event_level returns the canonical 17-
+    # column schema (mean_prob, start_recording_time, detection_latency_sec
+    # etc.); the bespoke CSV here keeps only the 9 historically reported
+    # fields. The canonical 4-file bundle below carries the full schema.
     with open(event_details_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames_evt)
+        writer = csv.DictWriter(f, fieldnames=fieldnames_evt, extrasaction="ignore")
         writer.writeheader()
         for row in train_eval_result["all_event_details"]:
             writer.writerow(row)

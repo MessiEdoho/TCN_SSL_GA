@@ -517,8 +517,12 @@ def main():
     fieldnames_evt = ["mouse_id", "is_true_alarm", "start_sec", "end_sec",
                       "duration_sec", "max_prob", "matched_gt_idx",
                       "matched_gt_start_sec", "matched_gt_end_sec"]
+    # extrasaction="ignore": evaluate_event_level returns the canonical 17-
+    # column schema (mean_prob, start_recording_time, detection_latency_sec
+    # etc.); the bespoke CSV here keeps only the 9 historically reported
+    # fields. The canonical 4-file bundle below carries the full schema.
     with open(event_details_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames_evt)
+        writer = csv.DictWriter(f, fieldnames=fieldnames_evt, extrasaction="ignore")
         writer.writeheader()
         for row in test_eval_result["all_event_details"]:
             writer.writerow(row)
