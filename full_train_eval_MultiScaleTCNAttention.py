@@ -89,6 +89,7 @@ from eval_utils import (
     write_event_level_bundle,
     THRESHOLD,
     STEP_SEC,
+    MAX_EVENT_SEC,
 )
 
 from tcn_utils import (
@@ -477,6 +478,7 @@ def main():
             train_eval_result, logger,
             order="min_then_refractory",
             min_event_duration_sec=MIN_EVENT_SEC,
+            max_event_duration_sec=MAX_EVENT_SEC,
             refractory_period_sec=REFRACTORY_SEC,
             smoothing_window=SMOOTHING_WIN,
             threshold=0.5,

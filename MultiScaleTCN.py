@@ -108,7 +108,7 @@ from tcn_utils import (
     ema_smooth,
 )
 
-from eval_utils import evaluate_event_level, write_event_level_bundle, THRESHOLD
+from eval_utils import evaluate_event_level, write_event_level_bundle, THRESHOLD, MAX_EVENT_SEC
 
 
 # ---------------------------------------------------------------------------
@@ -1741,6 +1741,7 @@ def main():
             OUTPUT_ROOT, "val", "M3 (MultiScaleTCN)", val_eval_result, logger,
             order="min_then_refractory",
             min_event_duration_sec=MIN_EVENT_SEC,
+            max_event_duration_sec=MAX_EVENT_SEC,
             refractory_period_sec=REFRACTORY_SEC,
             smoothing_window=SMOOTHING_WIN,
             threshold=0.5,

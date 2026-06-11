@@ -69,7 +69,7 @@ import numpy as np
 
 from eval_utils import (
     FS, WIN_LEN, STEP, SEGMENT_SEC, STEP_SEC,
-    THRESHOLD, SMOOTHING_WIN, MIN_EVENT_SEC, REFRACTORY_SEC,
+    THRESHOLD, SMOOTHING_WIN, MIN_EVENT_SEC, MAX_EVENT_SEC, REFRACTORY_SEC,
     load_annotations,
     detect_events_in_chunk,
     match_events_to_ground_truth,
@@ -99,6 +99,16 @@ def parse_args():
                    choices=["MultiScaleTCN", "MultiScaleTCNWithAttention"])
     p.add_argument("--partition", required=True,
                    choices=["val", "test", "train"])
+    p.add_argument("--min-event-sec", type=float, default=MIN_EVENT_SEC,
+                   help=f"Min event duration in seconds (default: {MIN_EVENT_SEC}). "
+                        f"Match the postproc-sweep cell you want to audit.")
+    p.add_argument("--max-event-sec", type=float, default=MAX_EVENT_SEC,
+                   help=f"Max event duration in seconds (default: {MAX_EVENT_SEC}). "
+                        f"Events longer than this are dropped before matching.")
+    p.add_argument("--order", choices=["min_then_refractory", "refractory_then_min"],
+                   default="min_then_refractory",
+                   help="Post-processing order. Default: min_then_refractory "
+                        "(canonical).")
     return p.parse_args()
 
 
@@ -135,9 +145,17 @@ def variant_paths(variant, partition):
 
 
 # ---------------------------------------------------------------------------
-def setup_logging(out_dir, partition):
+def _op_suffix(min_event_sec, max_event_sec, order):
+    """Return a filename suffix encoding the operating point so audits at
+    different sweep points don't clobber each other."""
+    return (f"min{int(round(min_event_sec))}s"
+            f"_max{int(round(max_event_sec))}s"
+            f"_{order}")
+
+
+def setup_logging(out_dir, partition, op_suffix):
     out_dir.mkdir(parents=True, exist_ok=True)
-    log_path = out_dir / f"false_negative_audit_{partition}.log"
+    log_path = out_dir / f"false_negative_audit_{partition}_{op_suffix}.log"
     logger = logging.getLogger("false_negative_audit")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
@@ -175,9 +193,12 @@ def longest_consecutive_run(binary):
 
 
 # ---------------------------------------------------------------------------
-def diagnose(row):
-    """Pick the most actionable diagnosis bucket for one FN."""
-    if row["gt_duration_sec"] < MIN_EVENT_SEC:
+def diagnose(row, min_event_sec):
+    """Pick the most actionable diagnosis bucket for one FN. min_event_sec
+    is the operating-point value used for this audit run (not the module
+    constant) so the 'short_gt_below_minimum' bucket reflects the actual
+    threshold applied."""
+    if row["gt_duration_sec"] < min_event_sec:
         return "short_gt_below_minimum"
     if row["near_recording_edge"]:
         return "edge_of_recording"
@@ -196,15 +217,18 @@ def diagnose(row):
 
 
 # ---------------------------------------------------------------------------
-def audit_partition(variant, partition, logger):
+def audit_partition(variant, partition, min_event_sec, max_event_sec, order, logger):
     paths = variant_paths(variant, partition)
-    logger.info("Variant   : %s", variant)
-    logger.info("Partition : %s", partition)
-    logger.info("NPZ       : %s", paths["npz"])
-    logger.info("Manifest  : %s", paths["manifest"])
-    logger.info("Out dir   : %s", paths["out_dir"])
-    logger.info("Annot dir : %s", ANNOT_DIR)
-    logger.info("Metadata  : %s", METADATA_PATH)
+    logger.info("Variant       : %s", variant)
+    logger.info("Partition     : %s", partition)
+    logger.info("Order         : %s", order)
+    logger.info("MIN_EVENT_SEC : %.1f s", min_event_sec)
+    logger.info("MAX_EVENT_SEC : %.1f s", max_event_sec)
+    logger.info("NPZ           : %s", paths["npz"])
+    logger.info("Manifest      : %s", paths["manifest"])
+    logger.info("Out dir       : %s", paths["out_dir"])
+    logger.info("Annot dir     : %s", ANNOT_DIR)
+    logger.info("Metadata      : %s", METADATA_PATH)
 
     if not METADATA_PATH.exists():
         logger.error("Mouse metadata missing: %s", METADATA_PATH); sys.exit(1)
@@ -263,7 +287,9 @@ def audit_partition(variant, partition, logger):
         for chunk_id, (s, e) in enumerate(chunks):
             evts, sp_chunk, spred_chunk = detect_events_in_chunk(
                 t_start_arr[s:e], y_prob_mouse[s:e], mouse_id, chunk_id,
-                order="min_then_refractory")
+                order=order,
+                min_event_duration_sec=min_event_sec,
+                max_event_duration_sec=max_event_sec)
             smoothed_probs[s:e] = sp_chunk
             smoothed_preds[s:e] = spred_chunk
             predicted.extend(evts)
@@ -315,6 +341,7 @@ def audit_partition(variant, partition, logger):
                     "crosses_filter_gap":                True,
                     "diagnosis_hint":                    "near_filter_gap",
                 }
+                # near_filter_gap is set directly; no need to consult diagnose()
                 fn_rows.append(row); continue
 
             raw_in_gt = y_prob_mouse[in_gt]
@@ -351,14 +378,14 @@ def audit_partition(variant, partition, logger):
                 "frac_above_0.5_raw":                round(float((raw_in_gt >= THRESHOLD).mean()), 6),
                 "frac_above_0.5_smoothed":           round(float((sm_in_gt >= THRESHOLD).mean()), 6),
                 "longest_pred_run_sec":              round(longest_run_sec, 4),
-                "brief_firing_dropped_by_min_dur":   bool(0 < longest_run_sec < MIN_EVENT_SEC),
+                "brief_firing_dropped_by_min_dur":   bool(0 < longest_run_sec < min_event_sec),
                 "nearest_pred_event_distance_sec":   None if nearest_dist is None else round(float(nearest_dist), 4),
                 "nearest_pred_event_label":          nearest_lbl,
                 "near_recording_edge":               (gs < NEAR_EDGE_SEC or
                                                       (recording_duration_sec - ge) < NEAR_EDGE_SEC),
                 "crosses_filter_gap":                bool(gt_crosses_gap),
             }
-            row["diagnosis_hint"] = diagnose(row)
+            row["diagnosis_hint"] = diagnose(row, min_event_sec)
             fn_rows.append(row)
 
         n_total_fn += len(fn_list)
@@ -396,7 +423,8 @@ def write_csv(out_path, rows, logger):
     logger.info("Saved FN audit CSV: %s (%d rows)", out_path, len(rows))
 
 
-def write_summary(out_path, rows, variant, partition, logger):
+def write_summary(out_path, rows, variant, partition,
+                  min_event_sec, max_event_sec, order, logger):
     buckets = {}
     per_mouse = {}
     for r in rows:
@@ -410,7 +438,9 @@ def write_summary(out_path, rows, variant, partition, logger):
         "diagnosis_buckets": buckets,
         "fns_per_mouse":     per_mouse,
         "thresholds_used": {
-            "MIN_EVENT_SEC":   MIN_EVENT_SEC,
+            "min_event_sec":   min_event_sec,
+            "max_event_sec":   max_event_sec,
+            "order":           order,
             "SMOOTHING_WIN":   SMOOTHING_WIN,
             "THRESHOLD":       THRESHOLD,
             "REFRACTORY_SEC":  REFRACTORY_SEC,
@@ -430,18 +460,22 @@ def write_summary(out_path, rows, variant, partition, logger):
 def main():
     args = parse_args()
     paths = variant_paths(args.variant, args.partition)
-    logger, log_path = setup_logging(paths["out_dir"], args.partition)
+    suffix = _op_suffix(args.min_event_sec, args.max_event_sec, args.order)
+    logger, log_path = setup_logging(paths["out_dir"], args.partition, suffix)
 
     logger.info("=" * 65)
     logger.info("false_negative_audit.py")
     logger.info("Log file : %s", log_path)
     logger.info("=" * 65)
 
-    rows = audit_partition(args.variant, args.partition, logger)
-    write_csv(paths["out_dir"] / f"false_negative_audit_{args.partition}.csv",
-              rows, logger)
-    write_summary(paths["out_dir"] / f"false_negative_audit_{args.partition}.json",
-                  rows, args.variant, args.partition, logger)
+    rows = audit_partition(
+        args.variant, args.partition,
+        args.min_event_sec, args.max_event_sec, args.order, logger)
+    csv_path  = paths["out_dir"] / f"false_negative_audit_{args.partition}_{suffix}.csv"
+    json_path = paths["out_dir"] / f"false_negative_audit_{args.partition}_{suffix}.json"
+    write_csv(csv_path, rows, logger)
+    write_summary(json_path, rows, args.variant, args.partition,
+                  args.min_event_sec, args.max_event_sec, args.order, logger)
     logger.info("=" * 65)
     logger.info("DONE")
     logger.info("=" * 65)

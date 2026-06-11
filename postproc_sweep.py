@@ -636,11 +636,13 @@ def sweep_partition(partition, npz_path, manifest_path, annot_dir,
     for order in ORDERINGS:
         for sec in SWEEP_SECS:
             logger.info("-" * 65)
-            logger.info("[%s] order=%s | MIN_EVENT_SEC=%d s", partition, order, sec)
-            eval_utils.MIN_EVENT_SEC = float(sec)
+            logger.info("[%s] order=%s | MIN_EVENT_SEC=%d s | MAX_EVENT_SEC=%.1f s",
+                        partition, order, sec, eval_utils.MAX_EVENT_SEC)
             result = evaluate_event_level(
                 records, y_true_kept, y_prob_kept,
-                annot_dir, mouse_metadata, logger, order=order)
+                annot_dir, mouse_metadata, logger, order=order,
+                min_event_duration_sec=float(sec),
+                max_event_duration_sec=eval_utils.MAX_EVENT_SEC)
 
             out_dir = output_root / partition / order / f"MIN_EVENT_SEC_{sec}s"
             out_dir.mkdir(parents=True, exist_ok=True)
@@ -649,6 +651,7 @@ def sweep_partition(partition, npz_path, manifest_path, annot_dir,
                 out_dir, partition, model_label, result, logger,
                 order=order,
                 min_event_duration_sec=float(sec),
+                max_event_duration_sec=eval_utils.MAX_EVENT_SEC,
                 refractory_period_sec=eval_utils.REFRACTORY_SEC,
                 smoothing_window=eval_utils.SMOOTHING_WIN,
                 threshold=eval_utils.THRESHOLD,
@@ -732,7 +735,9 @@ def main():
         logger.info("  train annot dir: %s", paths["train_annot_dir"])
     logger.info("Log             : %s", log_path)
     logger.info("Orderings       : %s", ORDERINGS)
-    logger.info("Sweep secs      : %s", SWEEP_SECS)
+    logger.info("Sweep min secs  : %s", SWEEP_SECS)
+    logger.info("Fixed max sec   : %.1f (drop events exceeding this; canonical: 120 s)",
+                eval_utils.MAX_EVENT_SEC)
     logger.info("=" * 65)
 
     if not paths["metadata"].exists():

@@ -31,13 +31,18 @@ echo "nproc (visible)     : $(nproc)"
 echo "Affinity (taskset)  : $(taskset -cp $$ 2>/dev/null || echo 'taskset unavailable')"
 echo "--------------------------"
 
-# Variant + partition passed as positional arguments.
+# Variant + partition passed as positional arguments. Any further
+# arguments (e.g. --min-event-sec 10 --order refractory_then_min) are
+# forwarded verbatim to false_negative_audit.py.
 #   Variants : MultiScaleTCN | MultiScaleTCNWithAttention
 #   Partitions: val | test | train
-VARIANT="${1:?Usage: sbatch -J <jobname> false_negative_audit.sh <VARIANT> <PARTITION>}"
-PARTITION="${2:?Usage: sbatch -J <jobname> false_negative_audit.sh <VARIANT> <PARTITION>}"
+VARIANT="${1:?Usage: sbatch -J <jobname> false_negative_audit.sh <VARIANT> <PARTITION> [extra args]}"
+PARTITION="${2:?Usage: sbatch -J <jobname> false_negative_audit.sh <VARIANT> <PARTITION> [extra args]}"
+shift 2
+EXTRA_ARGS=("$@")
 echo "Variant   : $VARIANT"
 echo "Partition : $PARTITION"
+echo "Extra args: ${EXTRA_ARGS[*]:-<none>}"
 
 mkdir -p "$HOME/slurm_logs"
 ln -sf "/home/people/22206468/slurm-fn_audit-${SLURM_JOB_ID}.out" \
@@ -54,7 +59,7 @@ cd ~/TCN_SSL_GA
 # Writes:
 #   <variant>/evaluation/false_negative_audit_<partition>.{csv,json,log}     (val, test)
 #   <variant>/full_train_evaluation/false_negative_audit_train.{csv,json,log} (train)
-python false_negative_audit.py --variant "$VARIANT" --partition "$PARTITION"
+python false_negative_audit.py --variant "$VARIANT" --partition "$PARTITION" "${EXTRA_ARGS[@]}"
 
 echo "===== JOB END ====="
 date

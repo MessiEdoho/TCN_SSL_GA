@@ -362,6 +362,9 @@ THRESHOLD       = 0.5
 SMOOTHING_WIN   = 3
 REFRACTORY_SEC  = 30.0
 MIN_EVENT_SEC   = 25.0
+MAX_EVENT_SEC   = 120.0     # drop events longer than 2 min (artefact / stuck-model cleanup;
+                            # applied as the FINAL step in both orderings of
+                            # detect_events_in_chunk -- see STUDY_REPORT 7.6.9)
 
 
 # ---------------------------------------------------------------------------
@@ -535,16 +538,30 @@ def _refractory_merge(events):
     return merged
 
 
-def _min_duration_filter(events):
-    """Drop events shorter than MIN_EVENT_SEC."""
+def _min_duration_filter(events, min_sec=None):
+    """Drop events shorter than min_sec (default: MIN_EVENT_SEC)."""
+    if min_sec is None:
+        min_sec = MIN_EVENT_SEC
     return [evt for evt in events
-            if (evt["end_sec"] - evt["start_sec"]) >= MIN_EVENT_SEC]
+            if (evt["end_sec"] - evt["start_sec"]) >= min_sec]
+
+
+def _max_duration_filter(events, max_sec=None):
+    """Drop events longer than max_sec (default: MAX_EVENT_SEC). Catches
+    artefact-driven super-long events and refractory-merged super-events
+    that should not be considered single seizures."""
+    if max_sec is None:
+        max_sec = MAX_EVENT_SEC
+    return [evt for evt in events
+            if (evt["end_sec"] - evt["start_sec"]) <= max_sec]
 
 
 def detect_events_in_chunk(t_start, y_prob, mouse_id, chunk_id,
-                           order="min_then_refractory"):
-    """Run smoothing + threshold + run-detection, then apply the
-    refractory-merge and min-duration-filter steps in the order specified.
+                           order="min_then_refractory",
+                           min_event_duration_sec=None,
+                           max_event_duration_sec=None):
+    """Run smoothing + threshold + run-detection, then apply min-duration,
+    refractory-merge (in the order specified), and finally max-duration.
 
     Parameters
     ----------
@@ -558,6 +575,12 @@ def detect_events_in_chunk(t_start, y_prob, mouse_id, chunk_id,
         "refractory_then_min" (legacy) merges first, then drops surviving
         short events; can rescue fragmented true detections at the cost
         of also rescuing fragmented false alarms.
+    min_event_duration_sec : float or None
+        Minimum event length. None -> use module-level MIN_EVENT_SEC.
+    max_event_duration_sec : float or None
+        Maximum event length. Applied as the FINAL step in both orderings.
+        None -> use module-level MAX_EVENT_SEC. Events exceeding this are
+        dropped (artefact / model-stuck cleanup).
 
     Returns
     -------
@@ -600,13 +623,21 @@ def detect_events_in_chunk(t_start, y_prob, mouse_id, chunk_id,
         })
 
     if order == "refractory_then_min":
-        processed = _min_duration_filter(_refractory_merge(raw_events))
+        processed = _min_duration_filter(
+            _refractory_merge(raw_events), min_event_duration_sec)
     elif order == "min_then_refractory":
-        processed = _refractory_merge(_min_duration_filter(raw_events))
+        processed = _refractory_merge(
+            _min_duration_filter(raw_events, min_event_duration_sec))
     else:
         raise ValueError(
             "Unknown post-processing order %r; expected 'refractory_then_min' "
             "or 'min_then_refractory'." % order)
+
+    # Max-duration filter: applied as the FINAL step in both orderings so
+    # it catches both raw long runs and refractory-merged super-events.
+    # Events with duration > max_event_duration_sec are dropped (treated as
+    # artefact / model-stuck cleanup; see STUDY_REPORT 7.6.9).
+    processed = _max_duration_filter(processed, max_event_duration_sec)
 
     final = []
     for evt in processed:
@@ -737,7 +768,9 @@ def build_classification_report(y_true, y_pred, row_metrics):
 # ---------------------------------------------------------------------------
 def evaluate_event_level(partition_records, y_true_all, y_prob_all,
                          annotations_dir, mouse_metadata, logger,
-                         order="min_then_refractory"):
+                         order="min_then_refractory",
+                         min_event_duration_sec=None,
+                         max_event_duration_sec=None):
     """End-to-end per-mouse-chronological event-level evaluation.
 
     Parameters
@@ -757,6 +790,9 @@ def evaluate_event_level(partition_records, y_true_all, y_prob_all,
     order : {"refractory_then_min", "min_then_refractory"}, default
         "min_then_refractory". Controls the post-processing step order
         in detect_events_in_chunk -- see that function's docstring.
+    min_event_duration_sec, max_event_duration_sec : float or None
+        Pass-through to detect_events_in_chunk. None -> use module-level
+        MIN_EVENT_SEC / MAX_EVENT_SEC.
 
     Returns
     -------
@@ -850,7 +886,10 @@ def evaluate_event_level(partition_records, y_true_all, y_prob_all,
         mouse_smoothed_preds_full = np.empty(len(chrono_idx_arr), dtype=np.int64)
         for chunk_id, (s, e) in enumerate(chunks):
             evts, smoothed_probs_chunk, smoothed_preds_chunk = detect_events_in_chunk(
-                t_start_arr[s:e], y_prob_mouse[s:e], mouse_id, chunk_id, order=order)
+                t_start_arr[s:e], y_prob_mouse[s:e], mouse_id, chunk_id,
+                order=order,
+                min_event_duration_sec=min_event_duration_sec,
+                max_event_duration_sec=max_event_duration_sec)
             mouse_predicted.extend(evts)
             mouse_smoothed_probs_full[s:e] = smoothed_probs_chunk
             mouse_smoothed_preds_full[s:e] = smoothed_preds_chunk
@@ -1128,6 +1167,7 @@ def write_event_level_bundle(out_dir, partition, model_label,
                               smoothing_window=3,
                               threshold=0.5,
                               step_sec=2.5,
+                              max_event_duration_sec=120.0,
                               extra_summary_fields=None):
     """Emit the canonical 4-file bundle:
 
@@ -1164,6 +1204,7 @@ def write_event_level_bundle(out_dir, partition, model_label,
             "matching_rule":           "any-overlap",
             "order":                   order,
             "min_event_duration_sec":  min_event_duration_sec,
+            "max_event_duration_sec":  max_event_duration_sec,
             "refractory_period_sec":   refractory_period_sec,
             "smoothing_window":        smoothing_window,
             "step_sec":                step_sec,
@@ -1189,6 +1230,8 @@ def emit_event_level_bundle(out_dir, partition, model_label,
                              y_true, y_prob, partition_records,
                              annotations_dir, mouse_metadata, logger,
                              order="min_then_refractory",
+                             min_event_duration_sec=None,
+                             max_event_duration_sec=None,
                              extra_summary_fields=None):
     """One-call convenience wrapper: per-mouse evaluation + 4-file bundle.
 
@@ -1199,10 +1242,18 @@ def emit_event_level_bundle(out_dir, partition, model_label,
     """
     result = evaluate_event_level(
         partition_records, y_true, y_prob,
-        annotations_dir, mouse_metadata, logger, order=order)
+        annotations_dir, mouse_metadata, logger, order=order,
+        min_event_duration_sec=min_event_duration_sec,
+        max_event_duration_sec=max_event_duration_sec)
+    # Resolve None defaults so the summary records the actual values used.
+    eff_min = MIN_EVENT_SEC if min_event_duration_sec is None else min_event_duration_sec
+    eff_max = MAX_EVENT_SEC if max_event_duration_sec is None else max_event_duration_sec
     write_event_level_bundle(
         out_dir, partition, model_label, result, logger,
-        order=order, extra_summary_fields=extra_summary_fields)
+        order=order,
+        min_event_duration_sec=eff_min,
+        max_event_duration_sec=eff_max,
+        extra_summary_fields=extra_summary_fields)
     return result
 
 
@@ -1213,7 +1264,8 @@ def write_deploy_event_bundle(out_dir, stem, events,
                                refractory_period_sec=30.0,
                                smoothing_window=3,
                                threshold=0.5,
-                               step_sec=2.5):
+                               step_sec=2.5,
+                               max_event_duration_sec=120.0):
     """Two-file deploy bundle for inference contexts without ground truth.
 
         {stem}_event_details.csv  (canonical schema, GT cells empty)
@@ -1268,6 +1320,7 @@ def write_deploy_event_bundle(out_dir, stem, events,
             "matching_rule":           "any-overlap",
             "order":                   order,
             "min_event_duration_sec":  min_event_duration_sec,
+            "max_event_duration_sec":  max_event_duration_sec,
             "refractory_period_sec":   refractory_period_sec,
             "smoothing_window":        smoothing_window,
             "step_sec":                step_sec,
