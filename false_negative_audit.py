@@ -266,15 +266,18 @@ def audit_partition(variant, partition, min_event_sec, max_event_sec, order, log
         gt_intervals = load_annotations(xlsx, rec_start)
         n_total_gt += len(gt_intervals)
 
-        # Chronological reorder
-        idxs   = np.array([i for i, _ in rec_list], dtype=np.int64)
-        cidxs  = np.array([r["chrono_idx"]  for _, r in rec_list], dtype=np.int64)
-        starts = np.array([r["t_start_sec"] for _, r in rec_list], dtype=np.float64)
-        order  = np.argsort(cidxs)
-        chrono_idx_arr = cidxs[order]
-        t_start_arr    = starts[order]
-        y_true_mouse   = y_true_all[idxs[order]]
-        y_prob_mouse   = y_prob_all[idxs[order]]
+        # Chronological reorder. NB: use a name OTHER than `order` for the
+        # argsort permutation -- the function parameter `order` is the
+        # post-processing string ("min_then_refractory" / "refractory_then_min")
+        # and shadowing it here silently breaks the detect_events_in_chunk call.
+        idxs    = np.array([i for i, _ in rec_list], dtype=np.int64)
+        cidxs   = np.array([r["chrono_idx"]  for _, r in rec_list], dtype=np.int64)
+        starts  = np.array([r["t_start_sec"] for _, r in rec_list], dtype=np.float64)
+        sort_ix = np.argsort(cidxs)
+        chrono_idx_arr = cidxs[sort_ix]
+        t_start_arr    = starts[sort_ix]
+        y_true_mouse   = y_true_all[idxs[sort_ix]]
+        y_prob_mouse   = y_prob_all[idxs[sort_ix]]
 
         chunks = split_into_chunks(chrono_idx_arr)
 
