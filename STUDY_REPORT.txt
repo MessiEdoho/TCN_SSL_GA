@@ -265,7 +265,7 @@ building unit.
         the original 2,500 samples throughout the convolutional stack.
 
         This high-dimensional sequence must be reduced to a fixed-
-        length vector before classification. In M1 (TCN) and M3
+        length vector befFore classification. In M1 (TCN) and M3
         (Multi-Scale TCN), this reduction is performed by global
         average pooling, which computes the arithmetic mean of the
         feature vectors across all T time steps:
@@ -956,7 +956,7 @@ configurations.
 
 7.1.1 Validation subset during tuning -- size selection and timing
 
-    The validation partition contains 4,298,154 segments (73 held-out
+    The validation partition contains 4,298,154 segments (10 held-out
     mice), of which 11,603 are ictal (0.27%). Because this partition
     was not subjected to the proximity-aware downsampling applied to
     the training partition (Section 5), its raw size dominates
@@ -1020,11 +1020,12 @@ configurations.
 
 7.1.2 Protocol parameter justifications
 
-    Three numerical choices in the common tuning protocol -- trial
+    Four numerical choices in the common tuning protocol -- trial
     budget (N = 50), pruner activation threshold (10 startup trials),
-    and trial-level early-stopping patience (5 epochs) -- merit
-    explicit justification because they jointly determine search
-    coverage, compute cost, and statistical reliability.
+    trial-level early-stopping patience (5 epochs), and the per-trial
+    epoch budget (MAX_EPOCHS = 20) -- merit explicit justification
+    because they jointly determine search coverage, compute cost, and
+    statistical reliability.
 
     Trial budget (N = 50)
     ---------------------
@@ -1085,6 +1086,55 @@ configurations.
     that genuinely improved across the schedule and prompt
     termination for the rest, yielding a 48 percent prune rate
     after the activation threshold.
+
+    Per-trial epoch budget (MAX_EPOCHS = 20)
+    ----------------------------------------
+    Each trial trains for at most twenty epochs -- one fifth of the
+    hundred-epoch budget used for final model training (Section 7.6).
+    The objective during search is the comparative ranking of candidate
+    configurations, not the attainment of each configuration's fully
+    converged performance; a configuration's relative merit becomes
+    apparent well before its loss has finished annealing. This choice is
+    bounded from below by the number of epochs the cosine-annealed
+    schedule needs to separate strong from weak configurations, and from
+    above by the tuning compute budget.
+
+    Lower bound. A shorter budget (e.g. ten epochs) would truncate the
+    cosine schedule before the learning rate had decayed sufficiently to
+    expose the performance gap between configurations, compressing the
+    validation-F1 range and injecting noise into the TPE surrogate. It
+    would also penalise slower-converging configurations that ultimately
+    outperform faster-plateauing ones, biasing the search toward
+    early-epoch behaviour rather than final quality. Twenty epochs
+    leaves head-room above the typical peak: in our tuning logs the
+    validation F1 of the stronger configurations reaches its maximum
+    between epochs 8 and 15 of the twenty-epoch budget (Appendix A.5,
+    Cosine Annealing), so genuinely improving trials have room to attain
+    their comparative maximum, while the patience-5 early-stopping rule
+    releases trials that plateau earlier (an average of roughly ten
+    epochs per trial, consistent with the Table 3 cost projection).
+
+    Upper bound. A longer budget (e.g. the full hundred epochs) would
+    multiply per-trial cost roughly five-fold without altering the
+    configuration ranking, because that ranking is already stable by the
+    mid-budget peak; the additional epochs refine the absolute F1 of a
+    configuration but not its position relative to the others. Extending
+    the budget would render the fifty-trial study infeasible within the
+    per-job walltime (Section 7.1.1, Table 3). Restricting the tuning
+    budget to a fraction of the final-training budget, and relying on
+    early-epoch performance to rank configurations, is the standard
+    economy exploited by successive-halving and bandit-based search
+    methods (Li et al., 2017).
+
+    Consistency across phases. The cosine schedule's annealing horizon
+    T_max is set equal to the epoch budget in force -- 20 during tuning,
+    100 during final training (Appendix A.5) -- so the learning rate
+    anneals fully to its 1% floor within whichever budget applies, and
+    no trial is evaluated under a partially annealed schedule. As with
+    the other three protocol parameters, MAX_EPOCHS = 20 was fixed
+    before tuning began and held constant across all four models
+    (M1-M4), so that ablation comparisons isolate architectural
+    contributions rather than differences in tuning budget.
 
     Table 2A. Summary of protocol parameter justifications. Each
     numerical choice is bounded from below by a statistical /
